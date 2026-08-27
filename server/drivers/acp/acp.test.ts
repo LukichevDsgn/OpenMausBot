@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ensureDirs } from "../../config.ts";
 import type { ProviderInstance } from "../../contracts.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
-import { createAcpDriver, type AcpSupport } from "./core.ts";
+import { createAcpDriver, resolveNewSessionTimeout, type AcpSupport } from "./core.ts";
 import { GrokAgentDriver } from "./grok.ts";
 import { GeminiAgentDriver } from "./gemini.ts";
 import { KimiAgentDriver } from "./kimi.ts";
@@ -74,6 +74,11 @@ const ClassifiedErrorDriver = createAcpDriver({
 });
 
 describe("ACP decodeConfig", () => {
+  it("keeps the generic session startup timeout unless a harness opts into a larger cold-start budget", () => {
+    expect(resolveNewSessionTimeout({})).toBe(30_000);
+    expect(resolveNewSessionTimeout({ newSessionTimeoutMs: 120_000 })).toBe(120_000);
+  });
+
   it("resolves a dynamic model catalog when a support provides one", async () => {
     const support: AcpSupport = {
       driverKind: "dynamic-test",
@@ -99,10 +104,44 @@ describe("ACP decodeConfig", () => {
       enabled: true,
       config: driver.defaultConfig(),
     });
+    await instance.refreshModels?.();
     expect(instance.models).toEqual({
       default: "dynamic-model",
       options: [{ id: "dynamic-model", label: "Dynamic model" }],
     });
+    await instance.dispose();
+  });
+  it("does not run optional model discovery during provider creation", async () => {
+    let discoveryCalls = 0;
+    const support: AcpSupport = {
+      driverKind: "startup-test",
+      displayName: "Startup Test",
+      models: { default: "fallback", options: [{ id: "fallback", label: "Fallback" }] },
+      defaultCli: FAKE_CLI,
+      nativeSource: "startup-test.acp",
+      loginNote: "not authenticated",
+      spawnArgs: () => [],
+      pickAuthMethod: () => null,
+      authFailure: "continue",
+      isAuthenticated: () => true,
+      resolveModels: async () => {
+        discoveryCalls += 1;
+        return { default: "dynamic", options: [{ id: "dynamic", label: "Dynamic" }] };
+      },
+    };
+    const driver = createAcpDriver(support);
+    const instance = await driver.create({
+      instanceId: "startup-test",
+      displayName: "Startup Test",
+      environment: {},
+      enabled: true,
+      config: driver.defaultConfig(),
+    });
+    expect(discoveryCalls).toBe(0);
+    expect(instance.models.default).toBe("fallback");
+    await instance.refreshModels?.();
+    expect(discoveryCalls).toBe(1);
+    expect(instance.models.default).toBe("dynamic");
     await instance.dispose();
   });
   it("grok defaults to the grok binary", () => {
@@ -756,6 +795,7 @@ describe("ACP snapshot", () => {
       config: { cli: FAKE_CLI, fullAuto: false },
     });
     try {
+      await instance.refreshModels?.();
       // favourites first in the user's own order, then the built-in slice
       expect(instance.models.options.slice(0, 2)).toEqual([
         { id: "custom:Azure-Opus-0", label: "Azure Opus", custom: true },

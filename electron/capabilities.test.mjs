@@ -40,9 +40,9 @@ describe("desktop capabilities", () => {
     });
   });
 
-  it.each(["win32", "freebsd"])("fails closed on %s", (platform) => {
+  it("fails closed on an unsupported desktop platform", () => {
     const capabilities = desktopCapabilities({
-      platform,
+      platform: "freebsd",
       env: { DISPLAY: ":0" },
       localConnection: { mode: "embedded" },
     });
@@ -54,6 +54,37 @@ describe("desktop capabilities", () => {
       available: false,
       support: "unsupported",
       reasonCode: "unsupported-platform",
+    });
+  });
+
+  it("enables Windows local control only for a complete CUA MCP descriptor", () => {
+    const connection = {
+      mode: "standalone",
+      platform: "win32",
+      status: "ready",
+      enabled: true,
+      mcpCommand: "C:\\Program Files\\Cua\\cua-driver.exe",
+      mcpArgs: ["mcp"],
+      mcpEnv: { CUA_DRIVER_RS_TELEMETRY_ENABLED: "0" },
+    };
+    expect(
+      desktopCapabilities({ platform: "win32", localConnection: connection }).localComputer,
+    ).toMatchObject({
+      available: true,
+      support: "supported",
+      enabled: true,
+      status: "ready",
+    });
+    expect(localComputerReady("win32", { ...connection, mcpArgs: [] })).toBe(false);
+    expect(localComputerReady("win32", { ...connection, mcpCommand: "" })).toBe(false);
+    expect(
+      desktopCapabilities({
+        platform: "win32",
+        localConnection: { mode: "unavailable", reasonCode: "cua-driver-unavailable" },
+      }).localComputer,
+    ).toMatchObject({
+      available: false,
+      reasonCode: "cua-driver-unavailable",
     });
   });
 

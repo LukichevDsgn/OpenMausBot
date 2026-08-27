@@ -11,6 +11,7 @@
 // time, never at queue time, because the user might have just turned
 // approvePeerComms on between queueing and draining.
 
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -18,11 +19,16 @@ import { writeFileAtomic } from "./atomic.ts";
 import { getOrCreateChannel, mirrorExchange, type CommsBus } from "./comms-visibility.ts";
 import { DATA_DIR } from "./config.ts";
 import { newId } from "./contracts.ts";
+import { parseHandoff, scopesConflict, type ParsedHandoff } from "./handoff.ts";
 import { requestPeerApproval, type ApprovalBus } from "./peer-approval.ts";
 import type { BotRecord, GroupRecord } from "./store.ts";
 
 export interface DelegationItem {
   toBotId: string;
+  /** Stable fallback when a roster was produced by an older/restarted app. */
+  toRoutingKey?: string;
+  /** Compatibility fallback for older agents that know only the display name. */
+  toBotName?: string;
   message: string;
   reason?: string;
   /** The source bot's comms depth (0 for a user-initiated turn). The
@@ -35,9 +41,25 @@ export interface DelegationItem {
 interface PendingDelegationItem extends DelegationItem {
   /** Stable acknowledgement key for crash-safe removal from the queue. */
   id: string;
+  handoff: ParsedHandoff;
+  sourceBotId: string;
+  stageKey: string;
+  evidenceKey: string;
+  fingerprint: string;
+  attempt: number;
 }
 
-export type QueueResult = "ok" | "no_target" | "self" | "too_deep" | "too_many";
+/** Captured by the harness from the source turn's admission snapshot. The
+ * proxy never supplies these values and queueDelegation never derives them
+ * from request data. */
+export interface DelegationAdmission {
+  retryCap: number;
+  handoffByteCap: number;
+  reserveDelegation?: () => boolean;
+  releaseDelegation?: () => void;
+}
+
+export type QueueResult = "ok" | "no_target" | "self" | "too_deep" | "too_many" | "invalid_handoff" | "conflict" | "duplicate" | "loop_blocked";
 
 /** Per source-thread queue. Persisted to delegations.json on every change
  * and reloaded at boot: a handoff queued right before a restart runs after
@@ -47,6 +69,41 @@ export type QueueResult = "ok" | "no_target" | "self" | "too_deep" | "too_many";
 const pendingDelegations = new Map<string, PendingDelegationItem[]>();
 const drainingThreads = new Set<string>();
 const DELEGATIONS_FILE = join(DATA_DIR, "delegations.json");
+export const MAX_STAGE_ATTEMPTS = 2;
+
+function normalized(value: string): string {
+  return value.trim().replaceAll("\\", "/").replace(/\s+/gu, " ").toLocaleLowerCase();
+}
+
+function digest(parts: string[]): string {
+  return createHash("sha256").update(parts.join("\n\u241f\n"), "utf8").digest("hex");
+}
+
+function objectiveStage(objective: string): string {
+  // Stable issue/package ids survive harmless prose changes such as
+  // "fresh", "retry" and "clarification". Without one, use the bounded
+  // objective itself rather than guessing semantic equivalence.
+  return objective.match(/\b(?:[a-z][a-z0-9]*-\d+[a-z0-9-]*|[a-z]\d+(?:-[a-z0-9]+)*)\b/iu)?.[0]
+    ?? objective;
+}
+
+function handoffControl(sourceBotId: string, targetBotId: string, handoff: ParsedHandoff) {
+  const files = [...handoff.scope.allowedFiles].map(normalized).sort();
+  const stageKey = digest([
+    sourceBotId,
+    targetBotId,
+    normalized(handoff.scope.base),
+    normalized(handoff.scope.worktree),
+    files.join("\n"),
+    normalized(objectiveStage(handoff.objective)),
+  ]);
+  const evidenceKey = digest([
+    normalized(handoff.scope.base),
+    normalized(handoff.exactChanges),
+    normalized(handoff.verification),
+  ]);
+  return { stageKey, evidenceKey, fingerprint: digest([stageKey, evidenceKey]) };
+}
 
 function savePending(): void {
   try {
@@ -61,6 +118,7 @@ export function _loadPending(): void {
   pendingDelegations.clear();
   try {
     const raw = JSON.parse(readFileSync(DELEGATIONS_FILE, "utf8")) as Record<string, unknown>;
+    const loadedScopes: ParsedHandoff[] = [];
     for (const [threadId, list] of Object.entries(raw)) {
       if (!Array.isArray(list)) continue;
       const items = list.flatMap((value): PendingDelegationItem[] => {
@@ -71,12 +129,26 @@ export function _loadPending(): void {
           typeof item.message !== "string" ||
           !Number.isFinite(item.depth)
         ) return [];
+        const parsed = parseHandoff(item.message, typeof item.reason === "string" ? item.reason : undefined);
+        if (!parsed.ok) return [];
+        if (loadedScopes.some((loaded) => scopesConflict(loaded.scope, parsed.handoff.scope))) return [];
+        loadedScopes.push(parsed.handoff);
+        const sourceBotId = typeof item.sourceBotId === "string" && item.sourceBotId ? item.sourceBotId : threadId;
+        const computed = handoffControl(sourceBotId, item.toBotId, parsed.handoff);
         return [{
           id: typeof item.id === "string" && item.id ? item.id : newId(),
           toBotId: item.toBotId,
+          ...(typeof item.toRoutingKey === "string" ? { toRoutingKey: item.toRoutingKey } : {}),
+          ...(typeof item.toBotName === "string" ? { toBotName: item.toBotName } : {}),
           message: item.message,
           ...(typeof item.reason === "string" ? { reason: item.reason } : {}),
           depth: Math.max(0, Math.trunc(item.depth!)),
+          handoff: parsed.handoff,
+          sourceBotId,
+          stageKey: typeof item.stageKey === "string" && item.stageKey ? item.stageKey : computed.stageKey,
+          evidenceKey: typeof item.evidenceKey === "string" && item.evidenceKey ? item.evidenceKey : computed.evidenceKey,
+          fingerprint: typeof item.fingerprint === "string" && item.fingerprint ? item.fingerprint : computed.fingerprint,
+          attempt: Number.isFinite(item.attempt) ? Math.max(1, Math.trunc(item.attempt!)) : 1,
         }];
       });
       if (items.length) pendingDelegations.set(threadId, items);
@@ -93,7 +165,7 @@ export function pendingThreads(): string[] {
 
 /** How many handoffs one turn may queue. Small on purpose: this is the only
  * thing standing between a confused bot and a fan-out of real turns. */
-const MAX_QUEUED_PER_THREAD = 4;
+export const MAX_QUEUED_PER_THREAD = 4;
 
 /** Validate and enqueue a delegation. Pushes a "Delegated to @B: reason"
  * chip to the source thread so the user can see what was queued. */
@@ -103,26 +175,59 @@ export function queueDelegation(
   item: DelegationItem,
   maxDepth: number,
   sourceThreadId = from.threadId,
+  admission?: DelegationAdmission,
 ): QueueResult {
   if (item.toBotId === from.id) return "self";
   if (item.depth >= maxDepth) return "too_deep";
-  const target = bus.store.bot(item.toBotId);
+  const parsed = parseHandoff(item.message, item.reason, admission?.handoffByteCap);
+  if (!parsed.ok) return "invalid_handoff";
+  const target = bus.store.resolveBotReference(item.toBotId, item.toRoutingKey, item.toBotName);
   if (!target) return "no_target";
   const list = pendingDelegations.get(sourceThreadId) ?? [];
+  const control = handoffControl(from.id, target.id, parsed.handoff);
+  const allPending = [...pendingDelegations.values()].flat();
+  if (
+    bus.store.hasHandoffFingerprint(target.id, control.fingerprint) ||
+    allPending.some((queued) => queued.fingerprint === control.fingerprint)
+  ) return "duplicate";
+  const attempts = bus.store.handoffStageAttempts(target.id, from.id, control.stageKey)
+    + allPending.filter((queued) => queued.sourceBotId === from.id && queued.stageKey === control.stageKey).length;
+  const retryCap = Number.isInteger(admission?.retryCap)
+    ? Math.max(0, Math.min(1, admission!.retryCap))
+    : MAX_STAGE_ATTEMPTS - 1;
+  if (attempts >= 1 + retryCap) return "loop_blocked";
+  if (bus.store.hasActiveHandoffConflict(parsed.handoff.scope)) return "conflict";
   // Async handoff removes the backpressure that ask_bot got for free by
   // making the caller wait. Without a cap, one turn can queue unboundedly
   // and fan out into as many real turns on the next settle.
   if (list.length >= MAX_QUEUED_PER_THREAD) return "too_many";
-  list.push({ ...item, id: newId() });
-  pendingDelegations.set(sourceThreadId, list);
-  savePending();
-  const label = `Delegated to @${target.name}${item.reason ? `: ${item.reason}` : ""}`;
-  bus.store.appendMessage(sourceThreadId, {
-    role: "bot",
-    kind: "activity",
-    tool: { name: label },
-  });
-  return "ok";
+  if (Array.from(pendingDelegations.values()).some((items) => items.some((queued) => scopesConflict(queued.handoff.scope, parsed.handoff.scope)))) {
+    return "conflict";
+  }
+  const reserved = admission?.reserveDelegation?.() ?? false;
+  if (admission?.reserveDelegation && !reserved) return "too_many";
+  try {
+    list.push({
+      ...item,
+      id: newId(),
+      handoff: parsed.handoff,
+      sourceBotId: from.id,
+      ...control,
+      attempt: attempts + 1,
+    });
+    pendingDelegations.set(sourceThreadId, list);
+    savePending();
+    const label = `Delegated to @${target.name}${item.reason ? `: ${item.reason}` : ""}`;
+    bus.store.appendMessage(sourceThreadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: label },
+    });
+    return "ok";
+  } catch (error) {
+    if (reserved) admission?.releaseDelegation?.();
+    throw error;
+  }
 }
 
 /** Drain queued delegations for a source thread (called on its
@@ -141,6 +246,7 @@ export function drainDelegations(
     commsDepth: number,
     sourceThreadId: string,
     channel?: GroupRecord,
+    targetThreadId?: string,
   ) => void | Promise<void>,
 ): void {
   if (drainingThreads.has(threadId)) return;
@@ -215,22 +321,23 @@ async function processOne(
   approvalBus: ApprovalBus,
   from: BotRecord,
   sourceThreadId: string,
-  item: DelegationItem,
+  item: PendingDelegationItem,
   runTarget: (
     toBotId: string,
     message: string,
     commsDepth: number,
     sourceThreadId: string,
     channel?: GroupRecord,
+    targetThreadId?: string,
   ) => void | Promise<void>,
 ): Promise<void> {
   let sender = from;
-  let target = bus.store.bot(item.toBotId);
+  let target = bus.store.resolveBotReference(item.toBotId, item.toRoutingKey, item.toBotName);
   if (!target) {
     bus.store.appendMessage(sourceThreadId, {
       role: "bot",
       kind: "activity",
-      tool: { name: `error: delegation to ${item.toBotId} failed — no such bot`, ok: false },
+      tool: { name: `error: delegation target not found — id=${item.toBotId}${item.toRoutingKey ? ` key=${item.toRoutingKey}` : ""}`, ok: false },
     });
     return;
   }
@@ -263,7 +370,7 @@ async function processOne(
     // checked above is a stale snapshot now: re-read both bots and re-check
     // busy, or an allow can start a second turn on a bot that is mid-turn —
     // and mirror a "Messaged @X" chip for an exchange that never happens.
-    const current = bus.store.bot(item.toBotId);
+    const current = bus.store.resolveBotReference(item.toBotId, item.toRoutingKey, item.toBotName);
     const currentSender = bus.store.bot(from.id);
     if (!current || !currentSender || !bus.store.taskByThread(currentSender.id, sourceThreadId)) return;
     if (current.busy) {
@@ -277,11 +384,50 @@ async function processOne(
     sender = currentSender;
     target = current;
   }
+  if (bus.store.hasActiveHandoffConflict(item.handoff.scope)) {
+    bus.store.appendMessage(sourceThreadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: `Delegation to @${target.name} canceled — worktree or file scope is already active`, ok: false },
+    });
+    return;
+  }
+  // A handoff is a new unit of work. Give the target a fresh transcript and
+  // provider session before mirroring the request, while ask_bot remains a
+  // conversational exchange in the target's current task.
+  const taskTitle = item.handoff.objective.trim().slice(0, 80) || item.reason?.trim().slice(0, 80) || "Delegated task";
+  const task = bus.store.createTask(target.id, taskTitle, true, item.handoff.scope, {
+    sourceBotId: item.sourceBotId,
+    stageKey: item.stageKey,
+    evidenceKey: item.evidenceKey,
+    fingerprint: item.fingerprint,
+    attempt: item.attempt,
+  });
+  if (!task) {
+    bus.store.appendMessage(sourceThreadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: `error: delegation to @${target.name} failed — could not create a fresh task`, ok: false },
+    });
+    return;
+  }
   const channel = getOrCreateChannel(bus.store, sender, target);
-  mirrorExchange(bus, sender, target, item.message, channel, sourceThreadId);
+  mirrorExchange(bus, sender, target, item.message, channel, sourceThreadId, task.threadId);
   const reasonLine = item.reason ? `\n\n[Reason: ${item.reason}]` : "";
   const prefixed = `[Delegated by @${sender.name}, another bot in this OpenMausBot workspace. Do the work and reply directly.]\n\n${item.message}${reasonLine}`;
-  await runTarget(item.toBotId, prefixed, item.depth + 1, sourceThreadId, channel);
+  // `resolveBotReference` may have found the worker through its stable
+  // routing key or name while `item.toBotId` is a stale UUID from an older
+  // roster. Start the turn with the canonical live record we just resolved;
+  // passing the original reference here reintroduced `no such bot` after a
+  // delegation had already been accepted into the queue.
+  try {
+    await runTarget(target.id, prefixed, item.depth + 1, sourceThreadId, channel, task.threadId);
+  } catch (error) {
+    // Dispatch failed before a provider turn could settle. This task has no
+    // receipt and therefore cannot become durable replay evidence.
+    bus.store.setHandoffTaskState(target.id, task.threadId, "interrupted");
+    throw error;
+  }
 }
 
 /** Test helper: how many items remain queued for a thread. */

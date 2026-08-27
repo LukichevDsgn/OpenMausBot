@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import { filterCustomModels, partitionCustomModels, suggestedModels } from "./custom-models";
+import { filterCustomModels, isOpenMausEndpointModel, partitionCustomModels, suggestedModels } from "./custom-models";
+
+describe("isOpenMausEndpointModel", () => {
+  it("recognizes endpoint-backed model ids without treating local models as API models", () => {
+    expect(isOpenMausEndpointModel("endpoint::openrouter::z-ai%2Fglm-5.2")).toBe(true);
+    expect(isOpenMausEndpointModel("ollama::llama3.2:latest")).toBe(false);
+    expect(isOpenMausEndpointModel(null)).toBe(false);
+  });
+});
 
 const rows = [
   { id: "omlx::gemma-4-31b-it-bf16", label: "gemma-4-31b-it-bf16 (oMLX)", loaded: true },

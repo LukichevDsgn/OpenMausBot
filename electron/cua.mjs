@@ -25,12 +25,17 @@ import { pathToFileURL } from "node:url";
 const require = createRequire(import.meta.url);
 const { createCuaConnectionStore } = require("./cua-connection.cjs");
 const {
+  probeWindowsDriver,
+  resolveWindowsDriverCandidate,
+  windowsCuaConnection,
+} = require("./cua-windows.cjs");
+const {
   createLinuxCuaRuntime,
   createUnavailableLinuxRuntime,
 } = require("./cua-linux-runtime.cjs");
 const { cleanupAppImageCuaBundle, stageAppImageCuaBundle } = require("./cua-linux-bundle.cjs");
 
-const INSTALLED_DRIVER = "/Applications/CuaDriver.app/Contents/MacOS/cua-driver";
+const INSTALLED_MAC_DRIVER = "/Applications/CuaDriver.app/Contents/MacOS/cua-driver";
 const STANDALONE_SOCKET = path.join(
   app.getPath("home"),
   "Library/Caches/cua-driver/cua-driver.sock",
@@ -84,12 +89,20 @@ export function setCuaStateListener(listener) {
 }
 
 export function resolveDriverBinary() {
+  if (process.platform === "win32") {
+    return resolveWindowsDriverCandidate({
+      env: process.env,
+      resourcesPath: process.resourcesPath,
+      homeDir: app.getPath("home"),
+      packaged: app.isPackaged,
+    })?.path ?? null;
+  }
   if (process.env.CUA_DRIVER_PATH) return process.env.CUA_DRIVER_PATH;
   if (app.isPackaged) {
     const bundled = path.join(process.resourcesPath, "cua-driver");
     if (fs.existsSync(bundled)) return bundled;
   }
-  if (fs.existsSync(INSTALLED_DRIVER)) return INSTALLED_DRIVER;
+  if (fs.existsSync(INSTALLED_MAC_DRIVER)) return INSTALLED_MAC_DRIVER;
   return null;
 }
 
@@ -152,12 +165,28 @@ async function startEmbedded(binary) {
 
 export async function startCua() {
   if (process.platform === "linux") return ensureLinuxRuntime().initialize();
-  const binary = resolveDriverBinary();
+  let windowsCandidate = null;
+  const binary = process.platform === "win32"
+    ? (windowsCandidate = resolveWindowsDriverCandidate({
+        env: process.env,
+        resourcesPath: process.resourcesPath,
+        homeDir: app.getPath("home"),
+        packaged: app.isPackaged,
+      }))?.path ?? null
+    : resolveDriverBinary();
   if (!binary) {
     return connectionStore.persist({
       mode: "unavailable",
       reason: "cua-driver binary not found",
     });
+  }
+
+  if (process.platform === "win32") {
+    const probe = probeWindowsDriver(binary, {
+      env: process.env,
+      source: windowsCandidate?.source,
+    });
+    return connectionStore.persist(windowsCuaConnection(binary, probe));
   }
 
   const wantEmbedded =
@@ -196,10 +225,17 @@ export async function startCua() {
 export function cuaPermissionsStatus() {
   const binary = resolveDriverBinary();
   if (!binary) return { available: false };
+  const probeEnv = process.platform === "win32"
+    ? {
+        ...process.env,
+        CUA_DRIVER_RS_UPDATE_CHECK: "false",
+        CUA_DRIVER_RS_TELEMETRY_ENABLED: "false",
+      }
+    : { ...process.env, ...CUA_ENV };
   const out = spawnSync(binary, ["permissions", "status", "--json"], {
     encoding: "utf8",
     timeout: 5000,
-    env: { ...process.env, ...CUA_ENV },
+    env: probeEnv,
   });
   try {
     return { available: true, ...JSON.parse(out.stdout) };

@@ -128,6 +128,51 @@ describe("augmentedPath", () => {
       rmSync(localAppData, { recursive: true, force: true });
     }
   });
+
+  it.skipIf(process.platform !== "win32")("exposes Git for Windows grep to GUI-launched agents", () => {
+    const previous = process.env.ProgramW6432;
+    const programFiles = mkdtempSync(join(tmpdir(), "omb-program-files-"));
+    try {
+      process.env.ProgramW6432 = programFiles;
+      const gitTools = join(programFiles, "Git", "usr", "bin");
+      mkdirSync(gitTools, { recursive: true });
+      writeFileSync(join(gitTools, "grep.exe"), "fixture");
+      resetPathCacheForTests();
+      expect(augmentedPath().split(delimiter)).toContain(gitTools);
+    } finally {
+      if (previous === undefined) delete process.env.ProgramW6432;
+      else process.env.ProgramW6432 = previous;
+      resetPathCacheForTests();
+      rmSync(programFiles, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== "win32")("does not add the donor Bun directory automatically but honors explicit OMB_EXTRA_PATH", () => {
+    const previousLocalAppData = process.env.LOCALAPPDATA;
+    const previousExtraPath = process.env.OMB_EXTRA_PATH;
+    const localAppData = mkdtempSync(join(tmpdir(), "omb-onlook-bun-"));
+    try {
+      process.env.LOCALAPPDATA = localAppData;
+      const bunDir = join(localAppData, "Programs", "@onlookstudio", "resources", "bun");
+      mkdirSync(bunDir, { recursive: true });
+      writeFileSync(join(bunDir, "bun.exe"), "fixture");
+      resetPathCacheForTests();
+      expect(augmentedPath().split(delimiter)).not.toContain(bunDir);
+
+      process.env.OMB_EXTRA_PATH = bunDir;
+      resetPathCacheForTests();
+      const explicitParts = augmentedPath().split(delimiter);
+      expect(explicitParts[0]).toBe(bunDir);
+      expect(explicitParts).toContain(bunDir);
+    } finally {
+      if (previousLocalAppData === undefined) delete process.env.LOCALAPPDATA;
+      else process.env.LOCALAPPDATA = previousLocalAppData;
+      if (previousExtraPath === undefined) delete process.env.OMB_EXTRA_PATH;
+      else process.env.OMB_EXTRA_PATH = previousExtraPath;
+      resetPathCacheForTests();
+      rmSync(localAppData, { recursive: true, force: true });
+    }
+  });
 });
 
 // Windows CLI resolution — spawn(cli) alone finds nothing on Windows (no

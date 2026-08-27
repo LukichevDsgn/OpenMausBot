@@ -1,7 +1,8 @@
+import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import type { Stats } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, win32 } from "node:path";
 
 export const REQUIRED_LINUX_TOOLS = ["click", "get_window_state", "list_apps", "type_text"];
 // Keep this exact field set synchronized with DRIVER_FILE_IDENTITY_KEYS in
@@ -16,6 +17,7 @@ export const DRIVER_FILE_IDENTITY_KEYS = [
   "mtimeNs",
   "ctimeNs",
 ] as const;
+export const WINDOWS_DRIVER_FILE_IDENTITY_KEYS = ["sha256", "size", "mtimeNs", "ctimeNs"] as const;
 
 export type LocalComputerConnection = {
   command: string;
@@ -41,7 +43,7 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boo
 }
 
 function legacyPlatform(platform: NodeJS.Platform): "darwin" | "win32" | null {
-  if (platform === "darwin" || platform === "win32") return platform;
+  if (platform === "darwin") return platform;
   return null;
 }
 
@@ -76,6 +78,132 @@ function sameDriverFileIdentity(expected: unknown, actual: Record<string, string
     validDriverFileIdentity(expected) &&
     DRIVER_FILE_IDENTITY_KEYS.every((key) => expected[key] === actual[key])
   );
+}
+
+function absoluteForPlatform(value: unknown, platform: "darwin" | "win32"): value is string {
+  return typeof value === "string" && (platform === "win32" ? win32.isAbsolute(value) || isAbsolute(value) : isAbsolute(value));
+}
+
+function validWindowsDriverFileIdentity(value: unknown): value is Record<string, string> {
+  return (
+    Boolean(value) &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    exactKeys(value as Record<string, unknown>, WINDOWS_DRIVER_FILE_IDENTITY_KEYS) &&
+    WINDOWS_DRIVER_FILE_IDENTITY_KEYS.every((key) =>
+      typeof (value as Record<string, unknown>)[key] === "string" &&
+      (key === "sha256"
+        ? /^[0-9a-f]{64}$/i.test((value as Record<string, string>)[key])
+        : /^\d+$/.test((value as Record<string, string>)[key])),
+    )
+  );
+}
+
+function currentWindowsDriverFileIdentity(file: string): Record<string, string> {
+  const stat = statSync(file, { bigint: true });
+  return {
+    sha256: createHash("sha256").update(readFileSync(file)).digest("hex"),
+    size: String(stat.size),
+    mtimeNs: String(stat.mtimeNs ?? BigInt(Math.trunc(Number(stat.mtimeMs) * 1_000_000))),
+    ctimeNs: String(stat.ctimeNs ?? BigInt(Math.trunc(Number(stat.ctimeMs) * 1_000_000))),
+  };
+}
+
+function sameWindowsDriverFileIdentity(expected: unknown, actual: Record<string, string>): boolean {
+  return validWindowsDriverFileIdentity(expected) &&
+    WINDOWS_DRIVER_FILE_IDENTITY_KEYS.every((key) => expected[key] === actual[key]);
+}
+
+const WINDOWS_DESCRIPTOR_KEYS = [
+  "schemaVersion",
+  "mode",
+  "platform",
+  "status",
+  "enabled",
+  "driver",
+  "mcp",
+  "mcpCommand",
+  "mcpArgs",
+  "mcpEnv",
+] as const;
+
+function decodeWindowsDescriptor(value: Record<string, unknown>): LocalComputerConnection | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const hasHealth = Object.prototype.hasOwnProperty.call(value, "health");
+  const hasHealthWarning = Object.prototype.hasOwnProperty.call(value, "healthWarning");
+  const allowedKeys = [...WINDOWS_DESCRIPTOR_KEYS, "health", "healthWarning"];
+  if (
+    !Object.keys(value).every((key) => allowedKeys.includes(key)) ||
+    Object.keys(value).length !== WINDOWS_DESCRIPTOR_KEYS.length + (hasHealth ? 2 : 0) ||
+    hasHealth !== hasHealthWarning ||
+    value.schemaVersion !== 1 ||
+    value.mode !== "standalone" ||
+    value.platform !== "win32" ||
+    value.status !== "ready" ||
+    value.enabled !== true ||
+    (hasHealth && (value.health !== "degraded" || typeof value.healthWarning !== "string"))
+  ) {
+    return null;
+  }
+
+  const driver = value.driver as Record<string, unknown>;
+  const mcp = value.mcp as Record<string, unknown>;
+  if (
+    !driver ||
+    !mcp ||
+    Array.isArray(driver) ||
+    Array.isArray(mcp) ||
+    !exactKeys(driver, ["path", "version", "source", "manifestSchema", "fileIdentity"]) ||
+    !exactKeys(mcp, ["command", "args", "env"])
+  ) {
+    return null;
+  }
+
+  const mcpEnv = mcp.env as Record<string, unknown>;
+  const topEnv = value.mcpEnv as Record<string, unknown>;
+  const expectedEnv = {
+    CUA_DRIVER_RS_UPDATE_CHECK: "false",
+    CUA_DRIVER_RS_TELEMETRY_ENABLED: "false",
+  };
+  if (
+    typeof driver.path !== "string" ||
+    !absoluteForPlatform(driver.path, "win32") ||
+    typeof driver.version !== "string" ||
+    !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(driver.version) ||
+    !["environment", "bundled", "user-local"].includes(String(driver.source)) ||
+    driver.manifestSchema !== "1" ||
+    !validWindowsDriverFileIdentity(driver.fileIdentity) ||
+    mcp.command !== driver.path ||
+    !Array.isArray(mcp.args) ||
+    mcp.args.length !== 1 ||
+    mcp.args[0] !== "mcp" ||
+    !mcpEnv ||
+    typeof mcpEnv !== "object" ||
+    Array.isArray(mcpEnv) ||
+    !exactKeys(mcpEnv, Object.keys(expectedEnv)) ||
+    mcpEnv.CUA_DRIVER_RS_UPDATE_CHECK !== expectedEnv.CUA_DRIVER_RS_UPDATE_CHECK ||
+    mcpEnv.CUA_DRIVER_RS_TELEMETRY_ENABLED !== expectedEnv.CUA_DRIVER_RS_TELEMETRY_ENABLED ||
+    value.mcpCommand !== driver.path ||
+    !Array.isArray(value.mcpArgs) ||
+    value.mcpArgs.length !== 1 ||
+    value.mcpArgs[0] !== "mcp" ||
+    !topEnv ||
+    typeof topEnv !== "object" ||
+    Array.isArray(topEnv) ||
+    !exactKeys(topEnv, Object.keys(expectedEnv)) ||
+    topEnv.CUA_DRIVER_RS_UPDATE_CHECK !== expectedEnv.CUA_DRIVER_RS_UPDATE_CHECK ||
+    topEnv.CUA_DRIVER_RS_TELEMETRY_ENABLED !== expectedEnv.CUA_DRIVER_RS_TELEMETRY_ENABLED
+  ) {
+    return null;
+  }
+
+  return {
+    command: driver.path,
+    args: [...(mcp.args as string[])],
+    env: { ...(mcpEnv as Record<string, string>) },
+    platform: "win32",
+    scope: "local-computer",
+  };
 }
 
 function decodeLegacyDescriptor(
@@ -309,16 +437,40 @@ export function validateLinuxDescriptorRuntime(
   }
 }
 
+export function validateWindowsDescriptorRuntime(
+  descriptorFile: string,
+  raw: Record<string, unknown>,
+): boolean {
+  try {
+    const descriptorStat = lstatSync(descriptorFile);
+    if (!descriptorStat.isFile() || descriptorStat.isSymbolicLink()) return false;
+    if (!decodeWindowsDescriptor(raw)) return false;
+    const driver = raw.driver as Record<string, unknown>;
+    const binaryPath = driver.path as string;
+    const binaryStat = statSync(binaryPath);
+    return (
+      binaryStat.isFile() &&
+      absoluteForPlatform(binaryPath, "win32") &&
+      realpathSync(binaryPath) === binaryPath &&
+      sameWindowsDriverFileIdentity(driver.fileIdentity, currentWindowsDriverFileIdentity(binaryPath))
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function readCuaConnection({
   platform = process.platform,
   userData = process.env.OMB_USER_DATA,
   home = homedir(),
   validateLinuxRuntime = validateLinuxDescriptorRuntime,
+  validateWindowsRuntime = validateWindowsDescriptorRuntime,
 }: {
   platform?: NodeJS.Platform;
   userData?: string;
   home?: string;
   validateLinuxRuntime?: (file: string, raw: LinuxConnectionDescriptor) => boolean;
+  validateWindowsRuntime?: (file: string, raw: Record<string, unknown>) => boolean;
 } = {}): LocalComputerConnection | null {
   const candidates = userData ? [join(userData, "cua-connection.json")] : [];
   if (platform === "darwin") {
@@ -334,6 +486,9 @@ export function readCuaConnection({
       if (platform === "linux") {
         const decoded = decodeLinuxDescriptor(raw);
         if (decoded && validateLinuxRuntime(file, raw)) return decoded;
+      } else if (platform === "win32") {
+        const decoded = decodeWindowsDescriptor(raw);
+        if (decoded && validateWindowsRuntime(file, raw)) return decoded;
       } else {
         const decoded = decodeLegacyDescriptor(raw, platform);
         if (decoded) return decoded;

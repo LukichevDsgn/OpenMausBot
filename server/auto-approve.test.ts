@@ -4,7 +4,7 @@
 // question is never answered by the machine.
 import { describe, expect, it } from "vitest";
 
-import { approvalKey, autoDecision, looksDestructive, looksSensitive } from "./auto-approve.ts";
+import { approvalKey, autoDecision, autoVerdict, looksDestructive, looksSensitive } from "./auto-approve.ts";
 
 describe("looksDestructive", () => {
   const dangerous = [
@@ -120,6 +120,43 @@ describe("autoDecision", () => {
     expect(
       autoDecision(bot, "mcp__computer__click", "Click the Submit button", {
         scope: "local-computer",
+      }),
+    ).toBeNull();
+  });
+
+  it("allows only the exact explicitly granted local app, including unattended work", () => {
+    const bot = { localComputerAllowApps: ["framer.exe"] };
+    expect(
+      autoVerdict(bot, "mcp:node_repl/tool", "Use Framer", {
+        scope: "local-computer",
+        localComputerApp: "Framer.exe",
+        unattended: true,
+      }),
+    ).toMatchObject({
+      approve: "auto-approved framer.exe (local app grant)",
+      source: "local-computer-app-grant",
+      rule: "local-computer:app:framer.exe",
+    });
+    expect(
+      autoDecision(bot, "mcp:node_repl/tool", "Use Terminal", {
+        scope: "local-computer",
+        localComputerApp: "terminal.exe",
+      }),
+    ).toBeNull();
+  });
+
+  it("does not let an app grant override destructive or sensitive guards", () => {
+    const bot = { localComputerAllowApps: ["framer.exe"] };
+    expect(
+      autoDecision(bot, "mcp:node_repl/tool", "git reset --hard", {
+        scope: "local-computer",
+        localComputerApp: "framer.exe",
+      }),
+    ).toBeNull();
+    expect(
+      autoDecision(bot, "mcp:node_repl/tool", "read ~/.ssh/id_rsa", {
+        scope: "local-computer",
+        localComputerApp: "framer.exe",
       }),
     ).toBeNull();
   });

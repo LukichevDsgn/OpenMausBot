@@ -14,6 +14,8 @@ export interface WatchedTurn {
   botId: string;
   startedAt: number;
   lastEventAt: number;
+  /** Captured at admission; later policy PATCHes cannot change this turn. */
+  idleMs: number;
   waitingOnHuman: boolean;
 }
 
@@ -54,9 +56,17 @@ export class TurnWatchdog {
   }
 
   /** A turn was dispatched on this thread. */
-  watch(threadId: string, botId: string): void {
+  watch(threadId: string, botId: string, idleMs = this.opts.stallMs): void {
     const at = this.now();
-    this.turns.set(threadId, { threadId, botId, startedAt: at, lastEventAt: at, waitingOnHuman: false });
+    const capturedIdleMs = Number.isFinite(idleMs) && idleMs > 0 ? Math.trunc(idleMs) : this.opts.stallMs;
+    this.turns.set(threadId, {
+      threadId,
+      botId,
+      startedAt: at,
+      lastEventAt: at,
+      idleMs: capturedIdleMs,
+      waitingOnHuman: false,
+    });
   }
 
   /** Any provider event for the thread proves the turn is alive. */
@@ -88,7 +98,7 @@ export class TurnWatchdog {
     const at = this.now();
     for (const turn of this.turns.values()) {
       if (turn.waitingOnHuman) continue;
-      if (at - turn.lastEventAt < this.opts.stallMs) continue;
+      if (at - turn.lastEventAt < turn.idleMs) continue;
       this.turns.delete(turn.threadId);
       this.opts.onStall(turn);
     }

@@ -12,6 +12,12 @@ describe("callKey", () => {
     expect(callKey("Bash", "Bash")).toBeNull();
     expect(callKey("Read", "Read src/index.ts")).toBe("Read:Read src/index.ts");
   });
+
+  it("distinguishes display-truncated calls by their complete-argument fingerprint", () => {
+    const title = '"C:\\Windows\\powershell.exe" -NoProfile -Command';
+    expect(callKey("tool", title, "sha-a")).not.toBe(callKey("tool", title, "sha-b"));
+    expect(callKey("tool", title, "sha-a")).toBe(callKey("tool", title, "sha-a"));
+  });
 });
 
 describe("RepeatDetector", () => {

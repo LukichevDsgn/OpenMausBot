@@ -31,7 +31,20 @@ export function needsSignIn(instance: InstanceInfo | undefined): boolean {
 /** The agent CLI itself is absent. Local-model injection needs the CLI but
  * does not need its cloud account to be signed in. */
 export function needsCli(instance: InstanceInfo | undefined): boolean {
-  return instance?.snapshot.state !== "available";
+  if (!instance || instance.snapshot.state === "available") return false;
+  if (instance.snapshot.setup !== undefined) return instance.snapshot.setup;
+
+  // Backward compatibility for older provider snapshots. Do not equate a
+  // timeout, profile lock, provider rejection, or another runtime failure
+  // with an absent executable.
+  const reason = instance.snapshot.reason ?? "";
+  return /\bENOENT\b|isn't installed|not installed|(?:CLI|command|binary) (?:was )?not found/i.test(reason);
+}
+
+/** The engine cannot be used right now, regardless of whether installation
+ * is the remedy. */
+export function engineUnavailable(instance: InstanceInfo | undefined): boolean {
+  return instance?.snapshot.state === "unavailable";
 }
 
 function CommandRow({ command, actionLabel }: { command: string; actionLabel: string }) {
@@ -119,6 +132,7 @@ export function EngineSetup({
   const installCommand = installCommandFor(install);
   const signInCommand = install?.signInCommand;
   const signInOnly = intent === "cloud" && needsSignIn(instance);
+  const unavailableOnly = engineUnavailable(instance) && !needsCli(instance);
   const command = signInOnly ? signInCommand : installCommand;
   const title = signInOnly ? `Sign in to ${instance.displayName}` : `Install ${instance.displayName}`;
   const description = signInOnly
@@ -126,6 +140,17 @@ export function EngineSetup({
     : intent === "inject"
       ? "Install the agent once, then you can run it with local models—no cloud sign-in required."
       : `Install the command-line app once. Models will appear here as soon as it’s ready${signInCommand ? "; sign-in may follow" : ""}.`;
+
+  if (unavailableOnly) {
+    return (
+      <div className={cn("rounded-xl border border-hairline/40 bg-raised/30 p-3", className)}>
+        <div className="text-[13px] font-semibold text-ink">{instance.displayName} is temporarily unavailable</div>
+        <p className="mt-1 text-[12px] leading-relaxed text-ink-secondary">
+          {instance.snapshot.reason ?? "The engine probe did not complete. Reopen this menu to retry."}
+        </p>
+      </div>
+    );
+  }
 
   // Some engines are configured elsewhere (for example, a cloud computer
   // token) and intentionally have no install descriptor.

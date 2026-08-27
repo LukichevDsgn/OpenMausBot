@@ -14,6 +14,8 @@ export interface LocalHost {
   baseUrl: string;
   apiKey?: string;
   apiKeyEnv?: string;
+  codexEnvKey?: string;
+  codexModels?: Array<{ id: string; label: string }>;
 }
 
 export const LOCAL_HOSTS: LocalHost[] = [
@@ -26,9 +28,31 @@ export const LOCAL_HOSTS: LocalHost[] = [
   { id: "unsloth_api", label: "Unsloth", baseUrl: "http://127.0.0.1:8888/v1", apiKeyEnv: "UNSLOTH_STUDIO_AUTH_TOKEN" },
 ];
 
+/** Cloud OpenAI-compatible hosts managed by OpenMausBot. These are used by
+ * Codex as an agent harness, so the aggregator key never needs to enter a
+ * third-party CLI's global config or Hermes. */
+export const API_HOSTS: LocalHost[] = [
+  {
+    id: "nvidia",
+    label: "NVIDIA NIM (API)",
+    baseUrl: "https://integrate.api.nvidia.com/v1",
+    apiKeyEnv: "OPENMAUSBOT_NVIDIA_API_KEY",
+    codexEnvKey: "OPENMAUSBOT_NVIDIA_API_KEY",
+    codexModels: [{ id: "z-ai/glm-5.2", label: "GLM 5.2 (NVIDIA NIM)" }],
+  },
+  {
+    id: "openrouter",
+    label: "OpenRouter (API)",
+    baseUrl: "https://openrouter.ai/api/v1",
+    apiKeyEnv: "OPENMAUSBOT_OPENROUTER_API_KEY",
+    codexEnvKey: "OPENMAUSBOT_OPENROUTER_API_KEY",
+    codexModels: [{ id: "z-ai/glm-5.2", label: "GLM 5.2 (OpenRouter)" }],
+  },
+];
+
 export const INJECT_SEP = "::";
 
-const HOST_BY_ID = new Map(LOCAL_HOSTS.map((host) => [host.id, host]));
+const HOST_BY_ID = new Map([...LOCAL_HOSTS, ...API_HOSTS].map((host) => [host.id, host]));
 const MODEL_ID = /^[\w][\w./:+-]*$/;
 
 export interface InjectedModel {
@@ -92,7 +116,9 @@ export function codexLocalProviderArgs(
   if (!inject || CODEX_RESERVED_PROVIDERS.has(inject.host)) return [];
   const host = localHost(inject.host);
   if (!host) return [];
-  const envKey = `OPENMAUSBOT_LOCAL_${host.id.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_API_KEY`;
+  const envKey =
+    host.codexEnvKey ??
+    `OPENMAUSBOT_LOCAL_${host.id.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_API_KEY`;
   env[envKey] = hostApiKey(host, env);
   return [
     "-c",
@@ -102,6 +128,22 @@ export function codexLocalProviderArgs(
     "-c",
     `model_providers.${host.id}.env_key=${JSON.stringify(envKey)}`,
   ];
+}
+
+/** Curated direct-provider rows. Discovery is deliberately opt-in and small:
+ * a provider's `/models` endpoint can be very large and should not create a
+ * noisy model picker or unexpected network traffic on every boot. */
+export function configuredCodexApiModels(env: Record<string, string | undefined> = process.env): ModelCatalog {
+  const options = API_HOSTS.flatMap((host) =>
+    env[host.apiKeyEnv ?? ""]
+      ? (host.codexModels ?? []).map((model) => ({
+          id: encodeInjectId(host.id, model.id),
+          label: model.label,
+          custom: true,
+        }))
+      : [],
+  );
+  return { default: options[0]?.id ?? "", options };
 }
 
 function readUnslothKey(env: Record<string, string | undefined>): string | null {

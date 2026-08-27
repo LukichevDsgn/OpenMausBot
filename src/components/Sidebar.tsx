@@ -8,9 +8,11 @@ import {
   Bot as BotIcon,
   CalendarDays,
   Check,
+  ChevronDown,
   ClipboardCopy,
   Copy,
   Crown,
+  ExternalLink,
   FolderMinus,
   FolderPlus,
   Library,
@@ -53,10 +55,13 @@ function profileInitials(profile?: { name?: string; email?: string }): string {
   return email ? email[0]!.toUpperCase() : "?";
 }
 
+const OFFICIAL_RELEASE_NOTES_URL =
+  "https://github.com/milind-soni/openmausbot-releases/releases";
+
 /** Manual update check, next to the settings gear. Packaged app only (no
- * bridge in dev/browser). One button, state-dependent: check → download →
- * restart, with a brief "up to date" tick when a check finds nothing so a
- * click is never silent. The bottom-left popup handles the loud cases. */
+ * bridge in dev/browser). Direct updates remain check → download → restart;
+ * source integration opens the official release notes for developer review.
+ * The bottom-left popup handles the loud cases. */
 function UpdateButton() {
   const s = useUpdaterState();
   const [checkedAt, setCheckedAt] = useState(0);
@@ -75,10 +80,14 @@ function UpdateButton() {
   }, [upToDate]);
   if (!updater) return null;
 
+  const sourceIntegration = s?.mode === "source-integration";
+  const sourceActionable = sourceIntegration && (status === "available" || status === "downloaded");
   const working =
     pending || status === "checking" || status === "downloading" || status === "installing";
   const label =
-    status === "available"
+    sourceActionable
+      ? `Official developer update ${s?.version ?? ""} available — open release notes`
+      : status === "available"
       ? `Version ${s?.version ?? ""} available — download`
       : status === "downloading"
         ? s?.percent == null
@@ -97,6 +106,10 @@ function UpdateButton() {
   return (
     <button
       onClick={() => {
+        if (sourceActionable) {
+          void window.ogb?.openExternal?.(OFFICIAL_RELEASE_NOTES_URL);
+          return;
+        }
         if (status === "downloaded") {
           setPending(true);
           return void updater.install();
@@ -117,12 +130,14 @@ function UpdateButton() {
         <Loader2 size={18} className="animate-spin" />
       ) : upToDate ? (
         <Check size={18} />
+      ) : sourceActionable ? (
+        <ExternalLink size={18} />
       ) : status === "available" ? (
         <ArrowDownToLine size={18} />
       ) : (
         <RefreshCw size={18} />
       )}
-      {status === "downloaded" && (
+      {status === "downloaded" && !sourceIntegration && (
         <span className="absolute right-1.5 top-1.5 size-2 rounded-full bg-accent" />
       )}
     </button>
@@ -348,19 +363,6 @@ function NewRoomPanel({ onClose }: { onClose: () => void }) {
           Create Room{picked.size ? ` · ${picked.size} ${picked.size === 1 ? "bot" : "bots"}` : ""}
         </button>
       </div>
-    </div>
-  );
-}
-
-/** Labeled divider between sidebar sections. Same typographic register as
- * EngineGroupLabel so the sidebar reads as one system. */
-function SectionDivider({ name }: { name: string }) {
-  return (
-    <div className="flex items-center gap-2 px-3 pb-1 pt-3 first:pt-0" data-section={name}>
-      <span className="text-[10px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
-        {name}
-      </span>
-      <span className="h-px flex-1 bg-hairline/40" />
     </div>
   );
 }
@@ -887,6 +889,14 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
     restoreBot?: { id: string; name: string };
   } | null>(null);
   const [query, setQuery] = useState("");
+  const [projectFilter, setProjectFilter] = useState(() => localStorage.getItem("openmausbot.sidebar.project") ?? "all");
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
+  const [projectFolders, setProjectFolders] = useState<Record<string, string>>(() => {
+    try { return JSON.parse(localStorage.getItem("openmausbot.sidebar.projects") ?? "{}"); } catch { return {}; }
+  });
+  const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>(() => {
+    try { return JSON.parse(localStorage.getItem("openmausbot.sidebar.collapsed") ?? "{}"); } catch { return {}; }
+  });
 
   // Esc closes the drawer, mirroring ApiKeys.tsx:75-85. Bound only while the
   // drawer is open — on mobile, exactly when a bot/room context menu or the
@@ -1012,8 +1022,30 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   // instantly from local state; transcript hits are the SearchResults
   // section below the list (debounced, lands on the message).
 
+  const projectNames = [...new Set([...Object.keys(projectFolders), ...state.bots.filter((bot) => !bot.hidden && bot.section).map((bot) => bot.section!)])]
+    .sort((a, b) => a.localeCompare(b));
+  const setProject = (project: string) => {
+    setProjectFilter(project);
+    localStorage.setItem("openmausbot.sidebar.project", project);
+    setProjectMenuOpen(false);
+  };
+  const addProject = async () => {
+    const cwd = await window.ogb?.pickFolder?.();
+    if (!cwd) return;
+    const name = cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? cwd;
+    const next = { ...projectFolders, [name]: cwd };
+    setProjectFolders(next);
+    localStorage.setItem("openmausbot.sidebar.projects", JSON.stringify(next));
+    setProject(name);
+  };
+  const toggleProject = (project: string) => {
+    const next = { ...collapsedProjects, [project]: !collapsedProjects[project] };
+    setCollapsedProjects(next);
+    localStorage.setItem("openmausbot.sidebar.collapsed", JSON.stringify(next));
+  };
   const matchingBots = state.bots
     .filter((b) => !b.hidden)
+    .filter((b) => projectFilter === "all" || b.section === projectFilter)
     .filter(
       (b) =>
         !q ||
@@ -1021,20 +1053,16 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
         (b.title ?? "").toLowerCase().includes(q) ||
         preview(b).toLowerCase().includes(q),
     );
-  const chiefBot = matchingBots.find((bot) => bot.chiefOfStaff);
+  const chiefBots = matchingBots.filter((bot) => bot.chiefOfStaff);
   const sectionedBots = matchingBots
     .filter((bot) => !bot.chiefOfStaff && bot.section)
     .sort((a, b) => Number(b.pinned ?? false) - Number(a.pinned ?? false));
   const visibleBots = matchingBots
     .filter((bot) => !bot.chiefOfStaff && !bot.section)
     .sort((a, b) => Number(b.pinned ?? false) - Number(a.pinned ?? false));
-  // sections keep first-appearance order within the current list; a section
-  // whose bots all moved away (or fell out of the filter) simply vanishes
-  const sectionNames: string[] = [];
-  for (const bot of sectionedBots) {
-    if (!sectionNames.includes(bot.section!)) sectionNames.push(bot.section!);
-  }
-  const visibleGroups = state.groups.filter((g) => !q || g.name.toLowerCase().includes(q));
+  const visibleGroups = state.groups
+    .filter((group) => projectFilter === "all" || group.memberIds.some((id) => state.bots.some((bot) => bot.id === id && bot.section === projectFilter)))
+    .filter((g) => !q || g.name.toLowerCase().includes(q));
   const activeBotCount = state.bots.filter((bot) => !bot.hidden).length;
   const archivedBots = state.bots.filter((bot) => bot.hidden);
   const pendingTeamUndo = teamFeedback?.undo;
@@ -1090,7 +1118,10 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
                   onClick={() => {
                     setPlusOpen(false);
                     track("bot_created");
-                    dispatch({ type: "newBot" });
+                    dispatch({
+                      type: "newBot",
+                      ...(projectFilter !== "all" ? { section: projectFilter, cwd: projectFolders[projectFilter] } : {}),
+                    });
                   }}
                   className="flex w-full items-center gap-3 px-3.5 py-2 text-left text-[14px] text-ink hover:bg-raised/70"
                 >
@@ -1106,6 +1137,16 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
                 >
                   <Users size={16} className="text-ink-secondary" />
                   New Room
+                </button>
+                <button
+                  onClick={() => {
+                    setPlusOpen(false);
+                    void addProject();
+                  }}
+                  className="flex w-full items-center gap-3 px-3.5 py-2 text-left text-[14px] text-ink hover:bg-raised/70"
+                >
+                  <FolderPlus size={16} className="text-ink-secondary" />
+                  Add project
                 </button>
                 <button
                   onClick={() => {
@@ -1149,6 +1190,35 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
 
       {/* Search */}
       <div className="px-3 pt-2 pb-3">
+        <div className="relative mb-2">
+          <button
+            type="button"
+            onClick={() => setProjectMenuOpen((value) => !value)}
+            className="flex w-full items-center justify-between rounded-lg border border-hairline/40 bg-raised/70 px-3 py-2 text-[13px] font-medium text-ink hover:bg-raised"
+            aria-expanded={projectMenuOpen}
+          >
+            <span className="truncate">{projectFilter === "all" ? "All projects" : projectFilter}</span>
+            <ChevronDown size={14} className={cn("mr-0.5 shrink-0 text-ink-secondary transition-transform", projectMenuOpen && "rotate-180")} />
+          </button>
+          {projectMenuOpen && (
+            <>
+              <button className="fixed inset-0 z-30 cursor-default" aria-label="Close project menu" onClick={() => setProjectMenuOpen(false)} />
+              <div className="absolute inset-x-0 top-full z-40 mt-1 overflow-hidden rounded-xl border border-hairline/50 bg-card p-1.5 shadow-2xl shadow-black/50">
+                {["all", ...projectNames].map((project) => (
+                  <button key={project} type="button" onClick={() => setProject(project)} className="flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left text-[13px] text-ink hover:bg-raised/70">
+                    <span className="truncate">{project === "all" ? "All projects" : project}</span>
+                    {projectFilter === project && <Check size={14} className="shrink-0 text-accent" />}
+                  </button>
+                ))}
+                <div className="my-1 border-t border-hairline/40" />
+                <button type="button" onClick={() => void addProject()} className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px] text-ink hover:bg-raised/70">
+                  <FolderPlus size={15} className="text-ink-secondary" />
+                  Add project folder…
+                </button>
+              </div>
+            </>
+          )}
+        </div>
         <div className="flex items-center gap-2 rounded-lg bg-raised/70 px-3 py-2">
           <Search size={16} className="text-ink-secondary" />
           <input
@@ -1165,19 +1235,36 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
       {/* Bot list */}
       <div className="flex-1 overflow-y-auto px-2">
         <div className="flex flex-col gap-0.5">
-          {!chiefBot && visibleBots.length === 0 && sectionedBots.length === 0 && visibleGroups.length === 0 && q && q.length < MIN_QUERY && (
+          {chiefBots.length === 0 && visibleBots.length === 0 && sectionedBots.length === 0 && visibleGroups.length === 0 && q && q.length < MIN_QUERY && (
             <div className="px-3 py-6 text-center text-[13px] text-ink-secondary">Nothing matches “{query}”</div>
           )}
-          {chiefBot && (
-            <div className="mb-1.5">
-              <BotListItem
-                bot={chiefBot}
-                onMenu={setMenu}
-                onArchive={(bot) => void archiveBot(bot)}
-                archiveDisabled
-              />
-            </div>
-          )}
+          {chiefBots.map((chiefBot) => (
+            <BotListItem key={chiefBot.id} bot={chiefBot} onMenu={setMenu} onArchive={(bot) => void archiveBot(bot)} archiveDisabled />
+          ))}
+          {projectFilter === "all" ? projectNames.map((name) => {
+            const projectBots = matchingBots.filter((bot) => bot.section === name && !bot.chiefOfStaff);
+            if (projectBots.length === 0 && q) return null;
+            const collapsed = Boolean(collapsedProjects[name]);
+            return (
+            <Fragment key={name}>
+              <button type="button" onClick={() => toggleProject(name)} className="mt-2 flex w-full items-center gap-2 px-3 py-1.5 text-left text-[10.5px] font-semibold uppercase tracking-wide text-ink-secondary hover:text-ink">
+                <ChevronDown size={12} className={cn("transition-transform", collapsed && "-rotate-90")} />
+                <span className="truncate">{name}</span>
+                <span className="ml-auto text-[10px] font-normal">{projectBots.length}</span>
+              </button>
+              {!collapsed && projectBots
+                .sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)))
+                .map((b) => (
+                  <BotListItem
+                    key={b.id}
+                    bot={b}
+                    onMenu={setMenu}
+                    onArchive={(bot) => void archiveBot(bot)}
+                    archiveDisabled={activeBotCount <= 1}
+                  />
+                ))}
+            </Fragment>
+          ); }) : null}
           {visibleGroups.map((g) => (
             <GroupListItem key={g.id} group={g} onMenu={setRoomMenu} />
           ))}
@@ -1190,21 +1277,8 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
               archiveDisabled={activeBotCount <= 1}
             />
           ))}
-          {sectionNames.map((name) => (
-            <Fragment key={name}>
-              <SectionDivider name={name} />
-              {sectionedBots
-                .filter((b) => b.section === name)
-                .map((b) => (
-                  <BotListItem
-                    key={b.id}
-                    bot={b}
-                    onMenu={setMenu}
-                    onArchive={(bot) => void archiveBot(bot)}
-                    archiveDisabled={activeBotCount <= 1}
-                  />
-                ))}
-            </Fragment>
+          {projectFilter !== "all" && sectionedBots.filter((bot) => !bot.chiefOfStaff).map((b) => (
+            <BotListItem key={b.id} bot={b} onMenu={setMenu} onArchive={(bot) => void archiveBot(bot)} archiveDisabled={activeBotCount <= 1} />
           ))}
           <SearchResults query={query} onLanded={() => setQuery("")} />
         </div>

@@ -14,6 +14,29 @@ import { createAcpDriver, type AcpSupport } from "./core.ts";
 
 const EMPTY: ModelCatalog = { default: "", options: [] };
 
+function readHermesProviderModels(env: Record<string, string | undefined>): ModelCatalog {
+  try {
+    const parsed = JSON.parse(readFileSync(join(hermesHome(env), "provider_models_cache.json"), "utf8")) as {
+      nvidia?: { models?: unknown };
+    };
+    const models = Array.isArray(parsed.nvidia?.models)
+      ? parsed.nvidia.models.filter((model): model is string => typeof model === "string" && model.trim().length > 0)
+      : [];
+    const options = [...new Set(models)].map((model) => ({ id: `nvidia:${model}`, label: model, custom: true }));
+    let configured = "";
+    try {
+      const config = readFileSync(join(hermesHome(env), "config.yaml"), "utf8");
+      configured = /^\s{2}default:\s*([^#\r\n]+?)\s*$/m.exec(config)?.[1]?.trim() ?? "";
+    } catch {
+      configured = "";
+    }
+    const preferred = configured ? `nvidia:${configured}` : "";
+    return { default: options.some((option) => option.id === preferred) ? preferred : (options[0]?.id ?? ""), options };
+  } catch {
+    return EMPTY;
+  }
+}
+
 function hermesHome(env: Record<string, string | undefined>): string {
   return env.HERMES_HOME || join(env.HOME || env.USERPROFILE || homedir(), ".hermes");
 }
@@ -78,13 +101,13 @@ export function ensureHermesInjectProvider(
 /** ACP session/set_model id. Hermes parse_model_input treats `custom:name:model`. */
 export function hermesAcpModelId(modelId: string | null | undefined): string | null {
   const inject = decodeInjectId(modelId);
-  if (!inject) return null;
+  if (!inject) return modelId?.startsWith("nvidia:") ? modelId : null;
   return `custom:${inject.host}:${inject.model}`;
 }
 
 async function resolveModels(env: Record<string, string | undefined>): Promise<ModelCatalog> {
-  const catalog = await mergeLocalInject(EMPTY, env);
-  return { default: catalog.options[0]?.id ?? "", options: catalog.options };
+  const catalog = await mergeLocalInject(readHermesProviderModels(env), env);
+  return { default: catalog.default || catalog.options[0]?.id || "", options: catalog.options };
 }
 
 async function applySetting(
@@ -105,6 +128,7 @@ const support: AcpSupport = {
   displayName: "Hermes",
   access: "custom",
   models: EMPTY,
+  effortLevels: ["none", "low", "medium", "high", "xhigh", "max"],
   resolveModels,
   resolveTurnModel: (model, env) => {
     if (!model) return model;
@@ -130,6 +154,21 @@ const support: AcpSupport = {
     // named custom provider + session/set_model is the real route.
     delete env.OPENAI_API_KEY;
     delete env.OPENROUTER_API_KEY;
+    // Hermes' Python OpenAI client does not ship SOCKS support. A system VPN
+    // commonly exports ALL_PROXY=socks4://...; leaving it in the child env
+    // makes client construction fail before ACP can initialize. Keep valid
+    // HTTP(S) proxies configured by OpenMausBot and drop only unsupported
+    // SOCKS schemes, including lowercase variants.
+    for (const key of [
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "ALL_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "all_proxy",
+    ]) {
+      if (/^socks(?:4|5):\/\//i.test(env[key] ?? "")) delete env[key];
+    }
   },
   pickAuthMethod: () => null,
   authFailure: "continue",
@@ -138,7 +177,7 @@ const support: AcpSupport = {
     // Decode only — resolveTurnModel already wrote the named provider using
     // the instance HOME. Calling ensure* again here would hit process.env
     // and rewrite the user's real ~/.hermes/config.yaml.
-    const native = hermesAcpModelId(turn.model);
+    const native = hermesAcpModelId(turn.model) ?? turn.model;
     if (!native) return;
     await applySetting(
       request,
@@ -146,6 +185,14 @@ const support: AcpSupport = {
       { sessionId, modelId: native },
       `model "${native}"`,
     );
+    if (turn.effort) {
+      await applySetting(
+        request,
+        "session/set_config_option",
+        { sessionId, configId: "reasoning_effort", value: turn.effort },
+        `reasoning effort "${turn.effort}"`,
+      );
+    }
   },
   buildPromptText: (turn) => (turn.system ? `${turn.system}\n\n${turn.text}` : turn.text),
 };

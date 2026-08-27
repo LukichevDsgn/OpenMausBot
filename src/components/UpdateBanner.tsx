@@ -3,9 +3,12 @@
 // and while idle/checking; appears only when actionable: an update to
 // download, a download in progress, a restart to apply, or an error.
 import { useEffect, useState } from "react";
-import { ArrowDownToLine, Loader2, RefreshCw, Sparkles, X } from "lucide-react";
+import { ArrowDownToLine, ExternalLink, Loader2, RefreshCw, Sparkles, X } from "lucide-react";
 import { useUpdaterState } from "@/lib/updater";
 import { cn } from "@/lib/cn";
+
+const OFFICIAL_RELEASE_NOTES_URL =
+  "https://github.com/milind-soni/openmausbot-releases/releases";
 
 // The one action button in the card. Disabled drops the accent fill for the
 // flat raised grey — the "I heard you" the click needs while the main process
@@ -42,13 +45,17 @@ export function UpdateBanner() {
   const key = `${s.status}:${s.version ?? ""}`;
   if (dismissed === key) return null;
   const updater = window.ogb!.updater!;
+  const sourceIntegration = s.mode === "source-integration";
+  const sourceActionable = sourceIntegration && (s.status === "available" || s.status === "downloaded");
 
   // while busy the card owns the moment: no dismissing, no second click
   const installing = s.status === "installing";
   const busy = s.status === "downloading" || installing;
 
   const title =
-    s.status === "available"
+    sourceActionable
+      ? `Official developer update ${s.version ?? ""} is available`
+      : s.status === "available"
       ? `OpenMausBot ${s.version} is available`
       : s.status === "downloading"
         ? `Downloading ${s.version ?? "update"}…`
@@ -58,7 +65,9 @@ export function UpdateBanner() {
             ? "Restarting to update…"
             : "Update check failed";
   const subtitle =
-    s.status === "available"
+    sourceActionable
+      ? "This custom build must be merged, tested, and rebuilt before it can be installed."
+      : s.status === "available"
       ? "A newer version is ready to download."
       : s.status === "downloading"
         ? // no percent yet means the transfer hasn't reported in — don't imply 0
@@ -121,7 +130,16 @@ export function UpdateBanner() {
 
       {!busy && (
         <div className="mt-2.5 flex gap-2">
-          {s.status === "available" && (
+          {sourceActionable && (
+            <button
+              onClick={() => void window.ogb?.openExternal?.(OFFICIAL_RELEASE_NOTES_URL)}
+              disabled={pending !== null}
+              className={primaryAction}
+            >
+              <ExternalLink size={13} /> Open official release notes
+            </button>
+          )}
+          {!sourceIntegration && s.status === "available" && (
             <button
               onClick={() => {
                 setPending("download");
@@ -141,7 +159,7 @@ export function UpdateBanner() {
               )}
             </button>
           )}
-          {s.status === "downloaded" && (
+          {!sourceIntegration && s.status === "downloaded" && (
             <button
               onClick={() => {
                 setPending("install");

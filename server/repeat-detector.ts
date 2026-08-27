@@ -7,11 +7,13 @@
 
 /** Tool name plus its arguments, whitespace-normalized. A bare tool name
  * is not a call worth counting: "Bash" five times may be five different
- * commands, and Claude's item.started carries only the name. */
-export function callKey(tool: string, args: string | undefined): string | null {
+ * commands, and Claude's item.started carries only the name. A provider may
+ * add a digest of the complete arguments when its display title is truncated. */
+export function callKey(tool: string, args: string | undefined, fingerprint?: string): string | null {
   const a = (args ?? "").replace(/\s+/g, " ").trim();
   if (!a || a === tool) return null;
-  return `${tool}:${a}`;
+  const suffix = fingerprint?.trim() ? `\u241f${fingerprint.trim()}` : "";
+  return `${tool}:${a}${suffix}`;
 }
 
 export class RepeatDetector {

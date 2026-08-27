@@ -4,8 +4,8 @@
 // initialize/thread/turn handshake, then plays a scripted turn. Like the
 // real app-server, it never exits on its own — the driver kills it.
 //
-//   FAKE_CODEX_MODE   happy (default) | approval | resume | stream |
-//                     logged-in-stdout | logged-out | unauthorized
+//   FAKE_CODEX_MODE   happy (default) | approval | mcp-approval | mcp-local-approval | resume | stream |
+//                     high-token-usage | many-tools | logged-in-stdout | logged-out | unauthorized
 //   FAKE_CODEX_DUMP   path to write {argv, env, calls, decision} as JSON
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
@@ -14,7 +14,7 @@ import { writeFileSync } from "node:fs";
 const mode = process.env.FAKE_CODEX_MODE ?? "happy";
 
 if (process.argv[2] === "--version") {
-  process.stdout.write("codex-cli 0.147.0\n");
+  process.stdout.write("codex-cli 0.149.0\n");
   process.exit(0);
 }
 if (process.argv[2] === "login" && process.argv[3] === "status") {
@@ -38,7 +38,7 @@ const dump = () => {
   if (process.env.FAKE_CODEX_DUMP) {
     writeFileSync(
       process.env.FAKE_CODEX_DUMP,
-      JSON.stringify({ argv: process.argv.slice(2), env: process.env, calls, decision }, null, 2),
+      JSON.stringify({ pid: process.pid, argv: process.argv.slice(2), env: process.env, calls, decision }, null, 2),
     );
   }
 };
@@ -134,9 +134,58 @@ process.stdin.on("data", (chunk) => {
         }
         out({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
         notify("item/started", { item: { id: "i1", type: "commandExecution", command: "ls -la" } });
-        if (mode === "approval") {
+        if (mode === "high-token-usage") {
+          notify("thread/tokenUsage/updated", {
+            tokenUsage: {
+              total: { inputTokens: 1_530_888, outputTokens: 9 },
+              last: { inputTokens: 50_000, outputTokens: 9 },
+            },
+          });
+          finishTurn();
+        } else if (mode === "many-tools") {
+          for (let i = 2; i <= 50; i += 1) {
+            notify("item/started", {
+              item: { id: `i${i}`, type: "mcpToolCall", tool: `tool_${i}`, status: "inProgress" },
+            });
+          }
+          finishTurn();
+        } else if (mode === "approval") {
           out({ jsonrpc: "2.0", id: 100, method: "execCommandApproval", params: { command: "rm -rf scratch" } });
           // turn continues from the approval response handler above
+        } else if (mode === "mcp-approval") {
+          out({
+            jsonrpc: "2.0",
+            id: 100,
+            method: "mcpServer/elicitation/request",
+            params: {
+              threadId: "codex-thread-1",
+              turnId: "turn-1",
+              serverName: "agents",
+              mode: "form",
+              _meta: { codex_approval_kind: "mcp_tool_call" },
+              message: 'Allow the agents MCP server to run tool "list_bots"?',
+              requestedSchema: { type: "object", properties: {} },
+            },
+          });
+        } else if (mode === "mcp-local-approval") {
+          out({
+            jsonrpc: "2.0",
+            id: 100,
+            method: "mcpServer/elicitation/request",
+            params: {
+              threadId: "codex-thread-1",
+              turnId: "turn-1",
+              serverName: "node_repl",
+              mode: "form",
+              _meta: {
+                codex_approval_kind: "mcp_tool_call",
+                tool_name: "tool",
+                tool_params: { app: "Framer.exe" },
+              },
+              message: 'Allow Codex to use Framer?',
+              requestedSchema: { type: "object", properties: {} },
+            },
+          });
         } else {
           finishTurn();
         }

@@ -13,6 +13,7 @@ import { workspaceDir } from "./workspace.ts";
 import { newId, type CloudBackend, type ModelSelection, type ThreadId } from "./contracts.ts";
 import { pickBotName } from "./names.ts";
 import { redactSecretsInText } from "./redact.ts";
+import type { RuntimePolicyOverrides } from "./bot-runtime-policy.ts";
 
 export type MausColor =
   | "green"
@@ -163,6 +164,48 @@ export interface TaskRecord {
    * a folder that moved under a live session would break resume. `null`
    * = pinned to the default (home); absent = not pinned yet. */
   cwd?: string | null;
+  /** Explicit hostless/cloud pin. `cwd: null` alone is ambiguous for
+   * records created before task cwd pinning existed, so keep the user's
+   * deliberate cloud choice separate from a legacy/default null. */
+  hostless?: boolean;
+  /** Compact delegation scope used to reject conflicting parallel writes. */
+  handoffScope?: {
+    base: string;
+    worktree: string;
+    allowedFiles: string[];
+  };
+  /** Durable anti-loop identity for a delegated workflow stage. The full
+   * handoff is deliberately not stored here: only bounded hashes and the
+   * source id are needed to reject replay after a fresh provider task. */
+  handoffControl?: {
+    sourceBotId: string;
+    stageKey: string;
+    evidenceKey: string;
+    fingerprint: string;
+    attempt: number;
+    /** `active` is local to one running server process. Every active
+     * handoff becomes `interrupted` on boot because provider turns do not
+     * survive a restart. Only a real turn.completed makes it `settled`. */
+    state?: "active" | "settled" | "interrupted";
+  };
+  /** Durable lifecycle of the task's most recent provider turn. `unknown`
+   * means the process restarted before it could observe a terminal event;
+   * it is never silently converted into success. */
+  lifecycle?: TaskLifecycle;
+}
+
+export type TaskLifecycleState = "pending" | "running" | "completed" | "failed" | "canceled" | "unknown";
+
+export interface TaskTerminalReceipt {
+  eventId: string;
+  state: Exclude<TaskLifecycleState, "pending" | "running">;
+  recordedAt: number;
+  reason?: string;
+}
+
+export interface TaskLifecycle {
+  state: TaskLifecycleState;
+  terminalReceipt?: TaskTerminalReceipt;
 }
 
 export interface TaskUsage {
@@ -234,6 +277,9 @@ export function titleFromMessage(text: string): string {
 
 export interface BotRecord {
   id: string;
+  /** Stable role address for peer routing. Unlike the display name and model
+   * selection, this survives provider/model changes and a UI rename. */
+  routingKey?: string;
   /** the ACTIVE task's thread — everything that runs a turn reads this */
   threadId: ThreadId;
   /** every task this bot has, newest first */
@@ -263,6 +309,9 @@ export interface BotRecord {
   /** Tools this bot may always use without asking, even outside auto mode
    * (set by "Always allow" on an approval card). */
   alwaysAllow?: string[];
+  /** Exact local desktop executable/app ids this bot may operate without a
+   * per-action card. This never enables another app or general auto mode. */
+  localComputerAllowApps?: string[];
   /** Speak this bot's replies aloud as they settle, without being asked.
    * Off by default: a hosted voice costs money per character, so speaking
    * is something you turn on, never something that happens to you. */
@@ -294,6 +343,15 @@ export interface BotRecord {
    * start false — a shared persona must not reach the user's Gmail on
    * turn one. */
   composio?: boolean;
+  /** Explicit skill ids. Undefined keeps the catalog's defaultEnabled behavior;
+   * [] is an intentional deny-all choice. */
+  skillGrants?: string[];
+  /** Explicit skill-owned tool ids. Undefined keeps the effective skills'
+   * declared-tool defaults; [] is an intentional deny-all choice. */
+  skillToolGrants?: string[];
+  /** Explicit per-bot runtime controls. The server fills effective defaults
+   * on the wire; bots.json keeps only fields the user supplied. */
+  runtimePolicy?: RuntimePolicyOverrides;
   /** Derived from `activity` — kept so the 200+ readers across the app and
    * tests keep working unchanged. Write through setActivity(), never here. */
   busy?: boolean;
@@ -320,6 +378,31 @@ const COLORS: MausColor[] = [
   "teal",
   "coral",
 ];
+
+/** Worker role contracts must survive provider/model switching. Keep the
+ * durable descriptions useful while removing stale provider labels from the
+ * runtime roster on load. */
+function modelNeutralizeRoleDescription(name: string, description: string): string {
+  if (!description) return description;
+  let next = description
+    .replaceAll("running Gemini 3.7 Flash Medium", "using the selected provider and model")
+    .replaceAll("Use GPT reasoning high by default.", "Use the configured reasoning level by default.")
+    .replaceAll(
+      "Gemini Worker 1 (Antigravity A, Gemini 3.7 Flash Medium) and Gemini Worker 2 (Antigravity B, Gemini 3.7 Flash Medium)",
+      "Gemini Worker 1 and Gemini Worker 2",
+    )
+    .replaceAll("Hermes NVIDIA Worker (GLM 5.2 Medium)", "Hermes NVIDIA Worker");
+  if (name === "Hermes NVIDIA Worker") next = next.replaceAll("low-cost read-only research helper", "read-only research helper");
+  return next;
+}
+
+/** Reserved role addresses for the long-lived worker pool. Keep these
+ * independent from provider names: a bot called "Gemini Worker 1" may run on
+ * Codex, OpenCode, Hermes, or any future engine. */
+function defaultRoutingKey(name: string): string | undefined {
+  const match = name.trim().match(/^Gemini Worker ([12])$/i);
+  return match ? `worker-${match[1]}` : undefined;
+}
 
 /** Resolve @mentions in a message against a bot roster: `@` must start a
  * word, the name must end on a word boundary (so "@New Bottle" never matches
@@ -427,24 +510,65 @@ export class Store {
     // busy never survives a restart — no turn does either. Rooms saved
     // before default responders existed adopt their first member as lead.
     let botsMigrated = false;
-    let chiefSeen = false;
+    const chiefSections = new Set<string>();
     let groupsMigrated = false;
     for (const b of this.bots) {
+      for (const task of b.tasks ?? []) {
+        const control = task.handoffControl;
+        const inferred = (task.usage?.turns ?? 0) > 0 ? "settled" : "interrupted";
+        if (control?.state === "active" || task.lifecycle?.state === "running") {
+          task.lifecycle = {
+            state: "unknown",
+            terminalReceipt: {
+              eventId: `restart:${task.threadId}`,
+              state: "unknown",
+              recordedAt: task.createdAt,
+              reason: "server restarted before a terminal task event was recorded",
+            },
+          };
+          if (control) control.state = "interrupted";
+          botsMigrated = true;
+        } else if (control && control.state !== inferred) {
+          control.state = inferred;
+          botsMigrated = true;
+        }
+      }
       // transient state never survives a restart — and if a previous
       // process died mid-turn, bots.json still says busy/working; persist
       // the reset so the next load does not read it again
       if (b.busy || (b.activity !== undefined && b.activity !== "idle")) botsMigrated = true;
       b.busy = false;
       b.activity = "idle";
+      // Builds from 2026-08-23 briefly persisted a per-role turn budget.
+      // Hard token/tool-call stops were removed for every role, so discard
+      // the obsolete flag instead of exposing a control that no longer acts.
+      const legacyBudgetBot = b as BotRecord & { turnBudgetMode?: unknown };
+      if ("turnBudgetMode" in legacyBudgetBot) {
+        delete legacyBudgetBot.turnBudgetMode;
+        botsMigrated = true;
+      }
       if (b.cloudBackend !== undefined && b.cloudBackend !== "box" && b.cloudBackend !== "vps") {
         delete b.cloudBackend;
         botsMigrated = true;
       }
+      const modelNeutralDescription = modelNeutralizeRoleDescription(b.name, b.description);
+      if (modelNeutralDescription !== b.description) {
+        b.description = modelNeutralDescription;
+        botsMigrated = true;
+      }
+      if (!b.routingKey) {
+        const routingKey = defaultRoutingKey(b.name);
+        if (routingKey && !this.bots.some((candidate) => candidate !== b && candidate.routingKey === routingKey)) {
+          b.routingKey = routingKey;
+          botsMigrated = true;
+        }
+      }
     }
     for (const b of this.bots) {
       if (!b.chiefOfStaff) continue;
-      if (!chiefSeen) {
-        chiefSeen = true;
+      const section = b.section || "";
+      if (!chiefSections.has(section)) {
+        chiefSections.add(section);
         if (b.hidden) {
           b.hidden = false;
           botsMigrated = true;
@@ -741,13 +865,34 @@ export class Store {
     return this.bots.find((b) => b.id === id) ?? null;
   }
 
+  botByRoutingKey(routingKey: string) {
+    const key = routingKey.trim().toLocaleLowerCase();
+    if (!key) return null;
+    return this.bots.find((b) => b.routingKey?.trim().toLocaleLowerCase() === key) ?? null;
+  }
+
+  /** Resolve a peer from the strongest identity available. IDs are primary;
+   * the stable routing key repairs a stale roster ID; an exact unique name is
+   * only a last-resort compatibility path for older proxies. Older agents
+   * may put the stable key itself in bot_id, so accept that shape too. */
+  resolveBotReference(id: string, routingKey?: string, name?: string) {
+    const byId = id.trim() ? this.bot(id.trim()) : null;
+    if (byId) return byId;
+    const byKey = routingKey?.trim() ? this.botByRoutingKey(routingKey) : this.botByRoutingKey(id);
+    if (byKey) return byKey;
+    const wanted = name?.trim().toLocaleLowerCase();
+    if (!wanted) return null;
+    const matches = this.bots.filter((b) => b.name.trim().toLocaleLowerCase() === wanted);
+    return matches.length === 1 ? matches[0]! : null;
+  }
+
   botByThread(threadId: string) {
     return this.bots.find((b) => b.threadId === threadId || b.tasks?.some((t) => t.threadId === threadId)) ?? null;
   }
 
   createBot(
     profile: Partial<
-      Pick<BotRecord, "name" | "title" | "description" | "color" | "mascotExpression" | "modelSelection">
+      Pick<BotRecord, "name" | "title" | "description" | "color" | "mascotExpression" | "modelSelection" | "routingKey">
     > = {},
     opts: {
       /** false = no greeting/onboarding seed. Imported bots must not open
@@ -756,8 +901,11 @@ export class Store {
     } = {},
   ): BotRecord {
     const name = profile.name?.trim() || pickBotName(this.bots.map((b) => b.name));
+    const requestedRoutingKey = profile.routingKey?.trim() || defaultRoutingKey(name);
+    const routingKey = requestedRoutingKey && !this.botByRoutingKey(requestedRoutingKey) ? requestedRoutingKey : undefined;
     const bot: BotRecord = {
       id: newId(),
+      ...(routingKey ? { routingKey } : {}),
       threadId: newId(),
       name,
       title: profile.title ?? "",
@@ -828,13 +976,15 @@ export class Store {
     return bot;
   }
 
-  /** Elect one Chief of Staff (or clear the role) as one persisted change.
+  /** Elect one Chief of Staff per project section (or clear that section's role).
    * The changed records are returned so the server can update every open
    * window, including the bot that just handed the role over. */
-  setChiefOfStaff(id: string | null): BotRecord[] | null {
+  setChiefOfStaff(id: string | null, explicitSection?: string): BotRecord[] | null {
     if (id && !this.bot(id)) return null;
+    const section = id ? (this.bot(id)?.section || "") : (explicitSection || "");
     const changed: BotRecord[] = [];
     for (const bot of this.bots) {
+      if ((bot.section || "") !== section) continue;
       const next = bot.id === id;
       if (Boolean(bot.chiefOfStaff) === next && !(next && bot.hidden)) continue;
       if (next) {
@@ -902,23 +1052,37 @@ export class Store {
   }
 
   /** The folder a task's turn runs in. Pins on first call from the bot's
-   * current folder — unless the task already has a session (a thread from
-   * before folders existed), which pins to the default so the folder can't
-   * move under it. Returns the pinned value: a path, or null for default. */
+   * current folder. An explicitly configured bot folder is authoritative:
+   * when it changes, discard provider cursors so the next turn starts a
+   * fresh engine session in that folder. A fallback workspace never moves
+   * an existing session. Returns the pinned value: a path, or null. */
   pinTaskCwd(botId: string, threadId: string, fallbackCwd?: string, opts: { none?: boolean } = {}): string | null {
     const bot = this.bot(botId);
     const task = bot ? this.taskByThread(botId, threadId) : undefined;
     if (!bot || !task) return null;
     if (opts.none) {
-      if (task.cwd !== null) {
+      if (task.cwd !== null || task.hostless !== true) {
         task.cwd = null;
+        task.hostless = true;
         this.saveBots();
         this.emit({ type: "bot", botId });
       }
       return null;
     }
-    if (task.cwd === undefined) {
-      task.cwd = Object.keys(task.resumeCursors).length === 0 ? (bot.cwd ?? fallbackCwd ?? null) : null;
+    const explicitCwd = bot.cwd?.trim() || undefined;
+    // A deliberate cloud pin stays hostless. Every other stale/default pin,
+    // including legacy `null`, follows an explicitly configured bot folder.
+    if (explicitCwd && task.cwd !== explicitCwd && task.hostless !== true) {
+      task.cwd = explicitCwd;
+      delete task.hostless;
+      task.resumeCursors = {};
+      delete task.lastInstanceId;
+      if (bot.threadId === threadId) bot.resumeCursors = {};
+      this.saveBots();
+      this.emit({ type: "bot", botId });
+    } else if (task.cwd === undefined) {
+      task.cwd = Object.keys(task.resumeCursors).length === 0 ? (explicitCwd ?? fallbackCwd ?? null) : null;
+      delete task.hostless;
       this.saveBots();
       this.emit({ type: "bot", botId });
     }
@@ -966,7 +1130,13 @@ export class Store {
 
   /** A fresh context on the same bot: new thread, new session, same
    * persona/tools/computer. Becomes the active task. */
-  createTask(botId: string, title?: string, activate = true): TaskRecord | null {
+  createTask(
+    botId: string,
+    title?: string,
+    activate = true,
+    handoffScope?: TaskRecord["handoffScope"],
+    handoffControl?: TaskRecord["handoffControl"],
+  ): TaskRecord | null {
     const bot = this.bot(botId);
     if (!bot) return null;
     const task: TaskRecord = {
@@ -974,6 +1144,9 @@ export class Store {
       title: title?.trim() || UNTITLED_TASK,
       createdAt: Date.now(),
       resumeCursors: {},
+      ...(handoffScope ? { handoffScope } : {}),
+      ...(handoffControl ? { handoffControl: { ...handoffControl, state: "active" as const } } : {}),
+      lifecycle: { state: "pending" },
     };
     bot.tasks = [task, ...(bot.tasks ?? [])];
     if (activate) {
@@ -983,6 +1156,105 @@ export class Store {
     this.saveBots();
     this.emit({ type: "bot", botId });
     return task;
+  }
+
+  /** Persist the point at which a provider turn is actually admitted. */
+  markTaskRunning(botId: string, threadId: string): TaskRecord | null {
+    const bot = this.bot(botId);
+    const task = bot?.tasks?.find((candidate) => candidate.threadId === threadId);
+    if (!bot || !task) return null;
+    if (task.lifecycle?.state === "running") return task;
+    task.lifecycle = { state: "running" };
+    if (task.handoffControl) task.handoffControl.state = "active";
+    this.saveBots();
+    this.emit({ type: "bot", botId });
+    return task;
+  }
+
+  /** Record one terminal provider outcome exactly once. Duplicate and late
+   * events cannot regress a terminal record or rewrite restart `unknown`. */
+  recordTaskOutcome(
+    botId: string,
+    threadId: string,
+    receipt: Omit<TaskTerminalReceipt, "recordedAt"> & { recordedAt?: number },
+  ): TaskRecord | null {
+    const bot = this.bot(botId);
+    const task = bot?.tasks?.find((candidate) => candidate.threadId === threadId);
+    if (!bot || !task) return null;
+    if (task.lifecycle && !["pending", "running"].includes(task.lifecycle.state)) return task;
+    task.lifecycle = {
+      state: receipt.state,
+      terminalReceipt: {
+        ...receipt,
+        recordedAt: receipt.recordedAt ?? Date.now(),
+      },
+    };
+    if (task.handoffControl) task.handoffControl.state = "settled";
+    this.saveBots();
+    this.emit({ type: "bot", botId });
+    return task;
+  }
+
+  /** Number of live or terminal attempts for one source/target workflow
+   * stage. A task interrupted before turn.completed is not evidence and
+   * must not consume the bounded retry after an app/provider restart. */
+  handoffStageAttempts(targetBotId: string, sourceBotId: string, stageKey: string): number {
+    const bot = this.bot(targetBotId);
+    if (!bot) return 0;
+    return (bot.tasks ?? []).filter((task) =>
+      task.handoffControl?.sourceBotId === sourceBotId &&
+      task.handoffControl.stageKey === stageKey &&
+      task.handoffControl.state !== "interrupted"
+    ).length;
+  }
+
+  hasHandoffFingerprint(targetBotId: string, fingerprint: string): boolean {
+    const bot = this.bot(targetBotId);
+    return Boolean(bot?.tasks?.some((task) =>
+      task.handoffControl?.fingerprint === fingerprint && task.handoffControl.state !== "interrupted"
+    ));
+  }
+
+  setHandoffTaskState(
+    botId: string,
+    threadId: string,
+    state: "settled" | "interrupted",
+  ): TaskRecord | null {
+    const bot = this.bot(botId);
+    const task = bot?.tasks?.find((candidate) => candidate.threadId === threadId);
+    if (!bot || !task?.handoffControl) return null;
+    if (task.handoffControl.state === state) return task;
+    task.handoffControl.state = state;
+    if (state === "interrupted" && (!task.lifecycle || ["pending", "running"].includes(task.lifecycle.state))) {
+      task.lifecycle = {
+        state: "unknown",
+        terminalReceipt: {
+          eventId: `interrupted:${threadId}`,
+          state: "unknown",
+          recordedAt: Date.now(),
+          reason: "handoff was interrupted before a terminal provider event was recorded",
+        },
+      };
+    }
+    this.saveBots();
+    this.emit({ type: "bot", botId });
+    return task;
+  }
+
+  /** True when another delegated task is currently running in the same
+   * worktree or owns one of the exact files in the proposed scope. */
+  hasActiveHandoffConflict(scope: NonNullable<TaskRecord["handoffScope"]>): boolean {
+    const normalize = (value: string) => value.trim().replaceAll("\\", "/").replace(/\/+$/u, "").toLocaleLowerCase();
+    const files = new Set(scope.allowedFiles.map(normalize));
+    return this.bots.some((bot) => {
+      if (!bot.busy) return false;
+      return (bot.tasks ?? []).some((task) => {
+        const active = task.handoffScope;
+        if (!active || task.threadId !== bot.threadId) return false;
+        if (normalize(active.worktree) === normalize(scope.worktree)) return true;
+        return active.allowedFiles.some((file) => files.has(normalize(file)));
+      });
+    });
   }
 
   switchTask(botId: string, threadId: string): BotRecord | null {

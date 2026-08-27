@@ -18,6 +18,7 @@ import { ensureQwenInjectModel } from "./acp/qwen.ts";
 import {
   applyClaudeInject,
   applyOpenAIInject,
+  configuredCodexApiModels,
   codexLocalProviderArgs,
   decodeInjectId,
   encodeInjectId,
@@ -216,6 +217,28 @@ describe("codexLocalProviderArgs", () => {
     expect(rendered).not.toContain("model_providers.ollama.base_url");
     expect(rendered).not.toContain("model_providers.lmstudio.base_url");
     expect(env.OPENMAUSBOT_LOCAL_UNSLOTH_API_KEY).toBe("unsloth-secret");
+  });
+
+  it("exposes direct NVIDIA and OpenRouter rows only when their keys are configured", () => {
+    expect(configuredCodexApiModels({}).options).toEqual([]);
+    const catalog = configuredCodexApiModels({
+      OPENMAUSBOT_NVIDIA_API_KEY: "nvidia-secret",
+      OPENMAUSBOT_OPENROUTER_API_KEY: "openrouter-secret",
+    });
+    expect(catalog.options).toEqual([
+      { id: "nvidia::z-ai/glm-5.2", label: "GLM 5.2 (NVIDIA NIM)", custom: true },
+      { id: "openrouter::z-ai/glm-5.2", label: "GLM 5.2 (OpenRouter)", custom: true },
+    ]);
+  });
+
+  it("passes a direct provider key through env_key without putting it on argv", () => {
+    const env: Record<string, string | undefined> = {
+      OPENMAUSBOT_NVIDIA_API_KEY: "nvidia-secret",
+    };
+    const args = codexLocalProviderArgs(env, "nvidia::z-ai/glm-5.2");
+    expect(JSON.stringify(args)).toContain("model_providers.nvidia.base_url");
+    expect(JSON.stringify(args)).toContain("OPENMAUSBOT_NVIDIA_API_KEY");
+    expect(JSON.stringify(args)).not.toContain("nvidia-secret");
   });
 });
 

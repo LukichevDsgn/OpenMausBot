@@ -89,6 +89,11 @@ export function OpenCodeMark({ size = 16, className }: IconProps) {
   );
 }
 
+/** OpenMausBot mark used for API models configured inside this app. */
+export function OpenMausMark({ size = 16, className }: IconProps) {
+  return <img src="/app-icon.svg" alt="" width={size} height={size} className={cn("rounded-[24%]", className)} />;
+}
+
 /** Official Qwen mark. */
 export function QwenMark({ size = 16, className }: IconProps) {
   const grad = "omb-qwen-mark";
@@ -128,6 +133,8 @@ export function ProviderMark({ driverKind, size, className }: IconProps & { driv
       return <AntigravityMark size={size} className={className} />;
     case "opencodeGo":
       return <OpenCodeMark size={size} className={className} />;
+    case "openmaus":
+      return <OpenMausMark size={size} className={className} />;
     case "qwenAgent":
       return <QwenMark size={size} className={className} />;
     case "hermesAgent":

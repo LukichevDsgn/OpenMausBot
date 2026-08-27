@@ -35,6 +35,31 @@ describe("Store", () => {
     expect(store.messagesFor(bot.threadId)).toHaveLength(0);
   });
 
+  it("migrates worker descriptions away from provider-specific model labels", () => {
+    const store = new Store(selection);
+    const fixer = store.createBot({
+      name: "Onlook Fixer",
+      description: "You are a mechanical implementation fixer running Gemini 3.7 Flash Medium.",
+    });
+    const coordinator = store.createBot({
+      name: "Onlook Coordinator",
+      description: "Gemini Worker 1 (Antigravity A, Gemini 3.7 Flash Medium) and Hermes NVIDIA Worker (GLM 5.2 Medium).",
+    });
+
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(fixer.id)?.description).toContain("selected provider and model");
+    expect(reloaded.bot(fixer.id)?.description).not.toContain("Gemini 3.7 Flash Medium");
+    expect(reloaded.bot(coordinator.id)?.description).not.toContain("GLM 5.2 Medium");
+  });
+
+  it("accepts a stable routing key accidentally supplied as bot_id", () => {
+    const store = new Store(selection);
+    const worker = store.createBot({ name: "Gemini Worker 1" });
+    expect(worker.routingKey).toBe("worker-1");
+    expect(store.resolveBotReference("worker-1")?.id).toBe(worker.id);
+    expect(store.resolveBotReference("stale-id", "worker-1")?.id).toBe(worker.id);
+  });
+
   it("addTaskUsage accumulates settled-turn totals per task and survives a restart", () => {
     const store = new Store(selection);
     const bot = store.createBot();
@@ -59,6 +84,61 @@ describe("Store", () => {
     store.patchBot(bot.id, { composio: false });
     const reloaded = new Store(selection);
     expect(reloaded.bot(bot.id)?.composio).toBe(false);
+  });
+
+  it("round-trips explicit empty skill grants without a destructive migration", () => {
+    const store = new Store(selection);
+    const defaults = store.createBot();
+    const explicit = store.createBot();
+    expect(defaults.skillGrants).toBeUndefined();
+    expect(defaults.skillToolGrants).toBeUndefined();
+
+    store.patchBot(explicit.id, { skillGrants: [], skillToolGrants: [] });
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(defaults.id)?.skillGrants).toBeUndefined();
+    expect(reloaded.bot(defaults.id)?.skillToolGrants).toBeUndefined();
+    expect(reloaded.bot(explicit.id)?.skillGrants).toEqual([]);
+    expect(reloaded.bot(explicit.id)?.skillToolGrants).toEqual([]);
+  });
+
+  it("round-trips explicit runtime policy overrides without persisting defaults", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.patchBot(bot.id, {
+      runtimePolicy: {
+        idleTimeoutMinutes: 9,
+        retryCap: 0,
+        delegationConcurrency: 2,
+        handoffByteCap: 4_096,
+        cumulativeTokenPolicy: { mode: "soft", limit: 2_000 },
+      },
+    });
+
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)?.runtimePolicy).toEqual({
+      idleTimeoutMinutes: 9,
+      retryCap: 0,
+      delegationConcurrency: 2,
+      handoffByteCap: 4_096,
+      cumulativeTokenPolicy: { mode: "soft", limit: 2_000 },
+    });
+    expect(reloaded.bot(bot.id)?.runtimePolicy?.wallClockTimeoutMinutes).toBeUndefined();
+  });
+
+  it("deletes legacy turnBudgetMode without converting it into token policy", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const botsPath = join(DATA_DIR, "bots.json");
+    const saved = JSON.parse(readFileSync(botsPath, "utf8")) as Array<Record<string, unknown>>;
+    const record = saved.find((candidate) => candidate.id === bot.id)!;
+    record.turnBudgetMode = "hard";
+    writeFileSync(botsPath, JSON.stringify(saved, null, 2));
+
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)).not.toHaveProperty("turnBudgetMode");
+    expect(reloaded.bot(bot.id)?.runtimePolicy).toBeUndefined();
+    const disk = JSON.parse(readFileSync(botsPath, "utf8")) as Array<Record<string, unknown>>;
+    expect(disk.find((candidate) => candidate.id === bot.id)).not.toHaveProperty("turnBudgetMode");
   });
 
   it("rotates colors across created bots", () => {
@@ -567,12 +647,97 @@ describe("Store task usage", () => {
   });
 });
 
+describe("Store task lifecycle", () => {
+  beforeEach(() => {
+    rmSync(DATA_DIR, { recursive: true, force: true });
+  });
+
+  it("persists a terminal receipt and ignores duplicate or late outcomes", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const task = store.createTask(bot.id, "delegated", true)!;
+
+    expect(task.lifecycle).toEqual({ state: "pending" });
+    store.markTaskRunning(bot.id, task.threadId);
+    store.recordTaskOutcome(bot.id, task.threadId, {
+      eventId: "turn-1",
+      state: "completed",
+    });
+    store.recordTaskOutcome(bot.id, task.threadId, {
+      eventId: "late-failure",
+      state: "failed",
+      reason: "late provider event",
+    });
+
+    expect(store.taskByThread(bot.id, task.threadId)?.lifecycle).toMatchObject({
+      state: "completed",
+      terminalReceipt: { eventId: "turn-1", state: "completed" },
+    });
+    const reloaded = new Store(selection);
+    expect(reloaded.taskByThread(bot.id, task.threadId)?.lifecycle).toMatchObject({
+      state: "completed",
+      terminalReceipt: { eventId: "turn-1" },
+    });
+  });
+
+  it("gives the first proven terminal result priority over exit and cleanup", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const task = store.createTask(bot.id, "terminal priority", true)!;
+    store.markTaskRunning(bot.id, task.threadId);
+    store.recordTaskOutcome(bot.id, task.threadId, {
+      eventId: "canonical-provider-failure",
+      state: "failed",
+      reason: "canonical provider completion",
+      recordedAt: 123,
+    });
+
+    store.recordTaskOutcome(bot.id, task.threadId, {
+      eventId: "late-process-exit",
+      state: "unknown",
+      reason: "provider exited after completion",
+    });
+    store.recordTaskOutcome(bot.id, task.threadId, {
+      eventId: "late-cleanup",
+      state: "canceled",
+      reason: "cleanup raced the terminal event",
+    });
+
+    expect(store.taskByThread(bot.id, task.threadId)?.lifecycle).toEqual({
+      state: "failed",
+      terminalReceipt: {
+        eventId: "canonical-provider-failure",
+        state: "failed",
+        reason: "canonical provider completion",
+        recordedAt: 123,
+      },
+    });
+  });
+
+  it("reconciles an active task to unknown on restart without inventing success", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const task = store.createTask(bot.id, "crash recovery", true)!;
+    store.markTaskRunning(bot.id, task.threadId);
+
+    const reloaded = new Store(selection);
+    expect(reloaded.taskByThread(bot.id, task.threadId)?.lifecycle).toMatchObject({
+      state: "unknown",
+      terminalReceipt: {
+        eventId: `restart:${task.threadId}`,
+        state: "unknown",
+      },
+    });
+    expect(reloaded.taskByThread(bot.id, task.threadId)?.lifecycle?.state).not.toBe("completed");
+  });
+});
+
 describe("Store task working folder", () => {
   beforeEach(() => {
     rmSync(DATA_DIR, { recursive: true, force: true });
   });
 
-  it("pins the bot's folder onto a task on its first turn, and never again", () => {
+  it("rebinds an existing task when the bot gets an explicit folder", () => {
     const store = new Store(selection);
     const bot = store.createBot();
     store.patchBot(bot.id, { cwd: "/tmp/project-a" });
@@ -581,22 +746,24 @@ describe("Store task working folder", () => {
     expect(store.pinTaskCwd(bot.id, bot.threadId)).toBe("/tmp/project-a");
     expect(store.taskByThread(bot.id, bot.threadId)?.cwd).toBe("/tmp/project-a");
 
-    // the bot's folder moves on; this task stays where its session started
+    store.setResumeCursor(bot.id, "codex", "session-a", bot.threadId);
+    // An explicit user folder change starts a fresh provider session there.
     store.patchBot(bot.id, { cwd: "/tmp/project-b" });
-    expect(store.pinTaskCwd(bot.id, bot.threadId)).toBe("/tmp/project-a");
+    expect(store.pinTaskCwd(bot.id, bot.threadId)).toBe("/tmp/project-b");
+    expect(store.taskByThread(bot.id, bot.threadId)?.resumeCursors).toEqual({});
 
     // a new task starts in the bot's current folder
     const next = store.createTask(bot.id, "second")!;
     expect(store.pinTaskCwd(bot.id, next.threadId)).toBe("/tmp/project-b");
   });
 
-  it("pins the default (null) when the bot has no folder, so a later folder can't move a live session", () => {
+  it("moves a default task to a later explicit folder and clears its session", () => {
     const store = new Store(selection);
     const bot = store.createBot();
     expect(store.pinTaskCwd(bot.id, bot.threadId)).toBeNull();
     store.patchBot(bot.id, { cwd: "/tmp/project-a" });
-    expect(store.pinTaskCwd(bot.id, bot.threadId)).toBeNull();
-    expect(store.taskByThread(bot.id, bot.threadId)?.cwd).toBeNull();
+    expect(store.pinTaskCwd(bot.id, bot.threadId)).toBe("/tmp/project-a");
+    expect(store.taskByThread(bot.id, bot.threadId)?.cwd).toBe("/tmp/project-a");
   });
 
   it("pins a supplied private workspace when the bot has no custom folder", () => {
@@ -606,13 +773,14 @@ describe("Store task working folder", () => {
     expect(store.taskByThread(bot.id, bot.threadId)?.cwd).toBe("/private/bot-workspace");
   });
 
-  it("a legacy task that already has a session pins to the default, not the bot's new folder", () => {
+  it("rebinds a legacy session to an explicit folder and clears its cursor", () => {
     const store = new Store(selection);
     const bot = store.createBot();
     // an older build ran turns here before folders existed
     store.setResumeCursor(bot.id, "claude", "sess-1", bot.threadId);
     store.patchBot(bot.id, { cwd: "/tmp/project-a" });
-    expect(store.pinTaskCwd(bot.id, bot.threadId)).toBeNull();
+    expect(store.pinTaskCwd(bot.id, bot.threadId)).toBe("/tmp/project-a");
+    expect(store.taskByThread(bot.id, bot.threadId)?.resumeCursors).toEqual({});
   });
 });
 

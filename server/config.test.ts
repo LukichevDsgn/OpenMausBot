@@ -1,23 +1,29 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   DATA_DIR,
+  publicConfigTransactionFailure,
+  replaceAppConfig,
   instanceConfigs,
   isValidSshAlias,
   loadConfig,
   parseConfigPatch,
   parseStoredConfig,
+  sanitizeStoredCustomEndpointUrls,
   roomTurnTimeoutMinutes,
   stripWorkspaceCredentialEnv,
+  runConfigTransaction,
   syncCredentialEnv,
   vpsSshAlias,
   withInstanceCli,
   WORKSPACE_CREDENTIAL_ENV,
   type AppConfig,
 } from "./config.ts";
+import { removeTempDir } from "./testing/cleanup.ts";
 
 describe("configuration boundaries", () => {
   it("keeps supported stored settings and drops unrelated top-level data", () => {
@@ -36,7 +42,159 @@ describe("configuration boundaries", () => {
   it("rejects malformed stored instances and API patches", () => {
     expect(() => parseStoredConfig({ instances: { claude: { driver: 42 } } })).toThrow("instances.claude.driver");
     expect(() => parseConfigPatch({ opencodeGo: { apiKey: 42 } })).toThrow("opencodeGo.apiKey");
+    expect(() => parseConfigPatch({ nvidia: { apiKey: 42 } })).toThrow("nvidia.apiKey");
     expect(() => parseConfigPatch({ profile: [] })).toThrow("profile");
+  });
+
+  it.each([
+    "https://user:password@example.test/api",
+    "https://example.test/api?token=secret",
+    "https://example.test/api#fragment",
+    "https://example.test/api?",
+    "https://example.test/api#",
+  ])("rejects unsafe custom endpoint save input without echoing %s", (baseUrl) => {
+    expect(() => parseConfigPatch({
+      customEndpoints: {
+        unsafe: {
+          id: "unsafe",
+          name: "Unsafe",
+          providerId: "unsafe",
+          baseUrl,
+          defaultModel: "model",
+        },
+      },
+    })).toThrow();
+    try {
+      parseConfigPatch({
+        customEndpoints: {
+          unsafe: {
+            id: "unsafe",
+            name: "Unsafe",
+            providerId: "unsafe",
+            baseUrl,
+            defaultModel: "model",
+          },
+        },
+      });
+    } catch (error) {
+      expect(String(error)).not.toContain(baseUrl);
+    }
+  });
+
+  it("sanitizes legacy endpoint URLs before strict stored-config validation", () => {
+    const raw = {
+      profile: { name: "Ada" },
+      unrelated: { keep: true },
+      customEndpoints: {
+        first: {
+          id: "first",
+          name: "First",
+          providerId: "first",
+          baseUrl: "https://user:password@example.test/api?token=secret#fragment",
+          defaultModel: "first-model",
+          apiKey: "endpoint-secret",
+        },
+      },
+    };
+    const sanitized = sanitizeStoredCustomEndpointUrls(raw);
+    expect(sanitized.changed).toBe(true);
+    expect((sanitized.value as typeof raw).unrelated).toEqual({ keep: true });
+    expect(raw.customEndpoints.first.baseUrl).toContain("user:password");
+    expect(parseStoredConfig(raw).customEndpoints?.first).toMatchObject({
+      baseUrl: "https://example.test/api",
+      apiKey: "endpoint-secret",
+    });
+  });
+
+  it("loads and atomically migrates multiple legacy endpoints without losing raw metadata", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "omb-config-url-migration-"));
+    try {
+      const configPath = join(dataDir, "config.json");
+      const raw = {
+        profile: { name: "Ada" },
+        unrelated: { keep: "yes" },
+        customEndpoints: {
+          first: {
+            id: "first",
+            name: "First",
+            providerId: "first",
+            baseUrl: "https://user:password@example.test/api/?token=secret#fragment",
+            defaultModel: "first-model",
+            useForNewChats: true,
+            apiKey: "first-key",
+          },
+          second: {
+            id: "second",
+            name: "Second",
+            providerId: "second",
+            baseUrl: "http://example.test/second?",
+            defaultModel: "second-model",
+            discoverModels: true,
+          },
+          safe: {
+            id: "safe",
+            name: "Safe",
+            providerId: "safe",
+            baseUrl: "https://safe.example/path%3Fpart%23fragment",
+            defaultModel: "safe-model",
+          },
+        },
+      };
+      writeFileSync(configPath, JSON.stringify(raw, null, 2));
+
+      const loaded = loadConfig(dataDir);
+      expect(loaded.profile).toEqual({ name: "Ada" });
+      expect(loaded.customEndpoints?.first).toMatchObject({
+        baseUrl: "https://example.test/api",
+        apiKey: "first-key",
+      });
+      expect(loaded.customEndpoints?.second?.baseUrl).toBe("http://example.test/second");
+      expect(loaded.customEndpoints?.safe?.baseUrl).toBe("https://safe.example/path%3Fpart%23fragment");
+
+      const migrated = readFileSync(configPath, "utf8");
+      expect(migrated).toContain('"unrelated"');
+      expect(migrated).toContain('"first-key"');
+      expect(migrated).not.toContain("user:password");
+      expect(migrated).not.toContain("token=secret");
+      expect(migrated).not.toContain("#fragment");
+
+      loadConfig(dataDir);
+      expect(readFileSync(configPath, "utf8")).toBe(migrated);
+    } finally {
+      await removeTempDir(dataDir);
+    }
+  });
+
+  it("keeps sanitized runtime usable when migration persistence fails and retries later", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "omb-config-url-retry-"));
+    try {
+      const configPath = join(dataDir, "config.json");
+      const raw = {
+        customEndpoints: {
+          retry: {
+            id: "retry",
+            name: "Retry",
+            providerId: "retry",
+            baseUrl: "https://user:password@example.test/retry?token=secret#fragment",
+            defaultModel: "retry-model",
+          },
+        },
+      };
+      writeFileSync(configPath, JSON.stringify(raw, null, 2));
+      const persist = vi.fn(() => {
+        throw new Error("simulated disk failure");
+      });
+
+      const loaded = loadConfig(dataDir, persist);
+      expect(loaded.customEndpoints?.retry?.baseUrl).toBe("https://example.test/retry");
+      expect(persist).toHaveBeenCalledOnce();
+      expect(readFileSync(configPath, "utf8")).toContain("user:password");
+
+      loadConfig(dataDir);
+      expect(readFileSync(configPath, "utf8")).not.toContain("user:password");
+    } finally {
+      await removeTempDir(dataDir);
+    }
   });
 
   it("accepts only a simple VPS SSH config alias and exposes no credentials", () => {
@@ -68,6 +226,225 @@ describe("configuration boundaries", () => {
   );
 });
 
+describe("config transaction boundaries", () => {
+  it("commits disk before env and live config", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "omb-config-transaction-success-"));
+    try {
+      const configPath = join(dataDir, "config.json");
+      const originalBytes = Buffer.from('{"profile":{"name":"old"}}\n');
+      writeFileSync(configPath, originalBytes);
+      const environment: Record<string, string | undefined> = {
+        XAI_API_KEY: "old-env",
+        OPENMAUSBOT_ENDPOINT_ALPHA_API_KEY: "old-endpoint",
+      };
+      const live: AppConfig = { profile: { name: "old" }, xai: { key: "old-env" } };
+      const order: string[] = [];
+      const result = await runConfigTransaction(live, {
+        applyDisk: () => {
+          order.push("disk");
+          writeFileSync(configPath, '{"profile":{"name":"new"}}\n');
+        },
+        applyEnv: () => {
+          order.push("env");
+          environment.XAI_API_KEY = "new-env";
+          environment.OPENMAUSBOT_ENDPOINT_ALPHA_API_KEY = "new-endpoint";
+        },
+        readConfig: () => ({ profile: { name: "new" }, xai: { key: "new-env" } }),
+        commitConfig: (next) => {
+          order.push("cfg");
+          replaceAppConfig(live, next);
+        },
+      }, { dataDir, environment });
+
+      expect(result.outcome).toBe("success");
+      expect(order).toEqual(["disk", "env", "cfg"]);
+      expect(readFileSync(configPath, "utf8")).toBe('{"profile":{"name":"new"}}\n');
+      expect(environment).toMatchObject({ XAI_API_KEY: "new-env", OPENMAUSBOT_ENDPOINT_ALPHA_API_KEY: "new-endpoint" });
+      expect(live).toEqual({ profile: { name: "new" }, xai: { key: "new-env" } });
+    } finally {
+      await removeTempDir(dataDir);
+    }
+  });
+
+  it("restores exact disk, env, and cfg after an apply failure", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "omb-config-transaction-apply-"));
+    try {
+      const configPath = join(dataDir, "config.json");
+      const originalBytes = Buffer.from('{"profile":{"name":"old"}}\r\n');
+      writeFileSync(configPath, originalBytes);
+      const environment: Record<string, string | undefined> = { XAI_API_KEY: "old-env" };
+      const live: AppConfig = { profile: { name: "old" }, xai: { key: "old-env" } };
+      const result = await runConfigTransaction(live, {
+        applyDisk: () => {
+          writeFileSync(configPath, "partial secret\n");
+          throw new Error("apply failed with secret");
+        },
+        applyEnv: () => { environment.XAI_API_KEY = "new-env"; },
+        commitConfig: (next) => { replaceAppConfig(live, next); },
+      }, { dataDir, environment });
+
+      expect(result.outcome).toBe("rolled_back");
+      expect(readFileSync(configPath)).toEqual(originalBytes);
+      expect(environment.XAI_API_KEY).toBe("old-env");
+      expect(live).toEqual({ profile: { name: "old" }, xai: { key: "old-env" } });
+      expect(JSON.stringify(publicConfigTransactionFailure(result.outcome))).not.toContain("secret");
+      expect(Object.keys(result)).toEqual(["outcome", "config"]);
+    } finally {
+      await removeTempDir(dataDir);
+    }
+  });
+
+  it("rebuilds the old fleet only after a begun reload and reports rollback", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "omb-config-transaction-reload-"));
+    try {
+      const configPath = join(dataDir, "config.json");
+      const originalBytes = Buffer.from('{"profile":{"name":"old"}}');
+      writeFileSync(configPath, originalBytes);
+      const environment: Record<string, string | undefined> = { XAI_API_KEY: "old-env" };
+      const live: AppConfig = { profile: { name: "old" }, xai: { key: "old-env" } };
+      const reloads: string[] = [];
+      const result = await runConfigTransaction(live, {
+        applyDisk: () => writeFileSync(configPath, '{"profile":{"name":"new"}}'),
+        applyEnv: () => { environment.XAI_API_KEY = "new-env"; },
+        readConfig: () => ({ profile: { name: "new" }, xai: { key: "new-env" } }),
+        reload: async (next) => {
+          replaceAppConfig(live, next);
+          reloads.push(next.profile?.name ?? "");
+          if (next.profile?.name === "new") throw new Error("reload failed with secret");
+        },
+      }, { dataDir, environment });
+
+      expect(result.outcome).toBe("rolled_back");
+      expect(reloads).toEqual(["new", "old"]);
+      expect(readFileSync(configPath)).toEqual(originalBytes);
+      expect(environment.XAI_API_KEY).toBe("old-env");
+      expect(live).toEqual({ profile: { name: "old" }, xai: { key: "old-env" } });
+    } finally {
+      await removeTempDir(dataDir);
+    }
+  });
+
+  it("replaces optional config keys exactly on rollback and success", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "omb-config-transaction-exact-"));
+    try {
+      const configPath = join(dataDir, "config.json");
+      writeFileSync(configPath, "{}");
+      const environment: Record<string, string | undefined> = {};
+      const live: AppConfig = { profile: { name: "old" } };
+      const snapshot = structuredClone(live);
+      const failed = await runConfigTransaction(live, {
+        applyDisk: () => writeFileSync(configPath, '{"profile":{"name":"new"}}'),
+        readConfig: () => ({
+          profile: { name: "new" },
+          customEndpoints: {
+            added: {
+              id: "added",
+              name: "Added",
+              providerId: "added",
+              baseUrl: "https://added.example.test/v1",
+              defaultModel: "added-model",
+            },
+          },
+        }),
+        reload: async (next) => {
+          replaceAppConfig(live, next);
+          if (next.customEndpoints) throw new Error("new fleet failed");
+        },
+      }, { dataDir, environment });
+
+      expect(failed.outcome).toBe("rolled_back");
+      expect(live).toEqual(snapshot);
+      expect(live.customEndpoints).toBeUndefined();
+
+      replaceAppConfig(live, {
+        profile: { name: "stale" },
+        customEndpoints: {
+          stale: {
+            id: "stale",
+            name: "Stale",
+            providerId: "stale",
+            baseUrl: "https://stale.example.test/v1",
+            defaultModel: "stale-model",
+          },
+        },
+      });
+      const succeeded = await runConfigTransaction(live, {
+        applyDisk: () => writeFileSync(configPath, '{"profile":{"name":"final"}}'),
+        readConfig: () => ({ profile: { name: "final" } }),
+        reload: async (next) => replaceAppConfig(live, next),
+      }, { dataDir, environment });
+
+      expect(succeeded.outcome).toBe("success");
+      expect(live).toEqual({ profile: { name: "final" } });
+      expect(live.customEndpoints).toBeUndefined();
+    } finally {
+      await removeTempDir(dataDir);
+    }
+  });
+
+  it("classifies snapshot preflight failure as rolled back without callbacks or leakage", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "omb-config-transaction-preflight-"));
+    try {
+      const configPath = join(dataDir, "config.json");
+      mkdirSync(configPath);
+      const live: AppConfig = { profile: { name: "unchanged" } };
+      const before = structuredClone(live);
+      const calls: string[] = [];
+      const result = await runConfigTransaction(live, {
+        applyDisk: () => { calls.push("disk"); },
+        applyEnv: () => { calls.push("env"); },
+        commitConfig: () => { calls.push("commit"); },
+        reload: async () => { calls.push("reload"); },
+      }, { dataDir, environment: { XAI_API_KEY: "preflight-secret" } });
+      const publicFailure = publicConfigTransactionFailure(result.outcome);
+
+      expect(result.outcome).toBe("rolled_back");
+      expect(calls).toEqual([]);
+      expect(live).toEqual(before);
+      expect(publicFailure).toEqual({ error: "configuration transaction failed", outcome: "rolled_back" });
+      expect(Object.keys(result)).toEqual(["outcome", "config"]);
+      expect(JSON.stringify(result)).not.toContain(dataDir);
+      expect(JSON.stringify(result)).not.toContain("preflight-secret");
+      expect(JSON.stringify(result)).not.toContain("cause");
+      expect(JSON.stringify(publicFailure)).not.toContain(dataDir);
+      expect(JSON.stringify(publicFailure)).not.toContain("preflight-secret");
+      expect(result.cause).toBeInstanceOf(Error);
+    } finally {
+      await removeTempDir(dataDir);
+    }
+  });
+
+  it("reports unknown when exact restoration cannot complete", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "omb-config-transaction-unknown-"));
+    try {
+      const configPath = join(dataDir, "config.json");
+      writeFileSync(configPath, '{"profile":{"name":"old"}}');
+      const environment: Record<string, string | undefined> = { XAI_API_KEY: "old-env" };
+      const live: AppConfig = { profile: { name: "old" }, xai: { key: "old-env" } };
+      const result = await runConfigTransaction(live, {
+        applyDisk: () => {
+          rmSync(dataDir, { recursive: true, force: true });
+          writeFileSync(dataDir, "blocking file");
+          throw new Error("apply failed with secret");
+        },
+        applyEnv: () => { environment.XAI_API_KEY = "new-env"; },
+        commitConfig: (next) => { replaceAppConfig(live, next); },
+      }, { dataDir, environment });
+
+      expect(result.outcome).toBe("unknown");
+      expect(result.rollbackCause).toBeDefined();
+      expect(environment.XAI_API_KEY).toBe("old-env");
+      expect(live).toEqual({ profile: { name: "old" }, xai: { key: "old-env" } });
+      expect(publicConfigTransactionFailure(result.outcome)).toEqual({
+        error: "configuration transaction failed",
+        outcome: "unknown",
+      });
+    } finally {
+      await removeTempDir(dataDir);
+    }
+  });
+});
+
 describe("default fleet", () => {
   it("ships Qwen and Hermes as custom-only engines", () => {
     const map = instanceConfigs({});
@@ -91,6 +468,24 @@ describe("default fleet", () => {
   it("does not expand a one-off shadow fleet", () => {
     const map = instanceConfigs({ instances: { ghost: { driver: "not-a-real-driver" } } });
     expect(Object.keys(map)).toEqual(["ghost"]);
+  });
+
+  it("adds the existing OpenCode worker when a custom endpoint is configured", () => {
+    const map = instanceConfigs({
+      instances: { claude: { driver: "claudeAgent" } },
+      customEndpoints: {
+        openrouter: {
+          id: "openrouter",
+          name: "OpenRouter",
+          providerId: "openrouter",
+          baseUrl: "https://openrouter.ai/api/v1",
+          defaultModel: "z-ai/glm-5.2",
+          apiKey: "endpoint-secret",
+        },
+      },
+    });
+    expect(map.opencodeGo?.driver).toBe("opencodeGo");
+    expect(map.opencodeGo?.environment).toEqual({ OPENMAUSBOT_ENDPOINT_OPENROUTER_API_KEY: "endpoint-secret" });
   });
 });
 
@@ -167,6 +562,23 @@ describe("OpenCode Go configuration", () => {
     expect(instances.opencode.environment).toEqual({ OPENCODE_API_KEY: "secret-value" });
     expect(instances.grok.environment).toEqual({});
   });
+
+  it("injects direct aggregator credentials only into Codex instances", () => {
+    const cfg: AppConfig = {
+      nvidia: { apiKey: "SECRET-NVIDIA" },
+      openrouter: { apiKey: "SECRET-OPENROUTER" },
+      instances: {
+        codex: { driver: "codex" },
+        hermes: { driver: "hermesAgent" },
+      },
+    };
+    const instances = instanceConfigs(cfg);
+    expect(instances.codex.environment).toEqual({
+      OPENMAUSBOT_NVIDIA_API_KEY: "SECRET-NVIDIA",
+      OPENMAUSBOT_OPENROUTER_API_KEY: "SECRET-OPENROUTER",
+    });
+    expect(instances.hermes.environment).toEqual({});
+  });
 });
 
 describe("credential env narrowing", () => {
@@ -213,7 +625,15 @@ describe("credential env narrowing", () => {
 });
 
 describe("credential env preference", () => {
-  const VARS = ["XAI_API_KEY", "BOX_TOKEN", "OPENCODE_API_KEY", "OMB_TTS_KEY", "COMPOSIO_API_KEY"] as const;
+  const VARS = [
+    "XAI_API_KEY",
+    "NVIDIA_API_KEY",
+    "OPENROUTER_API_KEY",
+    "BOX_TOKEN",
+    "OPENCODE_API_KEY",
+    "OMB_TTS_KEY",
+    "COMPOSIO_API_KEY",
+  ] as const;
   let saved: Record<string, string | undefined>;
 
   beforeEach(() => {
@@ -237,18 +657,24 @@ describe("credential env preference", () => {
     writeFileSync(
       join(DATA_DIR, "config.json"),
       JSON.stringify({
-        xai: { key: "file-xai", url: "https://api.example.test/v1" },
+      xai: { key: "file-xai", url: "https://api.example.test/v1" },
+      nvidia: { apiKey: "file-nvidia" },
+      openrouter: { apiKey: "file-openrouter" },
         box: { token: "file-box" },
         opencodeGo: { apiKey: "file-ocg" },
         tts: { key: "file-tts", voice: "narrator" },
       }),
     );
     process.env.XAI_API_KEY = "env-xai";
+    process.env.NVIDIA_API_KEY = "env-nvidia";
+    process.env.OPENROUTER_API_KEY = "env-openrouter";
     process.env.BOX_TOKEN = "env-box";
     process.env.OPENCODE_API_KEY = "env-ocg";
     process.env.OMB_TTS_KEY = "env-tts";
     const cfg = loadConfig();
     expect(cfg.xai).toEqual({ key: "env-xai", url: "https://api.example.test/v1" });
+    expect(cfg.nvidia).toEqual({ apiKey: "env-nvidia" });
+    expect(cfg.openrouter).toEqual({ apiKey: "env-openrouter" });
     expect(cfg.box).toEqual({ token: "env-box" });
     expect(cfg.opencodeGo).toEqual({ apiKey: "env-ocg" });
     expect(cfg.tts).toEqual({ key: "env-tts", voice: "narrator" });
@@ -307,5 +733,7 @@ describe("workspace credential env strip", () => {
     // consumed in-process (Computer driver / voice module), never by a CLI
     expect(WORKSPACE_CREDENTIAL_ENV).toContain("BOX_TOKEN");
     expect(WORKSPACE_CREDENTIAL_ENV).toContain("OMB_TTS_KEY");
+    expect(WORKSPACE_CREDENTIAL_ENV).toContain("API_KEY_21ST");
+    expect(WORKSPACE_CREDENTIAL_ENV).toContain("API_KEY_SECRET");
   });
 });

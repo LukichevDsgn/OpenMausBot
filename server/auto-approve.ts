@@ -73,6 +73,16 @@ export function approvalKey(tool: string, summary: string, scope?: "local-comput
 export interface AutoApprover {
   autoApprove?: boolean;
   alwaysAllow?: string[];
+  /** Exact local desktop applications this bot may operate without a card.
+   * This is deliberately separate from autoApprove/alwaysAllow: a grant for
+   * Framer must not become a grant for the desktop or the node_repl bridge. */
+  localComputerAllowApps?: string[];
+}
+
+export function normalizeLocalComputerApp(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9._-]{0,127}$/.test(normalized) ? normalized : null;
 }
 
 /** Why a verdict landed the way it did. `unattended-block` exists only in
@@ -83,6 +93,7 @@ export type AutoVerdictSource =
   | "auto-mode"
   | "unattended-block"
   | "local-computer-block"
+  | "local-computer-app-grant"
   | "destructive-guard"
   | "sensitive-guard"
   | "no-grant";
@@ -112,12 +123,19 @@ export function autoVerdict(
     unattended?: boolean;
     /** the request controls the user's active desktop */
     scope?: "local-computer";
+    /** exact executable/app id reported by the local-computer bridge */
+    localComputerApp?: string;
   },
 ): AutoVerdict {
   // the guards outrank the grants, so an "always allow" can never widen
   // into them
   const destructive = matchFirst(DESTRUCTIVE, summary) ?? matchFirst(DESTRUCTIVE, tool);
   const sensitive = destructive ? null : matchFirst(SENSITIVE, summary);
+  const localComputerApp = normalizeLocalComputerApp(context?.localComputerApp);
+  const localComputerAppGranted =
+    context?.scope === "local-computer" &&
+    localComputerApp !== null &&
+    bot.localComputerAllowApps?.some((app) => normalizeLocalComputerApp(app) === localComputerApp) === true;
   // The grant is computed even when a hard block will refuse it: the row
   // worth auditing is "this WOULD have auto-approved, and only the block
   // stood in the way", which cannot be told apart from an ordinary
@@ -131,6 +149,20 @@ export function autoVerdict(
         : bot.autoApprove
           ? { approve: `auto-approved ${tool}`, source: "auto-mode" as const, rule: undefined }
           : null;
+  // Guards always outrank every grant. An app-scoped local grant is the one
+  // deliberate exception to both the local-computer and unattended blocks:
+  // it records the user's standing authorization for this exact app, not a
+  // broad permission inherited from a tool name or a parent turn.
+  if (destructive) return { approve: null, source: "destructive-guard", rule: destructive };
+  if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };
+  if (localComputerAppGranted) {
+    const rule = `local-computer:app:${localComputerApp}`;
+    return {
+      approve: `auto-approved ${localComputerApp} (local app grant)`,
+      source: "local-computer-app-grant",
+      rule,
+    };
+  }
   if (context?.unattended) {
     // Auto mode is something a person switched on for turns they are present
     // for. A webhook turn begins with nobody watching, on a payload someone
@@ -140,8 +172,6 @@ export function autoVerdict(
     // anyway keeps its own name; the block is only the story when it is the
     // thing that changed the outcome.
     if (grant) return { approve: null, source: "unattended-block", rule: grant.rule };
-    if (destructive) return { approve: null, source: "destructive-guard", rule: destructive };
-    if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };
     return { approve: null, source: "no-grant" };
   }
   if (context?.scope === "local-computer") {
@@ -150,12 +180,8 @@ export function autoVerdict(
     // as the unattended block: a guard that would have carded anyway keeps
     // its own name, the block is the story only when it changed the outcome.
     if (grant) return { approve: null, source: "local-computer-block", rule: grant.rule };
-    if (destructive) return { approve: null, source: "destructive-guard", rule: destructive };
-    if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };
     return { approve: null, source: "no-grant" };
   }
-  if (destructive) return { approve: null, source: "destructive-guard", rule: destructive };
-  if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };
   if (grant) return { approve: grant.approve, source: grant.source, rule: grant.rule };
   return { approve: null, source: "no-grant" };
 }
@@ -170,6 +196,8 @@ export function autoDecision(
     unattended?: boolean;
     /** the request controls the user's active desktop */
     scope?: "local-computer";
+    /** exact executable/app id reported by the local-computer bridge */
+    localComputerApp?: string;
   },
 ): string | null {
   return autoVerdict(bot, tool, summary, context).approve;

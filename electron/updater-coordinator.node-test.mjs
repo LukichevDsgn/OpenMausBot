@@ -3,6 +3,13 @@ import { EventEmitter } from "node:events";
 import test from "node:test";
 
 import { createUpdaterCoordinator } from "./updater-coordinator.mjs";
+import {
+  DIRECT_UPDATE_POLICY,
+  OFFICIAL_GITHUB_FEED,
+  OFFICIAL_RELEASE_NOTES_URL,
+  SOURCE_INTEGRATION_UPDATE_POLICY,
+  applySourceIntegrationUpdatePolicy,
+} from "./update-policy.mjs";
 
 function deferred() {
   let resolve;
@@ -14,22 +21,72 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function harness() {
+function harness(policy, options = {}, initialState = { status: "idle" }) {
   const updater = new EventEmitter();
   // electron-updater has its own error listener; model that without routing it.
   updater.on("error", () => {});
-  let state = { status: "idle" };
+  let state = { ...initialState };
   const states = [];
   const coordinator = createUpdaterCoordinator(updater, (patch) => {
     state = { ...state, ...patch };
     states.push({ ...state });
-  });
+  }, policy, options);
   return { updater, coordinator, states, getState: () => state };
 }
 
 function errorStates(states) {
   return states.filter((entry) => entry.status === "error");
 }
+
+test("source integration policy is immutable and fixed to the official releases page", () => {
+  assert.equal(Object.isFrozen(SOURCE_INTEGRATION_UPDATE_POLICY), true);
+  assert.equal(Object.isFrozen(OFFICIAL_GITHUB_FEED), true);
+  assert.equal(SOURCE_INTEGRATION_UPDATE_POLICY.mode, "source-integration");
+  assert.equal(SOURCE_INTEGRATION_UPDATE_POLICY.autoDownload, false);
+  assert.equal(SOURCE_INTEGRATION_UPDATE_POLICY.autoInstallOnAppQuit, false);
+  assert.equal(SOURCE_INTEGRATION_UPDATE_POLICY.releaseNotesUrl, OFFICIAL_RELEASE_NOTES_URL);
+  assert.deepEqual(OFFICIAL_GITHUB_FEED, {
+    provider: "github",
+    owner: "milind-soni",
+    repo: "openmausbot-releases",
+  });
+  assert.throws(() => {
+    SOURCE_INTEGRATION_UPDATE_POLICY.mode = "direct";
+  }, TypeError);
+});
+
+test("source policy application sets exact feed and native safety flags", () => {
+  const calls = [];
+  const updater = {
+    autoDownload: true,
+    autoInstallOnAppQuit: true,
+    setFeedURL(feed) {
+      calls.push(feed);
+    },
+  };
+
+  const result = applySourceIntegrationUpdatePolicy(updater);
+
+  assert.strictEqual(result, SOURCE_INTEGRATION_UPDATE_POLICY);
+  assert.deepEqual(calls, [OFFICIAL_GITHUB_FEED]);
+  assert.equal(updater.autoDownload, false);
+  assert.equal(updater.autoInstallOnAppQuit, false);
+});
+
+test("source policy application propagates feed failure for fail-closed startup", () => {
+  const failure = new Error("feed setup failed");
+  const updater = {
+    autoDownload: true,
+    autoInstallOnAppQuit: true,
+    setFeedURL() {
+      throw failure;
+    },
+  };
+
+  assert.throws(() => applySourceIntegrationUpdatePolicy(updater), failure);
+  assert.equal(updater.autoDownload, false);
+  assert.equal(updater.autoInstallOnAppQuit, false);
+});
 
 test("automatic check rejection is handled and returns to idle", async () => {
   const { updater, coordinator, getState } = harness();
@@ -322,4 +379,105 @@ test("an updater error event and rejected promise produce one deterministic stat
   await download.coordinator.download();
   assert.equal(errorStates(download.states).length, 1);
   assert.deepEqual(download.getState(), { status: "error", message: "download failed once" });
+});
+
+test("source integration publishes an available developer update for automatic checks", async () => {
+  const { updater, coordinator, getState } = harness(SOURCE_INTEGRATION_UPDATE_POLICY);
+  let checkCalls = 0;
+  updater.checkForUpdates = () => {
+    checkCalls += 1;
+    updater.emit("checking-for-update");
+    updater.emit("update-available", { version: "2.2.0" });
+    return Promise.resolve({ isUpdateAvailable: true });
+  };
+
+  await coordinator.check();
+
+  assert.equal(checkCalls, 1);
+  assert.deepEqual(getState(), {
+    status: "available",
+    version: "2.2.0",
+    mode: "source-integration",
+    releaseNotesUrl: OFFICIAL_RELEASE_NOTES_URL,
+    message: undefined,
+  });
+});
+
+test("source integration blocks native download/install and ignores rogue events", async () => {
+  const opened = [];
+  let downloadCalls = 0;
+  let installCalls = 0;
+  const { updater, coordinator, getState } = harness(SOURCE_INTEGRATION_UPDATE_POLICY, {
+    openReleaseNotes: (url) => opened.push(url),
+  });
+  updater.checkForUpdates = () => {
+    updater.emit("update-available", { version: "2.3.0" });
+    return Promise.resolve();
+  };
+  updater.downloadUpdate = () => {
+    downloadCalls += 1;
+    return Promise.resolve();
+  };
+  updater.quitAndInstall = () => {
+    installCalls += 1;
+  };
+
+  await coordinator.check(true);
+  const available = { ...getState() };
+  updater.emit("download-progress", { percent: 91 });
+  updater.emit("update-downloaded", { version: "9.9.9" });
+  assert.deepEqual(getState(), available);
+
+  await coordinator.download();
+  await coordinator.install();
+
+  assert.equal(downloadCalls, 0);
+  assert.equal(installCalls, 0);
+  assert.deepEqual(opened, [OFFICIAL_RELEASE_NOTES_URL, OFFICIAL_RELEASE_NOTES_URL]);
+  assert.deepEqual(getState(), available);
+});
+
+test("source integration makes a stale downloaded state non-installable", async () => {
+  let downloadCalls = 0;
+  let installCalls = 0;
+  const { updater, coordinator, getState } = harness(
+    SOURCE_INTEGRATION_UPDATE_POLICY,
+    { openReleaseNotes: () => {} },
+    {
+      status: "downloaded",
+      version: "stale",
+      mode: "source-integration",
+      releaseNotesUrl: OFFICIAL_RELEASE_NOTES_URL,
+    },
+  );
+  updater.downloadUpdate = () => {
+    downloadCalls += 1;
+    return Promise.resolve();
+  };
+  updater.quitAndInstall = () => {
+    installCalls += 1;
+  };
+
+  await coordinator.install();
+
+  assert.equal(downloadCalls, 0);
+  assert.equal(installCalls, 0);
+  assert.equal(getState().status, "idle");
+  assert.equal(getState().mode, undefined);
+});
+
+test("explicit direct policy keeps native download behavior", async () => {
+  const { updater, coordinator, getState } = harness(DIRECT_UPDATE_POLICY);
+  let downloadCalls = 0;
+  updater.downloadUpdate = () => {
+    downloadCalls += 1;
+    updater.emit("download-progress", { percent: 50 });
+    return Promise.resolve();
+  };
+
+  await coordinator.download();
+
+  assert.equal(downloadCalls, 1);
+  assert.equal(getState().status, "downloading");
+  assert.equal(getState().percent, 50);
 });

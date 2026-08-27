@@ -8,13 +8,19 @@
 // status SUCCESS. Deterministic, no network.
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
-import { writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 
 const argv = process.argv.slice(2);
 if (process.env.FAKE_AGY_DUMP) {
   writeFileSync(process.env.FAKE_AGY_DUMP, JSON.stringify({ argv, env: process.env }, null, 2));
 }
 if (argv.includes("--version")) {
+  if (process.env.FAKE_AGY_VERSION_ALWAYS_FAIL) process.exit(7);
+  const failOnceMarker = process.env.FAKE_AGY_VERSION_FAIL_ONCE;
+  if (failOnceMarker && !existsSync(failOnceMarker)) {
+    writeFileSync(failOnceMarker, "failed once");
+    process.exit(7);
+  }
   console.log("1.1.12");
   process.exit(0);
 }
@@ -28,9 +34,39 @@ const printIdx = argv.indexOf("--print");
 const prompt = printIdx !== -1 ? argv[printIdx + 1] : undefined;
 if (!prompt) process.exit(0);
 
+if (process.env.FAKE_AGY_RESULT_ERROR) {
+  out({ event: "init", conversation_id: CONV, init: { cwd: process.cwd(), tools: [], permission_mode: "accept-edits" } });
+  out({
+    event: "result",
+    conversation_id: CONV,
+    result: {
+      conversation_id: CONV,
+      status: "ERROR",
+      response: process.env.FAKE_AGY_RESULT_RESPONSE ?? "non-authoritative worker explanation",
+      error: process.env.FAKE_AGY_RESULT_ERROR,
+      duration_seconds: 1,
+      num_turns: 1,
+    },
+  });
+  process.exit(1);
+}
+
+if (process.env.FAKE_AGY_REDUNDANT_POLL_LOOP) {
+  out({ event: "init", conversation_id: CONV, init: { cwd: process.cwd(), tools: ["run_command", "schedule"], permission_mode: "accept-edits" } });
+  out({ event: "step_update", conversation_id: CONV, step_update: { conversation_id: CONV, step_index: 7, state: "ACTIVE", step_type: "tool", tool_name: "run_command", tool_info: { name: "run_command", parameters: { CommandLine: "test" } } } });
+  out({ event: "step_update", conversation_id: CONV, step_update: { conversation_id: CONV, step_index: 7, state: "DONE", step_type: "tool", tool_name: "run_command", tool_info: { name: "run_command", parameters: { CommandLine: "test" }, output: "1 pass" } } });
+  out({ event: "step_update", conversation_id: CONV, step_update: { conversation_id: CONV, step_index: 8, state: "ACTIVE", step_type: "tool", tool_name: "schedule", tool_info: { name: "schedule", parameters: { DurationSeconds: 60, Prompt: "Check task-7" } } } });
+  out({ event: "step_update", conversation_id: CONV, step_update: { conversation_id: CONV, step_index: 8, state: "DONE", step_type: "tool", tool_name: "schedule", tool_info: { name: "schedule", parameters: { DurationSeconds: 60, Prompt: "Check task-7" } } } });
+  setTimeout(() => {
+    out({ event: "step_update", conversation_id: CONV, step_update: { conversation_id: CONV, step_index: 9, state: "ACTIVE", step_type: "tool", tool_name: "schedule", tool_info: { name: "schedule", parameters: { DurationSeconds: 60, Prompt: "Check task-7 again" } } } });
+  }, 20);
+  setInterval(() => {}, 1000);
+} else {
+
 out({ event: "init", conversation_id: CONV, init: { cwd: process.cwd(), tools: ["run_command", "write_to_file"], permission_mode: "accept-edits" } });
 out({ event: "step_update", conversation_id: CONV, step_update: { conversation_id: CONV, step_index: 0, state: "ACTIVE", step_type: "tool", tool_name: "write_to_file", tool_info: { name: "write_to_file", parameters: {} } } });
 out({ event: "step_update", conversation_id: CONV, step_update: { conversation_id: CONV, step_index: 0, state: "DONE", step_type: "tool", tool_name: "write_to_file", tool_info: { name: "write_to_file", parameters: {} } } });
 out({ event: "step_update", conversation_id: CONV, step_update: { conversation_id: CONV, step_index: 1, state: "DONE", step_type: "agent_response", usage: { input_tokens: 100, output_tokens: 20, thinking_tokens: 0, cache_read_tokens: 5, total_tokens: 125 } } });
 out({ event: "result", conversation_id: CONV, result: { conversation_id: CONV, status: "SUCCESS", response: "done from fake agy", duration_seconds: 1, num_turns: 1, usage: { input_tokens: 100, output_tokens: 20, thinking_tokens: 0, cache_read_tokens: 5, total_tokens: 125 } } });
 process.exit(0);
+}

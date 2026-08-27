@@ -1,6 +1,6 @@
 import { ChevronDown, ChevronLeft, Crown, FolderOpen, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import { api, useStore, type Bot } from "@/state/store";
+import { api, runtimePolicySignature, useStore, type Bot, type RuntimePolicy, type SkillCatalogEntry } from "@/state/store";
 import { MausAvatar } from "./Avatar";
 import {
   PICKABLE_STATES,
@@ -316,6 +316,446 @@ function MemoryCard({ bot }: { bot: Bot }) {
   );
 }
 
+function sortedIds(ids: Iterable<string>): string[] {
+  return [...new Set(ids)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+function defaultSkillIds(catalog: readonly SkillCatalogEntry[]): string[] {
+  return sortedIds(catalog.filter((skill) => skill.defaultEnabled).map((skill) => skill.id));
+}
+
+function effectiveSkillIds(bot: Bot, catalog: readonly SkillCatalogEntry[]): string[] {
+  const known = new Set(catalog.map((skill) => skill.id));
+  return sortedIds(
+    (bot.skillGrants === undefined ? defaultSkillIds(catalog) : bot.skillGrants)
+      .filter((id) => known.has(id)),
+  );
+}
+
+function effectiveToolIds(bot: Bot, catalog: readonly SkillCatalogEntry[], skillIds: readonly string[]): string[] {
+  const known = new Set(catalog.flatMap((skill) => skill.tools));
+  const defaultTools = catalog
+    .filter((skill) => skillIds.includes(skill.id))
+    .flatMap((skill) => skill.tools);
+  return sortedIds(
+    (bot.skillToolGrants === undefined ? defaultTools : bot.skillToolGrants)
+      .filter((id) => known.has(id)),
+  );
+}
+
+function SkillToggle({
+  checked,
+  label,
+  onClick,
+}: {
+  checked: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      onClick={onClick}
+      className={cn("relative h-[24px] w-[40px] shrink-0 rounded-full transition-colors", checked ? "bg-accent" : "bg-raised")}
+    >
+      <span className={cn("absolute top-[3px] size-[18px] rounded-full bg-white transition-all", checked ? "left-[19px]" : "left-[3px]")} />
+    </button>
+  );
+}
+
+/** Per-bot grants are persisted explicitly. The effective defaults are only
+ * the initial view; every user change writes arrays, including []. */
+function SkillsCard({ bot, catalog }: { bot: Bot; catalog: readonly SkillCatalogEntry[] }) {
+  const { dispatch } = useStore();
+  const [skillIds, setSkillIds] = useState<string[]>([]);
+  const [toolIds, setToolIds] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const nextSkills = effectiveSkillIds(bot, catalog);
+    setSkillIds(nextSkills);
+    setToolIds(effectiveToolIds(bot, catalog, nextSkills));
+  }, [bot.id, bot.skillGrants, bot.skillToolGrants, catalog]);
+
+  if (!catalog.length) return null;
+
+  const save = async (nextSkills: string[], nextTools: string[]) => {
+    setSkillIds(nextSkills);
+    setToolIds(nextTools);
+    setSaving(true);
+    setError(null);
+    try {
+      const result: { bot: Bot } = await api(`/api/bots/${bot.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ skillGrants: nextSkills, skillToolGrants: nextTools }),
+      });
+      dispatch({ type: "botPatched", bot: result.bot });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="rounded-xl bg-card p-4">
+      <div className="text-[15px] font-medium text-ink">Skills</div>
+      <div className="mt-0.5 text-[13px] leading-relaxed text-ink-secondary">
+        Choose which bundled skills and their tools this bot may use. Changes apply on the next turn.
+      </div>
+      <div className="mt-3 space-y-3">
+        {catalog.map((skill) => {
+          const skillEnabled = skillIds.includes(skill.id);
+          return (
+            <div key={skill.id} className="rounded-lg border border-hairline/40 bg-inset p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-[13.5px] font-medium text-ink">{skill.name}</div>
+                  <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">{skill.description}</div>
+                </div>
+                <SkillToggle
+                  checked={skillEnabled}
+                  label={`Allow ${skill.name}`}
+                  onClick={() => void save(
+                    skillEnabled
+                      ? skillIds.filter((id) => id !== skill.id)
+                      : sortedIds([...skillIds, skill.id]),
+                    toolIds,
+                  )}
+                />
+              </div>
+              {skill.tools.length > 0 && (
+                <div className="mt-3 border-t border-hairline/30 pt-2.5">
+                  <div className="mb-1.5 text-[11.5px] uppercase tracking-wide text-ink-secondary">Tools</div>
+                  <div className="space-y-1.5">
+                    {skill.tools.map((toolId) => {
+                      const toolEnabled = toolIds.includes(toolId);
+                      return (
+                        <div key={toolId} className="flex items-center justify-between gap-3">
+                          <span className="font-mono text-[12px] text-ink">{toolId}</span>
+                          <SkillToggle
+                            checked={toolEnabled}
+                            label={`Allow ${toolId} for ${skill.name}`}
+                            onClick={() => void save(
+                              skillIds,
+                              toolEnabled
+                                ? toolIds.filter((id) => id !== toolId)
+                                : sortedIds([...toolIds, toolId]),
+                            )}
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      {saving && <div className="mt-2 text-[12px] text-ink-secondary">Saving…</div>}
+      {error && <div className="mt-2 text-[12px] text-danger">{error}</div>}
+    </div>
+  );
+}
+
+const FALLBACK_RUNTIME_POLICY: RuntimePolicy = {
+  wallClockTimeoutMinutes: 0,
+  idleTimeoutMinutes: 20,
+  cancellationGraceSeconds: 5,
+  retryCap: 1,
+  maxToolAgentSteps: 0,
+  delegationConcurrency: 4,
+  freshSessionEnforcement: false,
+  handoffByteCap: 12_000,
+  cumulativeTokenPolicy: { mode: "disabled", limit: 1_000_000 },
+};
+
+function copyRuntimePolicy(policy?: RuntimePolicy): RuntimePolicy {
+  return {
+    ...(policy ?? FALLBACK_RUNTIME_POLICY),
+    cumulativeTokenPolicy: {
+      ...(policy?.cumulativeTokenPolicy ?? FALLBACK_RUNTIME_POLICY.cumulativeTokenPolicy),
+    },
+  };
+}
+
+function sameRuntimePolicy(a: RuntimePolicy, b: RuntimePolicy): boolean {
+  return a.wallClockTimeoutMinutes === b.wallClockTimeoutMinutes
+    && a.idleTimeoutMinutes === b.idleTimeoutMinutes
+    && a.cancellationGraceSeconds === b.cancellationGraceSeconds
+    && a.retryCap === b.retryCap
+    && a.maxToolAgentSteps === b.maxToolAgentSteps
+    && a.delegationConcurrency === b.delegationConcurrency
+    && a.freshSessionEnforcement === b.freshSessionEnforcement
+    && a.handoffByteCap === b.handoffByteCap
+    && a.cumulativeTokenPolicy.mode === b.cumulativeTokenPolicy.mode
+    && a.cumulativeTokenPolicy.limit === b.cumulativeTokenPolicy.limit;
+}
+
+function numberInputValue(value: number): number | string {
+  return Number.isFinite(value) ? value : "";
+}
+
+function RuntimeControlsCard({ bot }: { bot: Bot }) {
+  const { dispatch } = useStore();
+  const [base, setBase] = useState<RuntimePolicy>(() => copyRuntimePolicy(bot.runtimePolicy));
+  const [draft, setDraft] = useState<RuntimePolicy>(() => copyRuntimePolicy(bot.runtimePolicy));
+  const [status, setStatus] = useState<"clean" | "saving" | "saved" | "error">("clean");
+  const [error, setError] = useState<string | null>(null);
+  const policySignature = runtimePolicySignature(bot.runtimePolicy);
+
+  useEffect(() => {
+    const next = copyRuntimePolicy(bot.runtimePolicy);
+    setBase(next);
+    setDraft(next);
+    setStatus("clean");
+    setError(null);
+  }, [bot.id, policySignature]);
+
+  const updateNumber = (key: keyof Pick<RuntimePolicy, "wallClockTimeoutMinutes" | "idleTimeoutMinutes" | "cancellationGraceSeconds" | "retryCap" | "maxToolAgentSteps" | "delegationConcurrency" | "handoffByteCap">, value: string) => {
+    setDraft((current) => ({ ...current, [key]: value === "" ? Number.NaN : Number(value) }));
+    setStatus("clean");
+    setError(null);
+  };
+
+  const updateToken = (patch: Partial<RuntimePolicy["cumulativeTokenPolicy"]>) => {
+    setDraft((current) => ({
+      ...current,
+      cumulativeTokenPolicy: { ...current.cumulativeTokenPolicy, ...patch },
+    }));
+    setStatus("clean");
+    setError(null);
+  };
+
+  const save = async (reset: boolean) => {
+    const runtimePolicy: Record<string, unknown> = {};
+    if (!reset) {
+      const scalarKeys = [
+        "wallClockTimeoutMinutes",
+        "idleTimeoutMinutes",
+        "cancellationGraceSeconds",
+        "retryCap",
+        "maxToolAgentSteps",
+        "delegationConcurrency",
+        "freshSessionEnforcement",
+        "handoffByteCap",
+      ] as const;
+      for (const key of scalarKeys) {
+        if (draft[key] !== base[key]) runtimePolicy[key] = draft[key];
+      }
+      const tokenPatch: Record<string, unknown> = {};
+      if (draft.cumulativeTokenPolicy.mode !== base.cumulativeTokenPolicy.mode) {
+        tokenPatch.mode = draft.cumulativeTokenPolicy.mode;
+      }
+      if (draft.cumulativeTokenPolicy.limit !== base.cumulativeTokenPolicy.limit) {
+        tokenPatch.limit = draft.cumulativeTokenPolicy.limit;
+      }
+      if (Object.keys(tokenPatch).length) runtimePolicy.cumulativeTokenPolicy = tokenPatch;
+      if (!Object.keys(runtimePolicy).length) {
+        setStatus("clean");
+        return;
+      }
+    }
+
+    setStatus("saving");
+    setError(null);
+    try {
+      const result: { bot: Bot } = await api(`/api/bots/${bot.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ runtimePolicy: reset ? null : runtimePolicy }),
+      });
+      const next = copyRuntimePolicy(result.bot.runtimePolicy);
+      setBase(next);
+      setDraft(next);
+      dispatch({ type: "botPatched", bot: result.bot });
+      setStatus("saved");
+    } catch (cause) {
+      // Keep the server bot and reducer untouched when validation rejects the
+      // draft. The user can correct it and explicitly save again.
+      setStatus("error");
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const dirty = !sameRuntimePolicy(base, draft);
+  const saving = status === "saving";
+
+  return (
+    <div className="rounded-xl bg-card p-4">
+      <div className="text-[15px] font-medium text-ink">Runtime controls</div>
+      <div className="mt-0.5 text-[13px] leading-relaxed text-ink-secondary">
+        Changes apply to the next admitted turn and never interrupt the current one. Deterministic repeat/loop and conflicting-writer guards stay active independently.
+      </div>
+
+      <div className="mt-4 text-[11.5px] font-medium uppercase tracking-[0.08em] text-ink-secondary">Turn limits</div>
+      <div className="mt-2 grid grid-cols-2 gap-3">
+        <Field label="Wall-clock (minutes; 0 = off)">
+          <input
+            className={inputCls}
+            type="number"
+            min={0}
+            max={1_440}
+            step={1}
+            disabled={saving}
+            value={numberInputValue(draft.wallClockTimeoutMinutes)}
+            onChange={(event) => updateNumber("wallClockTimeoutMinutes", event.currentTarget.value)}
+          />
+        </Field>
+        <Field label="Idle timeout (minutes; 1–1440)">
+          <input
+            className={inputCls}
+            type="number"
+            min={1}
+            max={1_440}
+            step={1}
+            disabled={saving}
+            value={numberInputValue(draft.idleTimeoutMinutes)}
+            onChange={(event) => updateNumber("idleTimeoutMinutes", event.currentTarget.value)}
+          />
+        </Field>
+        <Field label="Cancellation grace (seconds; 1–120)">
+          <input
+            className={inputCls}
+            type="number"
+            min={1}
+            max={120}
+            step={1}
+            disabled={saving}
+            value={numberInputValue(draft.cancellationGraceSeconds)}
+            onChange={(event) => updateNumber("cancellationGraceSeconds", event.currentTarget.value)}
+          />
+        </Field>
+        <Field label="Max tool/agent steps (0 = off; 1–1000)">
+          <input
+            className={inputCls}
+            type="number"
+            min={0}
+            max={1_000}
+            step={1}
+            disabled={saving}
+            value={numberInputValue(draft.maxToolAgentSteps)}
+            onChange={(event) => updateNumber("maxToolAgentSteps", event.currentTarget.value)}
+          />
+        </Field>
+      </div>
+
+      <div className="mt-4 text-[11.5px] font-medium uppercase tracking-[0.08em] text-ink-secondary">Coordination</div>
+      <div className="mt-2 grid grid-cols-2 gap-3">
+        <Field label="Automatic retries (0–1)">
+          <input
+            className={inputCls}
+            type="number"
+            min={0}
+            max={1}
+            step={1}
+            disabled={saving}
+            value={numberInputValue(draft.retryCap)}
+            onChange={(event) => updateNumber("retryCap", event.currentTarget.value)}
+          />
+        </Field>
+        <Field label="Delegation fan-out (1–4)">
+          <input
+            className={inputCls}
+            type="number"
+            min={1}
+            max={4}
+            step={1}
+            disabled={saving}
+            value={numberInputValue(draft.delegationConcurrency)}
+            onChange={(event) => updateNumber("delegationConcurrency", event.currentTarget.value)}
+          />
+        </Field>
+        <Field label="Handoff size (UTF-8 bytes; 1024–12000)">
+          <input
+            className={inputCls}
+            type="number"
+            min={1_024}
+            max={12_000}
+            step={1}
+            disabled={saving}
+            value={numberInputValue(draft.handoffByteCap)}
+            onChange={(event) => updateNumber("handoffByteCap", event.currentTarget.value)}
+          />
+        </Field>
+        <label className="flex min-h-[72px] items-center gap-2 rounded-lg border border-hairline/40 bg-inset px-3 py-2.5 text-[13px] text-ink">
+          <input
+            type="checkbox"
+            className="size-4 accent-accent"
+            disabled={saving}
+            checked={draft.freshSessionEnforcement}
+            onChange={(event) => {
+              setDraft((current) => ({ ...current, freshSessionEnforcement: event.currentTarget.checked }));
+              setStatus("clean");
+              setError(null);
+            }}
+          />
+          <span>
+            <span className="block">Fresh session each turn</span>
+            <span className="mt-0.5 block text-[11.5px] text-ink-secondary">Keeps the bounded active-branch replay.</span>
+          </span>
+        </label>
+      </div>
+
+      <div className="mt-4 grid grid-cols-2 gap-3">
+        <Field label="Cumulative token policy">
+          <select
+            className={inputCls}
+            disabled={saving}
+            value={draft.cumulativeTokenPolicy.mode}
+            onChange={(event) => updateToken({ mode: event.currentTarget.value as RuntimePolicy["cumulativeTokenPolicy"]["mode"] })}
+          >
+            <option value="disabled">Disabled</option>
+            <option value="soft">Soft warning</option>
+            <option value="hard">Hard cap</option>
+          </select>
+        </Field>
+        <Field label="Token limit (1,000–10,000,000)">
+          <input
+            className={inputCls}
+            type="number"
+            min={1_000}
+            max={10_000_000}
+            step={1}
+            disabled={saving || draft.cumulativeTokenPolicy.mode === "disabled"}
+            value={numberInputValue(draft.cumulativeTokenPolicy.limit)}
+            onChange={(event) => updateToken({ limit: event.currentTarget.value === "" ? Number.NaN : Number(event.currentTarget.value) })}
+          />
+        </Field>
+      </div>
+      <div className="mt-2 text-[12px] leading-relaxed text-ink-secondary">
+        Disabled token policy does not stop workers or research. Soft warns once; hard requests a stop after the provider reports a sample.
+      </div>
+
+      <div className="mt-3 flex items-center gap-3">
+        <button
+          type="button"
+          onClick={() => void save(false)}
+          disabled={saving || !dirty}
+          className="rounded-lg bg-raised px-3 py-1.5 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-50"
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
+        <button
+          type="button"
+          onClick={() => void save(true)}
+          disabled={saving}
+          className="rounded-lg px-2 py-1.5 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50"
+        >
+          Reset
+        </button>
+        {status === "saved" && <span className="text-[12px] text-ink-secondary">Saved</span>}
+        {status === "clean" && !dirty && <span className="text-[12px] text-ink-secondary">Up to date</span>}
+      </div>
+      {error && <div className="mt-2 text-[12px] text-danger">{error}</div>}
+    </div>
+  );
+}
+
 export function SettingsPanel({ bot }: { bot: Bot }) {
   const { state, dispatch } = useStore();
   const [voices, setVoices] = useState<Array<{ id: string; label: string; description?: string }>>([]);
@@ -354,7 +794,9 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   const canUseVps = engine?.capabilities?.computerMcp === true && engine.driverKind !== "boxAgent";
   const connectedAppsConfigured = state.config?.composio?.configured === true;
   const connectedAppsEnabled = bot.composio !== false;
-  const currentChief = state.bots.find((candidate) => candidate.chiefOfStaff);
+  const currentChief = state.bots.find(
+    (candidate) => candidate.chiefOfStaff && (candidate.section || "") === (bot.section || ""),
+  );
 
   useEffect(() => {
     if (!state.config?.tts?.configured) {
@@ -561,6 +1003,9 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               />
             </button>
           </div>
+
+          <SkillsCard key={bot.id} bot={bot} catalog={state.skills} />
+          <RuntimeControlsCard key={`runtime-${bot.id}`} bot={bot} />
 
           <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4">
             <div>

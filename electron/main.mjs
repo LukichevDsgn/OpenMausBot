@@ -8,7 +8,11 @@ import { createAndroidDeviceController } from "./android-device.mjs";
 import { finishSpeech, startSpeech, stopSpeech } from "./speech.mjs";
 import { openBlankTerminal } from "./terminal-launch.mjs";
 import { startUpdater, registerUpdaterIpc } from "./updater.mjs";
-import { migrateWorkspaceCredentials, workspaceCredentialEnv } from "./workspace-credentials.mjs";
+import {
+  migrateWorkspaceCredentials,
+  runWorkspaceCredentialMutation,
+  workspaceCredentialEnv,
+} from "./workspace-credentials.mjs";
 import capabilitiesModule from "./capabilities.cjs";
 
 const { desktopCapabilities, nativeDesktopActions } = capabilitiesModule;
@@ -192,6 +196,7 @@ import {
   startCompanion,
   stopCompanion,
 } from "./companion.mjs";
+import { stopEmbeddedServer } from "./server-lifecycle.mjs";
 
 function slog(line) {
   try {
@@ -605,10 +610,18 @@ ipcMain.handle("desktop:capabilities", async () =>
 const CREDENTIAL_PATCH = {
   composioApiKey: (value) => ({ composio: { apiKey: value } }),
   xaiApiKey: (value) => ({ xai: { key: value } }),
+  nvidiaApiKey: (value) => ({ nvidia: { apiKey: value } }),
+  openrouterApiKey: (value) => ({ openrouter: { apiKey: value } }),
   boxToken: (value) => ({ box: { token: value } }),
   opencodeGoApiKey: (value) => ({ opencodeGo: { apiKey: value } }),
   ttsKey: (value) => ({ tts: { key: value } }),
 };
+
+async function fetchMutationResult(url, init) {
+  const response = await fetch(url, init);
+  const body = await response.json().catch(() => null);
+  return { ok: response.ok, status: response.status, body };
+}
 
 ipcMain.handle("credential:set", async (_event, name, value) => {
   const patchFor = CREDENTIAL_PATCH[name];
@@ -619,37 +632,98 @@ ipcMain.handle("credential:set", async (_event, name, value) => {
     throw new Error("The operating-system credential store is unavailable");
   }
   const secret = value.trim();
-  const previousCredentials = secureCredentials;
+  const previousCredentials = structuredClone(secureCredentials);
   if (app.isPackaged) {
     const nextCredentials = { ...secureCredentials };
     if (secret) nextCredentials[name] = secret;
     else delete nextCredentials[name];
-    // Commit the encrypted value before the server makes it live. If
-    // validation or reload fails below, restore the previous store so the
-    // next launch cannot disagree with the response the user saw.
-    await saveSecureCredentials(nextCredentials);
-    secureCredentials = nextCredentials;
-  }
-  try {
-    // In development the server is a separately launched process, so it
-    // cannot receive credentials from Electron at boot. Keep its established
-    // local config path there; production always uses the encrypted store.
     const secretStorage = app.isPackaged ? "?secretStorage=external" : "";
-    const response = await fetch(`http://127.0.0.1:${SERVER_PORT}/api/config${secretStorage}`, {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(patchFor(secret)),
+    const result = await runWorkspaceCredentialMutation({
+      previousCredentials,
+      nextCredentials,
+      writeCredentials: saveSecureCredentials,
+      setCredentials: (next) => { secureCredentials = next; },
+      request: () => fetchMutationResult(`http://127.0.0.1:${SERVER_PORT}/api/config${secretStorage}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(patchFor(secret)),
+      }),
     });
-    const body = await response.json().catch(() => null);
-    if (!response.ok) throw new Error(body?.error || `Could not save credential (HTTP ${response.status})`);
-    return body;
-  } catch (error) {
-    if (app.isPackaged) {
-      await saveSecureCredentials(previousCredentials);
-      secureCredentials = previousCredentials;
-    }
-    throw error;
+    return result.response?.body;
   }
+  // In development the server is a separately launched process, so it
+  // cannot receive credentials from Electron at boot. Keep its established
+  // local config path there; production always uses the encrypted store.
+  const result = await fetchMutationResult(`http://127.0.0.1:${SERVER_PORT}/api/config`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(patchFor(secret)),
+  });
+  if (!result.ok) throw new Error(result.body?.error || `Could not save credential (HTTP ${result.status})`);
+  return result.body;
+});
+
+ipcMain.handle("custom-endpoint:save", async (_event, endpoint) => {
+  if (!endpoint || typeof endpoint !== "object" || typeof endpoint.id !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/.test(endpoint.id)) {
+    throw new Error("Invalid custom endpoint id");
+  }
+  const secret = typeof endpoint.apiKey === "string" ? endpoint.apiKey.trim() : "";
+  const clearKey = endpoint.clearKey === true;
+  const previousCredentials = structuredClone(secureCredentials);
+  if (app.isPackaged && (secret || clearKey)) {
+    const nextCredentials = {
+      ...secureCredentials,
+      customEndpointKeys: { ...(secureCredentials.customEndpointKeys ?? {}) },
+    };
+    if (clearKey) delete nextCredentials.customEndpointKeys[endpoint.id];
+    else nextCredentials.customEndpointKeys[endpoint.id] = secret;
+    const secretStorage = app.isPackaged ? "?secretStorage=external" : "";
+    const result = await runWorkspaceCredentialMutation({
+      previousCredentials,
+      nextCredentials,
+      writeCredentials: saveSecureCredentials,
+      setCredentials: (next) => { secureCredentials = next; },
+      request: () => fetchMutationResult(`http://127.0.0.1:${SERVER_PORT}/api/custom-endpoints/${encodeURIComponent(endpoint.id)}${secretStorage}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(endpoint),
+      }),
+    });
+    return result.response?.body;
+  }
+  const secretStorage = app.isPackaged ? "?secretStorage=external" : "";
+  const result = await fetchMutationResult(`http://127.0.0.1:${SERVER_PORT}/api/custom-endpoints/${encodeURIComponent(endpoint.id)}${secretStorage}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(endpoint),
+  });
+  if (!result.ok) throw new Error(result.body?.error || `Could not save custom endpoint (HTTP ${result.status})`);
+  return result.body;
+});
+
+ipcMain.handle("custom-endpoint:delete", async (_event, id) => {
+  if (typeof id !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/.test(id)) throw new Error("Invalid custom endpoint id");
+  const previousCredentials = structuredClone(secureCredentials);
+  if (app.isPackaged && secureCredentials.customEndpointKeys?.[id]) {
+    const nextCredentials = {
+      ...secureCredentials,
+      customEndpointKeys: { ...(secureCredentials.customEndpointKeys ?? {}) },
+    };
+    delete nextCredentials.customEndpointKeys[id];
+    const result = await runWorkspaceCredentialMutation({
+      previousCredentials,
+      nextCredentials,
+      writeCredentials: saveSecureCredentials,
+      setCredentials: (next) => { secureCredentials = next; },
+      request: () => fetchMutationResult(`http://127.0.0.1:${SERVER_PORT}/api/custom-endpoints/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      }),
+    });
+    return result.response?.body;
+  }
+  const result = await fetchMutationResult(`http://127.0.0.1:${SERVER_PORT}/api/custom-endpoints/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (!result.ok) throw new Error(result.body?.error || `Could not delete custom endpoint (HTTP ${result.status})`);
+  return result.body;
 });
 
 async function broadcastDesktopCapabilities() {
@@ -737,7 +811,7 @@ app.whenReady().then(async () => {
   // connection descriptor on first render. Never blocks window creation on
   // failure — computer use degrades to "unavailable", the rest still works.
   cuaReady =
-    process.platform === "darwin" || process.platform === "linux"
+    process.platform === "darwin" || process.platform === "linux" || process.platform === "win32"
       ? startCua().catch((e) => {
           console.error("[cua] start failed:", e);
           return { mode: "unavailable", reason: String(e) };
@@ -773,18 +847,18 @@ let cuaCleanedUp = false;
 app.on("before-quit", (e) => {
   if (cuaCleanedUp) return;
   e.preventDefault();
-  try {
-    serverProc?.kill();
-  } catch {}
   // the sidecar holds a socket that is reachable from off this machine —
   // it should not outlive the window by even a moment
-  void stopCompanion();
   // a live dictation session runs its own helper child that holds the mic —
   // stop it here so quitting never orphans a recording process
   if (nativeActions.appleSpeech) stopSpeech();
-  const cleanup = Promise.race([
-    stopCua().catch(() => {}),
-    new Promise((resolve) => setTimeout(resolve, CUA_STOP_TIMEOUT_MS).unref()),
+  const cleanup = Promise.allSettled([
+    stopEmbeddedServer({ proc: serverProc, port: SERVER_PORT }),
+    stopCompanion(),
+    Promise.race([
+      stopCua().catch(() => {}),
+      new Promise((resolve) => setTimeout(resolve, CUA_STOP_TIMEOUT_MS).unref()),
+    ]),
   ]);
   cleanup.then(() => {
     cuaCleanedUp = true;

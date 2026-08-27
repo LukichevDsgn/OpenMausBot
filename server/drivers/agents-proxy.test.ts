@@ -48,7 +48,7 @@ beforeAll(async () => {
       res.writeHead(200, { "content-type": "application/json" });
       return res.end(
         JSON.stringify({
-          bots: [{ id: "bot-helper", name: "Helper", model: "fake-model", busy: false }],
+          bots: [{ id: "bot-helper", routingKey: "worker-1", name: "Helper", model: "fake-model", busy: false }],
         }),
       );
     }
@@ -86,6 +86,9 @@ beforeAll(async () => {
       OMB_THREAD_ID: "thread-asker-routine",
       OMB_COMMS_TOKEN: TOKEN,
       OMB_TURN_DEPTH: "0",
+      OMB_RETRY_CAP: "0",
+      OMB_DELEGATION_CONCURRENCY: "2",
+      OMB_HANDOFF_BYTE_CAP: "2048",
     },
     stdio: ["pipe", "pipe", "inherit"],
   });
@@ -115,6 +118,10 @@ describe("agents-proxy MCP surface", () => {
     expect(init.result.serverInfo.name).toContain("agents");
     const list = await rpc("tools/list");
     expect(list.result.tools.map((t: { name: string }) => t.name)).toEqual(["list_bots", "ask_bot", "delegate_bot"]);
+    const delegate = list.result.tools.find((tool: { name: string }) => tool.name === "delegate_bot");
+    expect(delegate.description).toContain("Maximum 2048 UTF-8 bytes");
+    expect(delegate.description).toContain("No automatic evidence-changing retry");
+    expect(delegate.description).toContain("capped at 2 successful delegations");
   });
 
   it("list_bots renders the roster and authenticates with the shared token", async () => {
@@ -127,13 +134,15 @@ describe("agents-proxy MCP surface", () => {
 
   it("ask_bot forwards sender + depth and returns the reply", async () => {
     askResponse = { botName: "Helper", text: "hi from helper" };
-    const res = await callTool("ask_bot", { bot_id: "bot-helper", message: "ping" });
+    const res = await callTool("ask_bot", { bot_id: "bot-helper", routing_key: "worker-1", bot_name: "Helper", message: "ping" });
     expect(res.result.content[0].text).toContain("Helper replied:");
     expect(res.result.content[0].text).toContain("hi from helper");
     expect(lastAskBody).toMatchObject({
       fromBotId: "bot-asker",
       fromThreadId: "thread-asker-routine",
       toBotId: "bot-helper",
+      toRoutingKey: "worker-1",
+      toBotName: "Helper",
       message: "ping",
       depth: 0,
     });
@@ -157,6 +166,8 @@ describe("agents-proxy MCP surface", () => {
     delegateResponse = { queued: true, message: "Delegation queued." };
     const res = await callTool("delegate_bot", {
       bot_id: "bot-helper",
+      routing_key: "worker-1",
+      bot_name: "Helper",
       message: "take this",
       reason: "follow-up",
     });
@@ -165,6 +176,8 @@ describe("agents-proxy MCP surface", () => {
       fromBotId: "bot-asker",
       fromThreadId: "thread-asker-routine",
       toBotId: "bot-helper",
+      toRoutingKey: "worker-1",
+      toBotName: "Helper",
       message: "take this",
       reason: "follow-up",
       depth: 0,

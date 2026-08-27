@@ -39,6 +39,23 @@ describe("local computer routing", () => {
     ).toBe(true);
   });
 
+  it("mounts an explicitly selected Windows desktop for an approval-capable provider", () => {
+    expect(
+      shouldMountLocalComputer({
+        requested: "local",
+        hostPlatform: "win32",
+        providerSupportsLocal: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldMountLocalComputer({
+        requested: "local",
+        hostPlatform: "win32",
+        providerSupportsLocal: false,
+      }),
+    ).toBe(false);
+  });
+
   it("never mounts the local desktop for explicit cloud/off or on an unsupported host", () => {
     for (const requested of ["cloud", "off"] as const) {
       expect(
@@ -52,7 +69,7 @@ describe("local computer routing", () => {
     expect(
       shouldMountLocalComputer({
         requested: "local",
-        hostPlatform: "win32",
+        hostPlatform: "aix",
         providerSupportsLocal: true,
       }),
     ).toBe(false);

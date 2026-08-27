@@ -1,7 +1,8 @@
 // Stall-watchdog contract: activity keeps a turn alive indefinitely, human
 // approvals pause the clock, silence past the ceiling stalls exactly once.
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { runtimePolicyTiming } from "./bot-runtime-policy.ts";
 import { TurnWatchdog, type WatchedTurn } from "./turn-watchdog.ts";
 
 const STALL = 10_000;
@@ -19,6 +20,8 @@ function rig() {
 }
 
 describe("TurnWatchdog", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
   it("stalls a silent turn once, and only once", () => {
     const { dog, stalls, tick } = rig();
     dog.watch("t1", "bot1");
@@ -81,5 +84,29 @@ describe("TurnWatchdog", () => {
     tick(STALL);
     dog.sweep();
     expect(stalls).toEqual([expect.objectContaining({ botId: "bot2" })]);
+  });
+
+  it("captures the per-turn idle limit at admission", () => {
+    const { dog, stalls, tick } = rig();
+    dog.watch("short", "bot1", 2_000);
+    tick(1_999);
+    dog.sweep();
+    expect(stalls).toHaveLength(0);
+    tick(2);
+    dog.sweep();
+    expect(stalls).toEqual([expect.objectContaining({ threadId: "short", idleMs: 2_000 })]);
+  });
+
+  it("applies the exact non-unit legacy idle fallback", () => {
+    vi.stubEnv("OMB_TURN_STALL_MS", "90000");
+    const timing = runtimePolicyTiming();
+    const { dog, stalls, tick } = rig();
+    dog.watch("legacy", "bot1", timing.idleMs);
+    tick(89_999);
+    dog.sweep();
+    expect(stalls).toHaveLength(0);
+    tick(2);
+    dog.sweep();
+    expect(stalls).toEqual([expect.objectContaining({ threadId: "legacy", idleMs: 90_000 })]);
   });
 });

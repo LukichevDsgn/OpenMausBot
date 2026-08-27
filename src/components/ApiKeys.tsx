@@ -6,12 +6,20 @@ import { Check, CircleHelp, ExternalLink, Loader2, TriangleAlert } from "lucide-
 import { api, useStore, type ConfigStatus } from "@/state/store";
 import { cn } from "@/lib/cn";
 
-export type ConfigSection = "composio" | "box" | "opencodeGo";
+export type ConfigSection = "composio" | "box" | "opencodeGo" | "nvidia" | "openrouter";
 
 const SECTIONS: Record<
   ConfigSection,
   { body: (value: string) => unknown; flag: (config: ConfigStatus) => boolean }
 > = {
+  nvidia: {
+    body: (v) => ({ nvidia: { apiKey: v } }),
+    flag: (c) => c.nvidia?.configured ?? false,
+  },
+  openrouter: {
+    body: (v) => ({ openrouter: { apiKey: v } }),
+    flag: (c) => c.openrouter?.configured ?? false,
+  },
   composio: {
     body: (v) => ({ composio: { apiKey: v } }),
     flag: (c) => c.composio.configured,
@@ -20,7 +28,9 @@ const SECTIONS: Record<
   opencodeGo: { body: (v) => ({ opencodeGo: { apiKey: v } }), flag: (c) => c.opencodeGo?.configured ?? false },
 };
 
-const ELECTRON_CREDENTIAL: Record<ConfigSection, "composioApiKey" | "boxToken" | "opencodeGoApiKey"> = {
+const ELECTRON_CREDENTIAL: Record<ConfigSection, "composioApiKey" | "boxToken" | "opencodeGoApiKey" | "nvidiaApiKey" | "openrouterApiKey"> = {
+  nvidia: "nvidiaApiKey",
+  openrouter: "openrouterApiKey",
   composio: "composioApiKey",
   box: "boxToken",
   opencodeGo: "opencodeGoApiKey",
@@ -38,6 +48,22 @@ const CREDENTIALS: Record<
     warning?: string;
   }
 > = {
+  nvidia: {
+    label: "NVIDIA NIM API key",
+    placeholder: "Paste NVIDIA NIM key",
+    description: "Call NVIDIA's OpenAI-compatible NIM endpoint directly from OpenMausBot through the Codex agent harness.",
+    href: "https://build.nvidia.com",
+    linkLabel: "Open NVIDIA NIM",
+    optional: true,
+  },
+  openrouter: {
+    label: "OpenRouter API key",
+    placeholder: "Paste OpenRouter key",
+    description: "Route OpenAI-compatible agent turns through OpenRouter without putting the key in Hermes.",
+    href: "https://openrouter.ai/keys",
+    linkLabel: "Create or copy an OpenRouter key",
+    optional: true,
+  },
   composio: {
     label: "Composio project key",
     placeholder: "ak_…",

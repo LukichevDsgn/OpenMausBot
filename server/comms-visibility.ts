@@ -36,6 +36,7 @@ export function mirrorExchange(
   message: string,
   channel: GroupRecord | undefined,
   sourceThreadId = from.threadId,
+  targetThreadId = target.threadId,
 ): void {
   const note = (threadId: string, m: Omit<Message, "id" | "at">) => {
     bus.store.appendMessage(threadId, m);
@@ -57,7 +58,7 @@ export function mirrorExchange(
       ? { groupId: channel.id, withBotId: target.id, withName: target.name, withColor: target.color }
       : undefined,
   });
-  note(target.threadId, {
+  note(targetThreadId, {
     role: "bot",
     kind: "activity",
     tool: { name: `Message from @${from.name}` },

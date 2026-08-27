@@ -13,6 +13,7 @@ dist-server
 electron/resources/speech-helper
 electron/resources/OpenMausBot Speech.app
 release
+/release-codex-local-v*/
 .omb-scratch
 .wrangler/
 .dev.vars

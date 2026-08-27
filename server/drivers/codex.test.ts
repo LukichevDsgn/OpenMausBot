@@ -106,6 +106,8 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(recorder.events.at(-1)).toMatchObject({ type: "turn.completed", ok: true, usage: { input: 7, output: 3 } });
 
     const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv).toContain("tool_output_token_limit=4000");
+    expect(seen.argv).toContain("project_doc_max_bytes=8192");
     expect(seen.env.OPENAI_API_KEY).toBeUndefined();
     expect(seen.env.BOX_TOKEN).toBeUndefined();
     expect(seen.env.OMB_TTS_KEY).toBeUndefined();
@@ -128,6 +130,59 @@ describe("CodexDriver turns (fake app-server)", () => {
     await recorder.until((event) => event.type === "turn.completed");
 
     expect(JSON.parse(readFileSync(dump, "utf8")).env.CODEX_HOME).toBe(codexHome);
+  });
+
+  it("reaps the per-turn app-server before publishing turn.completed", async () => {
+    await create();
+    const dump = join(scratch, "reaped-before-complete.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-reaped", text: "hi" });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const pid = Number(JSON.parse(readFileSync(dump, "utf8")).pid);
+    expect(pid).toBeGreaterThan(0);
+    expect(() => process.kill(pid, 0)).toThrow();
+  });
+
+  it("allows cumulative input usage above the former global turn budget", async () => {
+    await create({ mode: "high-token-usage" });
+
+    await instance.adapter.sendTurn({ threadId: "t-high-token-usage", text: "continue the task" });
+    const completed = await recorder.until((event) => event.type === "turn.completed");
+    expect(recorder.events.some((event) => event.type === "runtime.error")).toBe(false);
+    expect(completed).toMatchObject({ ok: true });
+  });
+
+  it("starts delegated turns without project-doc injection and with smaller tool output", async () => {
+    await create();
+    const dump = join(scratch, "delegated.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-delegated",
+      text: "[Delegated by @Coordinator, another bot in this OpenMausBot workspace.]\n\n[OBJECTIVE]\nAudit one file.",
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv).toContain("tool_output_token_limit=2000");
+    expect(seen.argv).toContain("project_doc_max_bytes=0");
+  });
+
+  it("allows delegated turns beyond the former tool-call and pre-edit budgets", async () => {
+    await create({ mode: "many-tools" });
+
+    await instance.adapter.sendTurn({
+      threadId: "t-many-tools",
+      text:
+        "[Delegated by @Coordinator, another bot in this OpenMausBot workspace.]\n\n" +
+        "[EXACT CHANGES]\nImplement the allowed fix and verify it.",
+    });
+    const completed = await recorder.until((event) => event.type === "turn.completed");
+    expect(recorder.events.some((event) => event.type === "runtime.error")).toBe(false);
+    expect(completed).toMatchObject({ ok: true });
+    expect(recorder.events.filter((event) => event.type === "item.started")).toHaveLength(50);
   });
 
   it("mounts connected apps without placing credential values in argv", async () => {
@@ -197,6 +252,7 @@ describe("CodexDriver turns (fake app-server)", () => {
     const dump = join(scratch, "local-computer.json");
     process.env.FAKE_CODEX_DUMP = dump;
     expect(instance.adapter.capabilities.computerMcp).toBe(true);
+    expect(instance.adapter.capabilities.localComputerMcp).toBe(true);
 
     await instance.adapter.sendTurn({
       threadId: "t-local-computer",
@@ -263,6 +319,32 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(seen.env.OPENMAUSBOT_LOCAL_UNSLOTH_API_KEY).toBe("unsloth-secret");
   });
 
+  it("passes only the selected direct aggregator key to the Codex child", async () => {
+    await create({
+      environment: {
+        OPENMAUSBOT_NVIDIA_API_KEY: "nvidia-secret",
+        OPENMAUSBOT_OPENROUTER_API_KEY: "openrouter-secret",
+      },
+    });
+    const dump = join(scratch, "direct-provider.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-direct-provider",
+      text: "verify provider routing",
+      model: "nvidia::z-ai/glm-5.2",
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.env.OPENMAUSBOT_NVIDIA_API_KEY).toBe("nvidia-secret");
+    expect(seen.env.OPENMAUSBOT_OPENROUTER_API_KEY).toBeUndefined();
+    expect(seen.argv).toContain('model_providers.nvidia.base_url="https://integrate.api.nvidia.com/v1"');
+    expect(seen.argv).toContain('model_providers.nvidia.env_key="OPENMAUSBOT_NVIDIA_API_KEY"');
+    expect(JSON.stringify(seen.argv)).not.toContain("nvidia-secret");
+    expect(JSON.stringify(seen.argv)).not.toContain("openrouter-secret");
+  });
+
   it("streams agentMessage deltas without re-emitting the settled text", async () => {
     process.env.FAKE_CODEX_MODE = "stream";
     await create();
@@ -320,6 +402,40 @@ describe("CodexDriver turns (fake app-server)", () => {
     await recorder.until((e) => e.type === "turn.completed");
     // legacy method name → legacy decision vocabulary
     expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ decision: "approved" });
+  });
+
+  it("answers MCP tool approval elicitations with the app-server elicitation schema", async () => {
+    await create({ mode: "mcp-approval" });
+    const dump = join(scratch, "mcp-approval.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-mcp-approve", text: "list teammates" });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({
+      requestType: "permission",
+      tool: "mcp:agents/list_bots",
+    });
+
+    await instance.adapter.respondToRequest("t-mcp-approve", opened.requestId!, { behavior: "allow" });
+    const resolved = await recorder.until((e) => e.type === "request.resolved");
+    expect(resolved).toMatchObject({ behavior: "allow", source: "user" });
+
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ action: "accept", content: {} });
+  });
+
+  it("marks CUA approvals with the exact local app target", async () => {
+    await create({ mode: "mcp-local-approval" });
+    await instance.adapter.sendTurn({ threadId: "t-local-approve", text: "use Framer" });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({
+      requestType: "permission",
+      tool: "mcp:node_repl/tool",
+      approvalScope: "local-computer",
+      approvalTarget: "framer.exe",
+    });
+    await instance.adapter.respondToRequest("t-local-approve", opened.requestId!, { behavior: "deny" });
+    await recorder.until((e) => e.type === "turn.completed");
   });
 
   it("auto-approves commands in fullAuto without opening a request", async () => {

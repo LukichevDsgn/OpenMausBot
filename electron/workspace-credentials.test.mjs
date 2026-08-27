@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   migrateWorkspaceCredentials,
+  runWorkspaceCredentialMutation,
   workspaceCredentialEnv,
   WORKSPACE_CREDENTIALS,
 } from "./workspace-credentials.mjs";
@@ -85,6 +86,18 @@ describe("workspace credential migration", () => {
     expect(result.credentialsChanged).toBe(false);
     expect(result.config.xai.key).toBe(42);
   });
+
+  it("moves custom endpoint keys into the dynamic encrypted credential bucket", () => {
+    const result = migrateWorkspaceCredentials({
+      customEndpoints: {
+        openrouter: { id: "openrouter", name: "OpenRouter", apiKey: "or-secret" },
+        nvidia: { id: "nvidia", name: "NVIDIA", apiKey: "" },
+      },
+    }, { customEndpointKeys: { nvidia: "old-secret" } });
+    expect(result.credentials).toEqual({ customEndpointKeys: { openrouter: "or-secret" } });
+    expect(result.config.customEndpoints.openrouter.apiKey).toBeUndefined();
+    expect(result.config.customEndpoints.nvidia.apiKey).toBeUndefined();
+  });
 });
 
 describe("workspace credential env", () => {
@@ -111,9 +124,99 @@ describe("workspace credential env", () => {
     expect(workspaceCredentialEnv(undefined)).toEqual({});
   });
 
+  it("maps dynamic endpoint secrets to isolated env names", () => {
+    expect(workspaceCredentialEnv({ customEndpointKeys: { openrouter: "or-secret", nvidia: "nv-secret" } })).toEqual({
+      OPENMAUSBOT_ENDPOINT_OPENROUTER_API_KEY: "or-secret",
+      OPENMAUSBOT_ENDPOINT_NVIDIA_API_KEY: "nv-secret",
+    });
+  });
+
   it("covers every credential the migration table declares", () => {
     const credentials = Object.fromEntries(WORKSPACE_CREDENTIALS.map((c) => [c.name, `v-${c.name}`]));
     const env = workspaceCredentialEnv(credentials);
     expect(Object.keys(env).sort()).toEqual(WORKSPACE_CREDENTIALS.map((c) => c.env).sort());
+  });
+});
+
+describe("workspace credential mutation transaction", () => {
+  const previous = { xaiApiKey: "old-secret" };
+  const next = { xaiApiKey: "new-secret" };
+
+  async function run(responseOrError, { failRollback = false } = {}) {
+    let memory = structuredClone(previous);
+    const writes = [];
+    let requests = 0;
+    const error = responseOrError instanceof Error ? responseOrError : null;
+    try {
+      const result = await runWorkspaceCredentialMutation({
+        previousCredentials: previous,
+        nextCredentials: next,
+        writeCredentials: async (credentials) => {
+          writes.push(structuredClone(credentials));
+          if (failRollback && writes.length === 2) throw new Error("rollback store failure");
+        },
+        setCredentials: (credentials) => { memory = structuredClone(credentials); },
+        request: async () => {
+          requests += 1;
+          if (error) throw error;
+          return typeof responseOrError === "function" ? responseOrError(requests) : responseOrError;
+        },
+      });
+      return { result, error: undefined, memory, writes, requests };
+    } catch (caught) {
+      return { result: undefined, error: caught, memory, writes, requests };
+    }
+  }
+
+  it("stores next first and keeps it after a successful server commit", async () => {
+    const { result, memory, writes } = await run({ ok: true, status: 200, body: { saved: true } });
+    expect(result.response.body).toEqual({ saved: true });
+    expect(writes).toEqual([next]);
+    expect(memory).toEqual(next);
+  });
+
+  it("rolls the encrypted store and memory back for an explicit server rejection", async () => {
+    const secret = "reflected-secret-that-must-not-escape";
+    const first = await run({ ok: false, status: 400, body: { error: secret, outcome: "rolled_back" } });
+    const thrown = first.error;
+    expect(thrown?.outcome).toBe("rolled_back");
+    expect(String(thrown)).not.toContain(secret);
+    expect(first.writes).toEqual([next, previous]);
+    expect(first.memory).toEqual(previous);
+  });
+
+  it("retries the same operation once after transport loss and commits on success", async () => {
+    const { result, requests, writes, memory } = await run((attempt) => {
+      if (attempt === 1) throw new Error("temporary transport loss");
+      return { ok: true, status: 200, body: { retried: true } };
+    });
+    expect(requests).toBe(2);
+    expect(result.response.body).toEqual({ retried: true });
+    expect(writes).toEqual([next]);
+    expect(memory).toEqual(next);
+  });
+
+  it.each([
+    { label: "double transport", response: new Error("transport leaked secret") },
+    { label: "ambiguous 500", response: { ok: false, status: 500, body: { error: "server leaked secret" } } },
+    { label: "unknown outcome", response: { ok: false, status: 200, outcome: "unknown", body: { error: "server leaked secret" } } },
+  ])("keeps next store and memory for $label", async ({ response }) => {
+    const first = await run(response);
+    const thrown = first.error;
+    expect(thrown?.outcome).toBe("unknown");
+    expect(String(thrown)).not.toContain("secret");
+    expect(first.writes).toEqual([next]);
+    expect(first.memory).toEqual(next);
+  });
+
+  it("retains newest state and both internal causes when rollback storage fails", async () => {
+    const first = await run({ ok: false, status: 409, body: { outcome: "rolled_back", error: "secret" } }, { failRollback: true });
+    const thrown = first.error;
+    expect(thrown?.outcome).toBe("unknown");
+    expect(thrown?.originalCause).toBeInstanceOf(Error);
+    expect(thrown?.rollbackCause).toBeInstanceOf(Error);
+    expect(String(thrown)).not.toContain("secret");
+    expect(first.writes).toEqual([next, previous]);
+    expect(first.memory).toEqual(next);
   });
 });

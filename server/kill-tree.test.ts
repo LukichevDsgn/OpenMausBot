@@ -5,7 +5,7 @@
 import { spawn } from "node:child_process";
 import { describe, expect, it } from "vitest";
 
-import { killCliTree, spawnCli } from "./procs.ts";
+import { execCliTree, killCliTree, spawnCli } from "./procs.ts";
 
 const IDLE = "setInterval(() => {}, 1000)";
 
@@ -19,6 +19,36 @@ function alive(pid: number): boolean {
 }
 
 describe("killCliTree", () => {
+  it("preserves CLI stderr in a non-zero exit error", async () => {
+    await expect(execCliTree(process.execPath, ["-e", "console.error('region denied');process.exit(7)"]))
+      .rejects.toThrow(/exited 7: region denied/);
+  });
+
+  it("does not leave a launcher descendant alive after a timeout", async () => {
+    const marker = `openmaus-antigravity-timeout-${process.pid}-${Date.now()}`;
+    const launcher =
+      `const {spawn}=require("node:child_process");` +
+      `const child=spawn(process.execPath,["-e",${JSON.stringify(IDLE)},${JSON.stringify(marker)}],{stdio:"ignore"});` +
+      `console.log(child.pid);` +
+      IDLE;
+
+    let failureMessage = "";
+    let failureStdout = "";
+    try {
+      await execCliTree(process.execPath, ["-e", launcher], { timeout: 150 });
+    } catch (error) {
+      // SAFETY: execCliTree's rejection contract attaches the captured stdout
+      // to an Error; this test invokes that function directly.
+      const failure = error as Error & { stdout: string };
+      failureMessage = failure.message;
+      failureStdout = failure.stdout;
+    }
+    expect(failureMessage).toMatch(/timed out/);
+    const descendantPid = Number(failureStdout.trim());
+    expect(descendantPid).toBeGreaterThan(0);
+    expect(alive(descendantPid)).toBe(false);
+  }, 15_000);
+
   it("owns stdin pipe errors before a CLI can be force-stopped", async () => {
     const child = spawnCli(process.execPath, ["-e", IDLE], { stdio: ["pipe", "pipe", "pipe"] });
     try {
@@ -41,7 +71,7 @@ describe("killCliTree", () => {
         `const c = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(IDLE)}], { stdio: "ignore" });` +
           `console.log(c.pid); ${IDLE}`,
       ],
-      { stdio: ["ignore", "pipe", "ignore"], detached: true },
+      { stdio: ["ignore", "pipe", "ignore"], detached: true, windowsHide: true },
     );
     let grandchild = 0;
     try {

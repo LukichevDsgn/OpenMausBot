@@ -18,6 +18,10 @@ import { join } from "node:path";
 import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
 import { augmentedPath } from "../env-path.ts";
 import { injectedApiModel, mergeLocalInject } from "./local-inject.ts";
+import {
+  registerManagedAntigravityWorker,
+  unregisterManagedAntigravityWorker,
+} from "../antigravity-accounts.ts";
 
 import type { ChildProcess } from "node:child_process";
 import type {
@@ -34,6 +38,53 @@ import { newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "antigravityAgent";
+const PRINT_TIMEOUT = "60m";
+const WATCHDOG_TIMEOUT_MS = 61 * 60_000;
+
+export const ANTIGRAVITY_WORKSPACE_TOOL_CONTRACT = `[OpenMausBot workspace tool compatibility]
+- The directory passed with --add-dir is a normal project workspace, not an Antigravity artifact directory.
+- Never use write_to_file for a workspace path. That tool is artifact-only and rejects paths outside the Antigravity brain directory.
+- Edit existing workspace files with replace_file_content or multi_replace_file_content. Create a new workspace file with a non-interactive run_command in the assigned workspace, then verify its exact path.
+- On Windows prefer run_command with rg.exe (or PowerShell Select-String) for search. Do not use grep_search as a fallback when grep is unavailable.
+- Never enumerate or print the full process environment (env, set, Get-ChildItem env:). Inspect only an explicitly named non-secret variable when required.
+- For every command expected to take more than 10 seconds, set run_command WaitMsBeforeAsync to 3600000 so it stays in the foreground. Do not accept the 10000 default for tests, typecheck, builds, recursive searches, or matrices.
+- If a command nevertheless becomes a background task, never emit repeated "I will wait" updates and never poll it in a tight loop. Consume its completion SYSTEM_MESSAGE; do not kill a task whose completion may already have arrived.
+- A run_command step with state DONE is already complete and its output is authoritative. After DONE, never call schedule or manage_task status for that task; continue from the returned output immediately.
+- When a long matrix fails at one case, isolate that exact case with a focused selector or deterministic reproduction before rerunning the full matrix. Do not repeatedly pay for the complete matrix while debugging one tuple.
+- Do not attribute an internal background-task notice to an OpenMausBot restart without a matching runtime error.`;
+
+const COMPLETED_TASK_KILL_RACE = /^cannot kill task "[^"]+\/task-\d+": task is not running \(status: DONE\)$/i;
+const COMPLETED_RECEIPT_SCHEDULE_RACE = /^another active schedule task "[^"]+\/task-\d+" has a conflicting early termination condition "task-\d+"$/i;
+const TERMINAL_RECEIPT = /(?:IMPLEMENTATION|AUDIT|DESIGN|VERIFICATION)-(?:RECEIPT|READY|BLOCKED)|\b(?:ACCEPT|BLOCK)\b/i;
+
+/**
+ * agy can finish a background command between the model deciding to kill it
+ * and the manage_task call reaching the task manager. It then returns the
+ * complete assistant response but marks the whole print turn ERROR solely
+ * because the redundant kill saw DONE. The raw result is still retained in
+ * native logs; at the provider boundary this exact race is a successful no-op.
+ */
+export function isCompletedTaskKillRace(error: unknown, response: unknown): boolean {
+  return typeof error === "string"
+    && typeof response === "string"
+    && response.trim().length > 0
+    && COMPLETED_TASK_KILL_RACE.test(error.trim());
+}
+
+/** Antigravity can also finish the response and only then reject cleanup
+ * because two internal schedule timers name different completed tasks. This
+ * is infrastructure bookkeeping, not a failed implementation. Accept only
+ * the exact error and a response that already contains a terminal receipt. */
+export function isCompletedReceiptScheduleRace(error: unknown, response: unknown): boolean {
+  return typeof error === "string"
+    && typeof response === "string"
+    && TERMINAL_RECEIPT.test(response)
+    && COMPLETED_RECEIPT_SCHEDULE_RACE.test(error.trim());
+}
+
+export function antigravityPrompt(system: string | undefined, text: string): string {
+  return [system, ANTIGRAVITY_WORKSPACE_TOOL_CONTRACT, text].filter(Boolean).join("\n\n");
+}
 
 export interface AntigravityConfig {
   cli: string;
@@ -156,7 +207,9 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         // Keep the last usable catalog when settings.json is unreadable.
       }
     };
-    await refreshModels();
+    // Quota/model probes are optional picker metadata. In particular, a
+    // temporarily unhealthy Antigravity CLI must not prevent the local API
+    // from starting. ProviderRegistry.describe() performs the live refresh.
     const listeners = new Set<RuntimeEventListener>();
     // one active turn per thread; a second send while busy is a caller bug
     const active = new Map<string, { stop: () => void; turnId: string }>();
@@ -214,7 +267,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       // output (verified against agy 1.1.12). Combine persona + text.
       // Trade-off: a very large prompt could exceed argv limits (E2BIG),
       // guarded below since stdin is not an option.
-      const prompt = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
+      const prompt = antigravityPrompt(turn.system, turn.text);
       const resumeCursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
 
       let settled = false;
@@ -251,7 +304,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       const args = [
         "--print", prompt, // print mode reads the prompt from this argv value
         "--output-format", "stream-json",
-        "--print-timeout", "10m",
+        "--print-timeout", PRINT_TIMEOUT,
         "--add-dir", cwd,
         // fullAuto approves everything; otherwise accept-edits allows file
         // edits but auto-denies shell (no interactive channel in print mode)
@@ -271,10 +324,14 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         stdio: ["ignore", "pipe", "pipe"], // prompt is on argv; stdin is unused
       });
       children.add(child);
+      registerManagedAntigravityWorker(child.pid);
+      const stop = () => killCliTree(child); // process groups are POSIX-only
 
       // conversation_id from the init event → the resumeCursor (session.started
       // is what the harness persists as the cursor). Also seeds tool item ids.
       let conversationId: string | null = null;
+      const completedRunCommandSteps = new Set<number>();
+      let redundantCompletedTaskSchedules = 0;
 
       const handleLine = (line: string) => {
         let o: any;
@@ -300,8 +357,30 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
             if (payload.step_type === "tool") {
               const itemId = `${conversationId ?? o.conversation_id ?? "conv"}:${payload.step_index}`;
               if (payload.state === "ACTIVE") {
+                if (payload.tool_name === "schedule") {
+                  const prompt = payload.tool_info?.parameters?.Prompt;
+                  const referencedStep = typeof prompt === "string"
+                    ? Number(/\btask-(\d+)\b/i.exec(prompt)?.[1])
+                    : Number.NaN;
+                  if (Number.isInteger(referencedStep) && completedRunCommandSteps.has(referencedStep)) {
+                    redundantCompletedTaskSchedules += 1;
+                    if (redundantCompletedTaskSchedules >= 2) {
+                      emit({
+                        ...base(threadId, turnId),
+                        type: "runtime.error",
+                        message: `Antigravity polling loop stopped: task-${referencedStep} was already DONE before schedule`,
+                      });
+                      stop();
+                      settle(false, "redundant_poll_loop");
+                      return;
+                    }
+                  }
+                }
                 emit({ ...base(threadId, turnId), type: "item.started", itemType: "tool", itemId, title: payload.tool_name });
               } else if (payload.state === "DONE") {
+                if (payload.tool_name === "run_command" && Number.isInteger(payload.step_index)) {
+                  completedRunCommandSteps.add(payload.step_index);
+                }
                 emit({ ...base(threadId, turnId), type: "item.completed", itemType: "tool", itemId, ok: true });
               } else if (payload.state === "ERROR") {
                 emit({ ...base(threadId, turnId), type: "item.completed", itemType: "tool", itemId, ok: false });
@@ -319,6 +398,10 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           case "result": {
             // agy delivers the assistant text in result.response (not streamed)
             const response = typeof payload.response === "string" ? payload.response : "";
+            const completedTaskKillRace = isCompletedTaskKillRace(payload.error, response);
+            const completedReceiptScheduleRace = isCompletedReceiptScheduleRace(payload.error, response);
+            const completedPostReceiptRace = completedTaskKillRace || completedReceiptScheduleRace;
+            const resultOk = payload.status === "SUCCESS" || completedPostReceiptRace;
             if (response) {
               emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: response });
               emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text: response });
@@ -331,11 +414,18 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
                 output: payload.usage.output_tokens || 0,
               });
             }
+            if (!resultOk && typeof payload.error === "string" && payload.error.trim()) {
+              emit({
+                ...base(threadId, turnId),
+                type: "runtime.error",
+                message: `Antigravity result ${payload.status ?? "ERROR"}: ${payload.error.trim()}`,
+              });
+            }
             // result.usage is the turn total (the per-step agent_response
             // figures above are its parts, not additions to it)
             settle(
-              payload.status === "SUCCESS",
-              payload.status ?? null,
+              resultOk,
+              completedPostReceiptRace ? "SUCCESS" : payload.status ?? null,
               null,
               payload.usage
                 ? {
@@ -368,11 +458,13 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       });
 
       child.on("error", (e) => {
+        unregisterManagedAntigravityWorker(child.pid);
         emit({ ...base(threadId, turnId), type: "runtime.error", ...describeSpawnFailure(e, config.cli) });
         settle(false, "spawn_error");
       });
 
       child.on("close", (code) => {
+        unregisterManagedAntigravityWorker(child.pid);
         children.delete(child); // close is the true process-exit signal
         if (!settled) {
           emit({
@@ -384,10 +476,9 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         }
       });
 
-      const stop = () => killCliTree(child); // process groups are POSIX-only
       active.set(threadId, { stop, turnId });
 
-      // 11 min — just above agy's own 10m --print-timeout, so agy normally
+      // 61 min — just above agy's own 60m --print-timeout, so agy normally
       // settles first; this is the backstop for a fully wedged child.
       watchdog = setTimeout(() => {
         if (!settled) {
@@ -395,7 +486,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           stop();
           settle(false, "timeout");
         }
-      }, 11 * 60_000);
+      }, WATCHDOG_TIMEOUT_MS);
       watchdog.unref?.();
 
       emit({ ...base(threadId, turnId), type: "turn.started" });
@@ -404,16 +495,26 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
     };
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
-      const version = await new Promise<string | null>((resolve) => {
-        execCli(config.cli, ["--version"], { timeout: 8000, env: antigravityEnvironment() }, (err, stdout) =>
-          resolve(err ? null : stdout.trim()),
+      const probe = () => new Promise<{ version: string | null; error: Error | null }>((resolve) => {
+        execCli(config.cli, ["--version"], { timeout: 8000, env: antigravityEnvironment() }, (error, stdout) =>
+          resolve({ version: error ? null : stdout.trim(), error }),
         );
       });
-      if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+      let result = await probe();
+      // Focus/provider refresh can overlap an updater or a credential switch.
+      // One bounded retry avoids turning that transient into "not installed".
+      if (!result.version && (result.error as NodeJS.ErrnoException | null)?.code !== "ENOENT") {
+        result = await probe();
+      }
+      if (!result.version) {
+        const error = result.error ?? new Error(`\`${config.cli}\` returned an empty version`);
+        const failure = describeSpawnFailure(error as NodeJS.ErrnoException, config.cli);
+        return { state: "unavailable", reason: failure.message, setup: failure.setup };
+      }
       // No auth field: agy auth is keyring-backed with no reliable file marker
       // (~/.gemini/antigravity-cli/ exists after first run even when logged
       // out), so any file heuristic would overstate "signed in". Leave undefined.
-      return { state: "available", version };
+      return { state: "available", version: result.version };
     };
 
     return {

@@ -98,7 +98,15 @@ export type RuntimeEvent = RuntimeEventBase &
          * delta, a thread total, a per-step figure) and must never be summed. */
         usage?: { input: number; output: number };
       }
-    | { type: "item.started"; itemType: "tool" | "reasoning"; title?: string }
+    | {
+        type: "item.started";
+        itemType: "tool" | "reasoning";
+        title?: string;
+        /** Stable digest of the complete provider arguments when `title` is
+         * display-truncated. Keeps anti-loop detection precise without
+         * exposing the full command in activity chips or stored messages. */
+        callFingerprint?: string;
+      }
     | { type: "item.updated"; itemType: "tool" | "reasoning"; tokens?: number | null }
     | { type: "item.completed"; itemType: "tool"; ok: boolean }
     | { type: "item.completed"; itemType: "assistant_text"; text: string }
@@ -110,6 +118,8 @@ export type RuntimeEvent = RuntimeEventBase &
         summary: string;
         choices?: string[];
         approvalScope?: "local-computer";
+        /** Exact executable/app id supplied by the local-computer MCP. */
+        approvalTarget?: string;
       }
     | {
         type: "request.resolved";
@@ -247,6 +257,10 @@ export interface ProviderAdapter {
 export interface ProviderSnapshot {
   state: "available" | "unavailable";
   reason?: string;
+  /** True only when setup/install is required. A transient probe, lock, or
+   * provider failure may also be unavailable, but must not be presented as a
+   * missing CLI. */
+  setup?: boolean;
   authenticated?: boolean;
   version?: string | null;
   /** How this instance is paid for, when the driver can tell: a reported

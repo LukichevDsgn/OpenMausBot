@@ -59,6 +59,8 @@ function windowsKnownDirs(): string[] {
   const home = homedir();
   const appData = process.env.APPDATA ?? join(home, "AppData", "Roaming");
   const localAppData = process.env.LOCALAPPDATA ?? join(home, "AppData", "Local");
+  const programFiles = process.env.ProgramW6432 ?? process.env.ProgramFiles ?? "C:\\Program Files";
+  const programFilesX86 = process.env["ProgramFiles(x86)"];
   return [
     join(appData, "npm"), // npm -g shims: claude, codex
     join(home, ".grok", "bin"), // x.ai installer
@@ -69,6 +71,12 @@ function windowsKnownDirs(): string[] {
     join(home, ".bun", "bin"),
     join(home, ".deno", "bin"),
     join(home, "go", "bin"),
+    // Antigravity's built-in grep_search invokes a real `grep` executable.
+    // A Windows GUI process normally cannot see Git for Windows' Unix tools,
+    // even though the user's terminal can. Include both install roots so a
+    // delegated turn cannot fail late with `grep not found in %PATH%`.
+    join(programFiles, "Git", "usr", "bin"),
+    ...(programFilesX86 ? [join(programFilesX86, "Git", "usr", "bin")] : []),
   ];
 }
 

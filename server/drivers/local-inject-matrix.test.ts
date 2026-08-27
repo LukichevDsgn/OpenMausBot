@@ -431,6 +431,8 @@ describe("Qwen / Hermes ACP turns", () => {
         FAKE_ACP_DUMP: dump,
         OPENAI_API_KEY: "8989",
         OPENROUTER_API_KEY: "sk-or-should-not-leak",
+        ALL_PROXY: "socks4://127.0.0.1:10808",
+        HTTP_PROXY: "socks5://127.0.0.1:10808",
       },
       enabled: true,
       config: { cli: FAKE_ACP, fullAuto: true },
@@ -443,6 +445,8 @@ describe("Qwen / Hermes ACP turns", () => {
       expect(seen.argv).toEqual(["acp"]);
       expect(seen.env.OPENAI_API_KEY).toBeUndefined();
       expect(seen.env.OPENROUTER_API_KEY).toBeUndefined();
+      expect(seen.env.ALL_PROXY).toBeUndefined();
+      expect(seen.env.HTTP_PROXY).toBeUndefined();
       const configCalls = JSON.parse(readFileSync(`${dump}.config.json`, "utf8")) as Array<{
         method: string;
         params: { modelId?: string };

@@ -49,7 +49,18 @@ describe("chiefOfStaffSystemPrompt", () => {
     expect(prompt).toContain("Patch — Engineer (working right now)");
     expect(prompt).not.toContain("Secret");
     expect(prompt).not.toContain("Atlas —");
-    expect(prompt).toContain("Use ask_bot");
+    expect(prompt).toContain("ask_bot is ONLY");
+    expect(prompt).toContain("Use a finite workflow");
+    expect(prompt).toContain("Every delegate_bot message MUST");
+    expect(prompt).toContain("[OBJECTIVE]");
+    expect(prompt).toContain("[ALLOWED FILES]");
+    expect(prompt).toContain("never include parent history");
+    expect(prompt).toContain("MUST use delegate_bot for architecture");
+    expect(prompt).toContain("terminal for automatic coordination");
+    expect(prompt).toContain("Stop for new authority");
+    expect(prompt).toContain("One evidence-changing retry is the absolute maximum");
+    expect(prompt).toContain("Never poll, ping or redelegate an active peer");
+    expect(prompt).not.toContain("own the whole loop");
   });
 
   it("does not promise delegation when the engine cannot mount agent tools", () => {

@@ -6,11 +6,15 @@
 // signing). In dev it's a no-op so the browser/dev shell is unaffected.
 // electron-updater is vendored (electron/vendor/electron-updater.cjs) because
 // the packaged app ships no node_modules.
-import { app, ipcMain } from "electron";
+import { app, ipcMain, shell } from "electron";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { createUpdaterCoordinator } from "./updater-coordinator.mjs";
+import {
+  SOURCE_INTEGRATION_UPDATE_POLICY,
+  applySourceIntegrationUpdatePolicy,
+} from "./update-policy.mjs";
 
 const require = createRequire(import.meta.url);
 
@@ -63,19 +67,18 @@ export function startUpdater(mainWindow) {
   }
   try {
     ({ autoUpdater } = require("./vendor/electron-updater.cjs"));
+    applySourceIntegrationUpdatePolicy(autoUpdater);
   } catch {
+    autoUpdater = null;
     updaterCoordinator = null;
     setState({ status: "error", message: "updater unavailable" });
     return;
   }
-  autoUpdater.autoDownload = false; // button-driven download
-  // Squirrel.Mac has a second, native staging pass after the ZIP download.
-  // Start it immediately so "Restart to update" never has to begin that slow
-  // pass and wait indefinitely. Windows keeps the explicit installer click.
-  autoUpdater.autoInstallOnAppQuit = process.platform === "darwin";
   autoUpdater.logger = updaterLogger();
 
-  updaterCoordinator = createUpdaterCoordinator(autoUpdater, setState);
+  updaterCoordinator = createUpdaterCoordinator(autoUpdater, setState, SOURCE_INTEGRATION_UPDATE_POLICY, {
+    openReleaseNotes: (url) => shell.openExternal(url),
+  });
 
   // first check ~15s after launch (let the app settle), then hourly — both
   // silent on failure, hence the arrow: a bare `check` would receive the

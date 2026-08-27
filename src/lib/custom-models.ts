@@ -12,6 +12,11 @@ export function filterCustomModels<T extends { id: string; label: string }>(
   );
 }
 
+/** Models discovered through Settings → Connections → Custom endpoints. */
+export function isOpenMausEndpointModel(modelId: string | null | undefined): boolean {
+  return typeof modelId === "string" && modelId.startsWith("endpoint::");
+}
+
 export function partitionCustomModels<T extends { id: string; loaded?: boolean }>(
   options: readonly T[],
 ) {

@@ -1,4 +1,17 @@
-export function createUpdaterCoordinator(updater, setState) {
+import {
+  DIRECT_UPDATE_POLICY,
+  SOURCE_INTEGRATION_UPDATE_POLICY,
+} from "./update-policy.mjs";
+
+export function createUpdaterCoordinator(
+  updater,
+  setState,
+  policy = DIRECT_UPDATE_POLICY,
+  options = {},
+) {
+  const sourceIntegration = policy?.mode === SOURCE_INTEGRATION_UPDATE_POLICY.mode;
+  const openReleaseNotes = typeof options?.openReleaseNotes === "function" ? options.openReleaseNotes : null;
+  let sourceVersion = null;
   let checkOperation = null;
   let downloadOperation = null;
   let installOperation = null;
@@ -13,8 +26,22 @@ export function createUpdaterCoordinator(updater, setState) {
       clearTimeout(installOperation.timer);
       installOperation = null;
     }
+    sourceVersion = null;
     if (!manual) {
+      if (sourceIntegration) {
+        setState({ status: "idle", mode: undefined, releaseNotesUrl: undefined });
+        return;
+      }
       setState({ status: "idle" });
+      return;
+    }
+    if (sourceIntegration) {
+      setState({
+        status: "error",
+        message: String(error?.message ?? error),
+        mode: undefined,
+        releaseNotesUrl: undefined,
+      });
       return;
     }
     setState({ status: "error", message: String(error?.message ?? error) });
@@ -34,11 +61,29 @@ export function createUpdaterCoordinator(updater, setState) {
   });
   updater.on("update-available", (info) => {
     if (checkOwnsState()) {
-      setState({ status: "available", version: info?.version, message: undefined });
+      if (sourceIntegration) {
+        sourceVersion = info?.version;
+        setState({
+          status: "available",
+          version: sourceVersion,
+          message: undefined,
+          mode: SOURCE_INTEGRATION_UPDATE_POLICY.mode,
+          releaseNotesUrl: SOURCE_INTEGRATION_UPDATE_POLICY.releaseNotesUrl,
+        });
+      } else {
+        setState({ status: "available", version: info?.version, message: undefined });
+      }
     }
   });
   updater.on("update-not-available", () => {
-    if (checkOwnsState()) setState({ status: "idle" });
+    if (checkOwnsState()) {
+      if (sourceIntegration) {
+        sourceVersion = null;
+        setState({ status: "idle", mode: undefined, releaseNotesUrl: undefined });
+      } else {
+        setState({ status: "idle" });
+      }
+    }
   });
   // downloadUpdate/checkForUpdates reject after most updater errors, but the
   // macOS native staging pass used by quitAndInstall is event-only. Without
@@ -48,10 +93,12 @@ export function createUpdaterCoordinator(updater, setState) {
     const manual = Boolean(installOperation || downloadOperation || checkOperation?.manual);
     routeError(manual, error);
   });
-  updater.on("download-progress", (progress) =>
-    setState({ status: "downloading", percent: Math.round(progress?.percent ?? 0) }),
-  );
+  updater.on("download-progress", (progress) => {
+    if (sourceIntegration) return;
+    setState({ status: "downloading", percent: Math.round(progress?.percent ?? 0) });
+  });
   updater.on("update-downloaded", (info) => {
+    if (sourceIntegration) return;
     // On macOS electron-updater emits this before Squirrel.Mac has finished
     // staging the ZIP. Keep the UI in downloading until downloadUpdate's
     // promise resolves, which is the point the native updater is ready.
@@ -61,6 +108,28 @@ export function createUpdaterCoordinator(updater, setState) {
     }
     setState({ status: "downloaded", version: info?.version });
   });
+
+  function openSourceReleaseNotes() {
+    try {
+      return Promise.resolve(openReleaseNotes?.(SOURCE_INTEGRATION_UPDATE_POLICY.releaseNotesUrl)).catch(() => {});
+    } catch {
+      return Promise.resolve();
+    }
+  }
+
+  function restoreSourceState() {
+    if (!sourceIntegration) return;
+    if (sourceVersion) {
+      setState({
+        status: "available",
+        version: sourceVersion,
+        mode: SOURCE_INTEGRATION_UPDATE_POLICY.mode,
+        releaseNotesUrl: SOURCE_INTEGRATION_UPDATE_POLICY.releaseNotesUrl,
+      });
+    } else {
+      setState({ status: "idle", mode: undefined, releaseNotesUrl: undefined });
+    }
+  }
 
   function check(manual = false) {
     if (checkOperation) {
@@ -88,6 +157,10 @@ export function createUpdaterCoordinator(updater, setState) {
   }
 
   function download() {
+    if (sourceIntegration) {
+      restoreSourceState();
+      return openSourceReleaseNotes();
+    }
     if (checkOperation) checkOperation.supersededByDownload = true;
     if (downloadOperation) return downloadOperation.promise;
 
@@ -119,6 +192,10 @@ export function createUpdaterCoordinator(updater, setState) {
   }
 
   function install() {
+    if (sourceIntegration) {
+      restoreSourceState();
+      return openSourceReleaseNotes();
+    }
     if (installOperation) return;
     const operation = { failed: false, timer: null };
     installOperation = operation;

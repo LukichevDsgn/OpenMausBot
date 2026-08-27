@@ -41,6 +41,95 @@ const api = async (method: string, path: string, body?: unknown): Promise<{ stat
   return { status: res.status, body: await res.json() };
 };
 
+async function holdConfigFileWithoutDeleteSharing(configPath: string): Promise<() => Promise<void>> {
+  const powershell = join(
+    process.env.SystemRoot ?? "C:\\Windows",
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
+  const script = [
+    "$path = $env:OMB_CONFIG_LOCK_PATH",
+    "$stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)",
+    "[Console]::WriteLine('LOCKED')",
+    "[Console]::Out.Flush()",
+    "[Console]::ReadLine() | Out-Null",
+    "$stream.Dispose()",
+  ].join("; ");
+  const holder = spawn(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+    env: {
+      PATH: process.env.PATH ?? "",
+      SystemRoot: process.env.SystemRoot ?? "C:\\Windows",
+      OMB_CONFIG_LOCK_PATH: configPath,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let output = "";
+  let settled = false;
+  let resolveReady!: () => void;
+  let rejectReady!: (error: Error) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    rejectReady(new Error(`Windows config holder did not report LOCKED: ${output}`));
+    holder.kill();
+  }, 5_000);
+  holder.stdout?.on("data", (chunk) => {
+    output += String(chunk);
+    if (!settled && output.includes("LOCKED")) {
+      settled = true;
+      clearTimeout(timer);
+      resolveReady();
+    }
+  });
+  holder.stderr?.on("data", (chunk) => { output += String(chunk); });
+  holder.once("error", (error) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    rejectReady(error instanceof Error ? error : new Error(String(error)));
+  });
+  holder.once("exit", (code) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    rejectReady(new Error(`Windows config holder exited before LOCKED (${code}): ${output}`));
+  });
+  await ready;
+
+  return async () => {
+    if (holder.exitCode !== null) return;
+    try {
+      holder.stdin?.end("\n");
+    } catch {
+      /* cleanup below remains bounded */
+    }
+    await new Promise<void>((resolve) => {
+      if (holder.exitCode !== null) return resolve();
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        resolve();
+      };
+      holder.once("exit", finish);
+      holder.once("error", finish);
+      setTimeout(() => {
+        if (holder.exitCode === null) holder.kill();
+        finish();
+      }, 2_000);
+    });
+  };
+}
+
+const testHandoff = (objective: string, worktree: string, file: string) =>
+  `[OBJECTIVE]\n${objective}\n[BASE/WORKTREE]\nBase: main\nWorktree: ${worktree}\n[ALLOWED FILES]\n- ${file}\n[FORBIDDEN SCOPE]\nNo history, logs, unrelated files or live services.\n[EXACT CHANGES]\nImplement only this bounded test handoff.\n[VERIFICATION]\nRun the focused deterministic test.\n[RECEIPT]\nReturn files, commands and results.`;
+
 const statusWithHeaders = (headers: Record<string, string>): Promise<number> =>
   new Promise((resolve, reject) => {
     const req = request({ hostname: "127.0.0.1", port: PORT, path: "/api/health", headers }, (res) => {
@@ -835,6 +924,22 @@ describe("harness HTTP API", () => {
     await api("DELETE", `/api/bots/${bot.id}`);
   });
 
+  it("persists a normalized exact-app grant for local computer control", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const saved = await api("PATCH", `/api/bots/${bot.id}`, {
+      computer: "local",
+      localComputerAllowApps: ["Framer.exe", "framer.exe"],
+    });
+    expect(saved.status).toBe(200);
+    expect(saved.body.bot.localComputerAllowApps).toEqual(["framer.exe"]);
+
+    expect(
+      (await api("PATCH", `/api/bots/${bot.id}`, { localComputerAllowApps: ["C:\\Windows\\notepad.exe"] })).status,
+    ).toBe(400);
+    expect((await api("PATCH", `/api/bots/${bot.id}`, { localComputerAllowApps: "framer.exe" })).status).toBe(400);
+    await api("DELETE", `/api/bots/${bot.id}`);
+  });
+
   it("offers an idempotent stop boundary for active local turns", async () => {
     const unsupported = await api("POST", "/api/local-computer/interrupt");
     expect(unsupported).toEqual({
@@ -1065,6 +1170,418 @@ describe("harness HTTP API", () => {
     }
   });
 
+  it("reconciles a 1:1 task receipt and busy state exactly once across provider reload", async () => {
+    const created = await api("POST", "/api/bots", {});
+    const botId = created.body.bot.id;
+    const threadId = created.body.bot.tasks[0].threadId;
+    try {
+      const selected = await api("PATCH", `/api/bots/${botId}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+      });
+      expect(selected.status).toBe(200);
+
+      rmSync(fakeClaudeDump, { force: true });
+      const sent = await api("POST", `/api/bots/${botId}/messages`, { text: "reload reconciliation" });
+      expect(sent.status).toBe(202);
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots")).body;
+        const bot = state.bots.find((candidate: { id: string }) => candidate.id === botId);
+        const task = bot?.tasks?.find((candidate: { threadId: string }) => candidate.threadId === threadId);
+        return { busy: bot?.busy, activity: bot?.activity, lifecycle: task?.lifecycle?.state };
+      }, { timeout: 5_000 }).toEqual({ busy: true, activity: "working", lifecycle: "running" });
+
+      // This is the real provider-instance lifecycle route: it detaches the
+      // old fake adapter, reconciles the live turn, disposes its process, and
+      // loads a fresh instance. No test-only server route is involved.
+      const reloaded = await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI });
+      expect(reloaded.status).toBe(200);
+      expect(reloaded.body.instances.find((instance: { instanceId: string }) => instance.instanceId === "claude"))
+        .toMatchObject({ instanceId: "claude", driverKind: "claudeAgent" });
+
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots")).body;
+        const bot = state.bots.find((candidate: { id: string }) => candidate.id === botId);
+        const task = bot?.tasks?.find((candidate: { threadId: string }) => candidate.threadId === threadId);
+        return { busy: bot?.busy, activity: bot?.activity, lifecycle: task?.lifecycle };
+      }, { timeout: 5_000 }).toMatchObject({ busy: false, activity: "idle", lifecycle: { state: "unknown" } });
+      const settledState = (await api("GET", "/api/bots")).body;
+      const settledBot = settledState.bots.find((candidate: { id: string }) => candidate.id === botId);
+      const settledTask = settledBot.tasks.find((candidate: { threadId: string }) => candidate.threadId === threadId);
+      const firstReceipt = structuredClone(settledTask.lifecycle.terminalReceipt);
+      expect(firstReceipt).toMatchObject({
+        state: "unknown",
+        reason: expect.stringContaining("provider settings changed"),
+      });
+
+      // The old fake process can only produce late cleanup after disposal;
+      // a duplicate HTTP stop must also be a no-op against the terminal task.
+      expect((await api("POST", `/api/bots/${botId}/interrupt`)).status).toBe(200);
+      const afterDuplicate = (await api("GET", "/api/bots")).body.bots
+        .find((candidate: { id: string }) => candidate.id === botId);
+      const afterTask = afterDuplicate.tasks.find((candidate: { threadId: string }) => candidate.threadId === threadId);
+      expect(afterDuplicate).toMatchObject({ busy: false, activity: "idle" });
+      expect(afterTask.lifecycle.terminalReceipt).toEqual(firstReceipt);
+    } finally {
+      const cleanupState = (await api("GET", "/api/bots")).body;
+      const cleanupBot = cleanupState.bots.find((candidate: { id: string }) => candidate.id === botId);
+      if (cleanupBot?.busy) {
+        await api("POST", `/api/bots/${botId}/interrupt`);
+        await expect.poll(async () => {
+          const state = (await api("GET", "/api/bots")).body;
+          return state.bots.find((candidate: { id: string }) => candidate.id === botId)?.busy;
+        }, { timeout: 5_000 }).toBe(false);
+      }
+      await api("DELETE", `/api/bots/${botId}`);
+    }
+  });
+
+  it("keeps a live turn on its admission policy while PATCH returns effective controls", async () => {
+    const created = await api("POST", "/api/bots", {});
+    const botId = created.body.bot.id;
+    const threadId = created.body.bot.threadId;
+    try {
+      expect((await api("PATCH", `/api/bots/${botId}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+      })).status).toBe(200);
+
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/bots/${botId}/messages`, { text: "hold this fake turn" })).status).toBe(202);
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots")).body;
+        const bot = state.bots.find((candidate: { id: string }) => candidate.id === botId);
+        const task = bot?.tasks?.find((candidate: { threadId: string }) => candidate.threadId === threadId);
+        return { busy: bot?.busy, activity: bot?.activity, lifecycle: task?.lifecycle?.state };
+      }, { timeout: 5_000 }).toEqual({ busy: true, activity: "working", lifecycle: "running" });
+
+      const livePatch = await api("PATCH", `/api/bots/${botId}`, {
+        runtimePolicy: {
+          wallClockTimeoutMinutes: 1,
+          idleTimeoutMinutes: 1,
+          cancellationGraceSeconds: 1,
+          retryCap: 0,
+          maxToolAgentSteps: 1,
+          delegationConcurrency: 2,
+          freshSessionEnforcement: true,
+          handoffByteCap: 2_048,
+          cumulativeTokenPolicy: { mode: "hard", limit: 1_000 },
+        },
+      });
+      expect(livePatch.status).toBe(200);
+      expect(livePatch.body.bot.runtimePolicy).toEqual({
+        wallClockTimeoutMinutes: 1,
+        idleTimeoutMinutes: 1,
+        cancellationGraceSeconds: 1,
+        retryCap: 0,
+        maxToolAgentSteps: 1,
+        delegationConcurrency: 2,
+        freshSessionEnforcement: true,
+        handoffByteCap: 2_048,
+        cumulativeTokenPolicy: { mode: "hard", limit: 1_000 },
+      });
+
+      // The admitted fake turn had wall off/idle 20m/grace 5s. A PATCH is
+      // persisted for the next turn and must not stop or retime this one.
+      await new Promise((resolve) => setTimeout(resolve, 1_200));
+      const duringPatch = (await api("GET", "/api/bots")).body.bots
+        .find((candidate: { id: string }) => candidate.id === botId);
+      const duringTask = duringPatch.tasks.find((candidate: { threadId: string }) => candidate.threadId === threadId);
+      expect(duringPatch).toMatchObject({ busy: true, activity: "working" });
+      expect(duringTask.lifecycle).toMatchObject({ state: "running" });
+
+      expect((await api("PATCH", `/api/bots/${botId}`, { runtimePolicy: { unknown: true } })).status).toBe(400);
+      for (const invalid of [
+        { retryCap: 2 },
+        { delegationConcurrency: 0 },
+        { handoffByteCap: 1_023 },
+        { cumulativeTokenPolicy: { mode: "disabled", limit: 999 } },
+      ]) {
+        expect((await api("PATCH", `/api/bots/${botId}`, { runtimePolicy: invalid })).status).toBe(400);
+      }
+      const reset = await api("PATCH", `/api/bots/${botId}`, { runtimePolicy: null });
+      expect(reset.status).toBe(200);
+      expect(reset.body.bot.runtimePolicy).toEqual({
+        wallClockTimeoutMinutes: 0,
+        idleTimeoutMinutes: 20,
+        cancellationGraceSeconds: 5,
+        retryCap: 1,
+        maxToolAgentSteps: 0,
+        delegationConcurrency: 4,
+        freshSessionEnforcement: false,
+        handoffByteCap: 12_000,
+        cumulativeTokenPolicy: { mode: "disabled", limit: 1_000_000 },
+      });
+      const afterReset = (await api("GET", "/api/bots")).body.bots
+        .find((candidate: { id: string }) => candidate.id === botId);
+      expect(afterReset).toMatchObject({ busy: true, activity: "working" });
+      expect(JSON.parse(readFileSync(join(home, ".openmausbot", "bots.json"), "utf8"))
+        .find((candidate: { id: string }) => candidate.id === botId)).not.toHaveProperty("runtimePolicy");
+
+      expect((await api("POST", `/api/bots/${botId}/interrupt`)).status).toBe(200);
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots")).body;
+        const bot = state.bots.find((candidate: { id: string }) => candidate.id === botId);
+        const task = bot?.tasks?.find((candidate: { threadId: string }) => candidate.threadId === threadId);
+        return { busy: bot?.busy, activity: bot?.activity, receipt: task?.lifecycle?.terminalReceipt };
+      }, { timeout: 8_000 }).toMatchObject({ busy: false, activity: "idle", receipt: { state: expect.any(String) } });
+      const settled = (await api("GET", "/api/bots")).body.bots.find((candidate: { id: string }) => candidate.id === botId);
+      const firstReceipt = structuredClone(settled.tasks.find((candidate: { threadId: string }) => candidate.threadId === threadId).lifecycle.terminalReceipt);
+      expect((await api("POST", `/api/bots/${botId}/interrupt`)).status).toBe(200);
+      const duplicate = (await api("GET", "/api/bots")).body.bots.find((candidate: { id: string }) => candidate.id === botId);
+      expect(duplicate).toMatchObject({ busy: false, activity: "idle" });
+      expect(duplicate.tasks.find((candidate: { threadId: string }) => candidate.threadId === threadId).lifecycle.terminalReceipt)
+        .toEqual(firstReceipt);
+    } finally {
+      const state = (await api("GET", "/api/bots")).body;
+      if (state.bots.find((candidate: { id: string }) => candidate.id === botId)?.busy) {
+        await api("POST", `/api/bots/${botId}/interrupt`);
+      }
+      await api("DELETE", `/api/bots/${botId}`);
+    }
+  });
+
+  it("keeps live delegation enforcement on the captured snapshot after an HTTP PATCH", async () => {
+    const source = await api("POST", "/api/bots", {});
+    const target = await api("POST", "/api/bots", {});
+    const sourceId = source.body.bot.id;
+    const targetId = target.body.bot.id;
+    try {
+      expect((await api("PATCH", `/api/bots/${sourceId}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+        runtimePolicy: { retryCap: 0, delegationConcurrency: 1, handoffByteCap: 1_024 },
+      })).status).toBe(200);
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/bots/${sourceId}/messages`, { text: "hold coordination snapshot" })).status).toBe(202);
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots")).body;
+        return state.bots.find((candidate: { id: string }) => candidate.id === sourceId)?.busy;
+      }, { timeout: 5_000 }).toBe(true);
+
+      const dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+      const token = dump.mcpConfig?.mcpServers?.agents?.env?.OMB_COMMS_TOKEN;
+      expect(typeof token).toBe("string");
+      const internalDelegate = async (message: string) => {
+        const response = await fetch(`${BASE}/api/internal/delegate-bot`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            fromBotId: sourceId,
+            fromThreadId: source.body.bot.threadId,
+            toBotId: targetId,
+            message,
+            depth: 0,
+          }),
+        });
+        return { status: response.status, body: await response.json() as any };
+      };
+
+      const first = await internalDelegate(testHandoff("snapshot first", "D:/work/snapshot-one", "server/snapshot-one.ts"));
+      expect(first).toMatchObject({ status: 200, body: { queued: true } });
+
+      const patched = await api("PATCH", `/api/bots/${sourceId}`, {
+        runtimePolicy: { retryCap: 1, delegationConcurrency: 4, handoffByteCap: 12_000 },
+      });
+      expect(patched.status).toBe(200);
+      const second = await internalDelegate(testHandoff("snapshot second", "D:/work/snapshot-two", "server/snapshot-two.ts"));
+      expect(second.body.error).toMatch(/fan-out|queue cap/i);
+      const tooLarge = await internalDelegate(
+        `${testHandoff("snapshot byte cap", "D:/work/snapshot-three", "server/snapshot-three.ts")}${"x".repeat(1_024)}`,
+      );
+      expect(tooLarge.body.error).toMatch(/invalid handoff/i);
+    } finally {
+      const state = (await api("GET", "/api/bots")).body;
+      if (state.bots.find((candidate: { id: string }) => candidate.id === sourceId)?.busy) {
+        await api("POST", `/api/bots/${sourceId}/interrupt`);
+        await expect.poll(async () => {
+          const next = (await api("GET", "/api/bots")).body;
+          return next.bots.find((candidate: { id: string }) => candidate.id === sourceId)?.busy;
+        }, { timeout: 8_000 }).toBe(false);
+      }
+      await api("DELETE", `/api/bots/${targetId}`);
+      await api("DELETE", `/api/bots/${sourceId}`);
+    }
+  });
+
+  it("selects granted skills from the current trigger and audits direct plus room decisions", async () => {
+    const catalog = await api("GET", "/api/skills/catalog");
+    expect(catalog.status).toBe(200);
+    expect(catalog.body.skills).toEqual([
+      expect.objectContaining({ id: "phone-harness", tools: ["phone"], defaultEnabled: true }),
+    ]);
+
+    const runDirectCase = async (input: {
+      text: string;
+      grants?: { skillGrants: string[]; skillToolGrants: string[] };
+      selectedSkillIds: string[];
+      mountedSkillToolIds: string[];
+      reason: string;
+    }) => {
+      const created = await api("POST", "/api/bots", {});
+      const botId = created.body.bot.id;
+      const threadId = created.body.bot.threadId;
+      try {
+        const patched = await api("PATCH", `/api/bots/${botId}`, {
+          modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+          ...(input.grants ?? {}),
+        });
+        expect(patched.status).toBe(200);
+
+        rmSync(fakeClaudeDump, { force: true });
+        const sent = await api("POST", `/api/bots/${botId}/messages`, { text: input.text });
+        expect(sent.status).toBe(202);
+        await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+        const dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+        const systemArgs = dump.argv.join("\n");
+        const servers = dump.mcpConfig?.mcpServers ?? {};
+        expect(Boolean(servers.phone)).toBe(input.mountedSkillToolIds.includes("phone"));
+        expect(systemArgs.includes('<openmaus-skill id="phone-harness"')).toBe(
+          input.selectedSkillIds.includes("phone-harness"),
+        );
+
+        expect((await api("POST", `/api/bots/${botId}/interrupt`)).status).toBe(200);
+        await expect.poll(async () => {
+          const state = (await api("GET", "/api/bots")).body;
+          const bot = state.bots.find((candidate: { id: string }) => candidate.id === botId);
+          const task = bot?.tasks?.find((candidate: { threadId: string }) => candidate.threadId === threadId);
+          return {
+            busy: bot?.busy,
+            activity: bot?.activity,
+            terminal: Boolean(task?.lifecycle?.terminalReceipt),
+          };
+        }, { timeout: 5_000 }).toEqual({ busy: false, activity: "idle", terminal: true });
+
+        const settled = (await api("GET", "/api/bots")).body.bots
+          .find((candidate: { id: string }) => candidate.id === botId);
+        const task = settled.tasks.find((candidate: { threadId: string }) => candidate.threadId === threadId);
+        const receipt = structuredClone(task.lifecycle.terminalReceipt);
+        expect(receipt).toBeTruthy();
+        expect((await api("POST", `/api/bots/${botId}/interrupt`)).status).toBe(200);
+        const afterDuplicate = (await api("GET", "/api/bots")).body.bots
+          .find((candidate: { id: string }) => candidate.id === botId);
+        const afterTask = afterDuplicate.tasks.find((candidate: { threadId: string }) => candidate.threadId === threadId);
+        expect(afterDuplicate).toMatchObject({ busy: false, activity: "idle" });
+        expect(afterTask.lifecycle.terminalReceipt).toEqual(receipt);
+
+        const audit = await api("GET", `/api/skills/audit?botId=${botId}&threadId=${threadId}&surface=direct&limit=5`);
+        expect(audit.status).toBe(200);
+        expect(audit.body.rows).toHaveLength(1);
+        expect(audit.body.rows[0]).toMatchObject({
+          botId,
+          threadId,
+          surface: "direct",
+          selectedSkillIds: input.selectedSkillIds,
+          mountedSkillToolIds: input.mountedSkillToolIds,
+          decisions: [{ skillId: "phone-harness", reason: input.reason }],
+        });
+        expect(audit.body.rows[0]).not.toHaveProperty("prompt");
+        expect(JSON.stringify(audit.body.rows[0])).not.toContain(input.text);
+        return dump;
+      } finally {
+        const state = (await api("GET", "/api/bots")).body;
+        if (state.bots.find((candidate: { id: string }) => candidate.id === botId)?.busy) {
+          await api("POST", `/api/bots/${botId}/interrupt`);
+          await expect.poll(async () => {
+            const current = (await api("GET", "/api/bots")).body;
+            return current.bots.find((candidate: { id: string }) => candidate.id === botId)?.busy;
+          }, { timeout: 5_000 }).toBe(false);
+        }
+        await api("DELETE", `/api/bots/${botId}`);
+      }
+    };
+
+    await runDirectCase({
+      text: "Use my Android phone to inspect the mobile app",
+      selectedSkillIds: ["phone-harness"],
+      mountedSkillToolIds: ["phone"],
+      reason: "selected",
+    });
+    const denied = await api("POST", "/api/bots", {});
+    expect((await api("PATCH", `/api/bots/${denied.body.bot.id}`, { skillGrants: ["not-a-real-skill"] })).status).toBe(400);
+    await api("DELETE", `/api/bots/${denied.body.bot.id}`);
+    await runDirectCase({
+      text: "Use my Android phone to inspect the mobile app",
+      grants: { skillGrants: [], skillToolGrants: [] },
+      selectedSkillIds: [],
+      mountedSkillToolIds: [],
+      reason: "skill-denied",
+    });
+    await runDirectCase({
+      text: "Use my Android phone to inspect the mobile app",
+      grants: { skillGrants: ["phone-harness"], skillToolGrants: [] },
+      selectedSkillIds: [],
+      mountedSkillToolIds: [],
+      reason: "tool-denied",
+    });
+    await runDirectCase({
+      text: "Tell me how to organize a small garden",
+      selectedSkillIds: [],
+      mountedSkillToolIds: [],
+      reason: "trigger-mismatch",
+    });
+
+    const roomBot = await api("POST", "/api/bots", {});
+    const roomBotId = roomBot.body.bot.id;
+    const room = await api("POST", "/api/groups", { name: "Skill trigger history", memberIds: [roomBotId] });
+    const roomId = room.body.group.id;
+    const roomThreadId = room.body.group.threadId;
+    try {
+      expect((await api("PATCH", `/api/bots/${roomBotId}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+      })).status).toBe(200);
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/groups/${roomId}/messages`, { text: "Android phone: check the mobile app" })).status).toBe(202);
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+      const firstDump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+      expect(firstDump.mcpConfig.mcpServers.phone).toBeTruthy();
+      expect(firstDump.argv.join("\n")).toContain('<openmaus-skill id="phone-harness"');
+
+      expect((await api("POST", `/api/groups/${roomId}/interrupt`)).status).toBe(200);
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots")).body;
+        return {
+          busy: state.bots.find((candidate: { id: string }) => candidate.id === roomBotId)?.busy,
+          roomBusyBotId: state.groups.find((candidate: { id: string }) => candidate.id === roomId)?.busyBotId,
+        };
+      }, { timeout: 5_000 }).toEqual({ busy: false, roomBusyBotId: null });
+
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/groups/${roomId}/messages`, { text: "Tell me about gardening instead" })).status).toBe(202);
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+      const secondDump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+      expect(JSON.stringify(secondDump.prompt)).toContain("Android phone");
+      expect(secondDump.mcpConfig.mcpServers.phone).toBeUndefined();
+      expect(secondDump.argv.join("\n")).not.toContain('<openmaus-skill id="phone-harness"');
+
+      expect((await api("POST", `/api/groups/${roomId}/interrupt`)).status).toBe(200);
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots")).body;
+        return {
+          busy: state.bots.find((candidate: { id: string }) => candidate.id === roomBotId)?.busy,
+          roomBusyBotId: state.groups.find((candidate: { id: string }) => candidate.id === roomId)?.busyBotId,
+        };
+      }, { timeout: 5_000 }).toEqual({ busy: false, roomBusyBotId: null });
+
+      const audit = await api("GET", `/api/skills/audit?threadId=${roomThreadId}&surface=room&limit=5`);
+      expect(audit.status).toBe(200);
+      expect(audit.body.rows).toHaveLength(2);
+      expect(audit.body.rows.map((row: { selectedSkillIds: string[] }) => row.selectedSkillIds)).toEqual([
+        ["phone-harness"],
+        [],
+      ]);
+      expect(audit.body.rows[1].decisions).toEqual([{ skillId: "phone-harness", reason: "trigger-mismatch" }]);
+      expect(JSON.stringify(audit.body.rows)).not.toContain("Android phone: check the mobile app");
+    } finally {
+      const state = (await api("GET", "/api/bots")).body;
+      if (state.bots.find((candidate: { id: string }) => candidate.id === roomBotId)?.busy) {
+        await api("POST", `/api/bots/${roomBotId}/interrupt`);
+      }
+      await api("DELETE", `/api/groups/${roomId}`);
+      await api("DELETE", `/api/bots/${roomBotId}`);
+    }
+  });
+
   it("validates the non-secret VPS alias and keeps old bots on Box by default", async () => {
     const before = await api("GET", "/api/bots");
     const bot = before.body.bots[0];
@@ -1192,6 +1709,34 @@ describe("harness HTTP API", () => {
     const after = await api("GET", "/api/config");
     expect(after.body.opencodeGo).toEqual({ configured: true });
     expect(JSON.stringify(after.body)).not.toContain("opencode-secret");
+  });
+
+  it("stores a custom endpoint as metadata and keeps its external secret out of config.json", async () => {
+    const put = await api("PUT", "/api/custom-endpoints/openrouter?secretStorage=external", {
+      id: "openrouter",
+      name: "OpenRouter",
+      providerId: "openrouter",
+      baseUrl: "https://openrouter.ai/api/v1",
+      defaultModel: "z-ai/glm-5.2",
+      context: 1_000_000,
+      discoverModels: false,
+      useForNewChats: true,
+      apiKey: "endpoint-secret",
+    });
+    expect(put.status).toBe(200);
+    expect(put.body.endpoint).toMatchObject({ id: "openrouter", configured: true });
+    expect(JSON.stringify(put.body)).not.toContain("endpoint-secret");
+    const disk = JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8"));
+    expect(disk.customEndpoints.openrouter.apiKey).toBe("");
+
+    const listed = await api("GET", "/api/custom-endpoints");
+    expect(listed.body.endpoints).toEqual([expect.objectContaining({ id: "openrouter", configured: true })]);
+    expect(JSON.stringify(listed.body)).not.toContain("endpoint-secret");
+
+    const removed = await api("DELETE", "/api/custom-endpoints/openrouter");
+    expect(removed.status).toBe(200);
+    expect(removed.body.endpoints).toEqual([]);
+    expect(JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8")).customEndpoints).toEqual({});
   });
 
   it("rejects a non-string OpenCode Go API key", async () => {
@@ -1664,6 +2209,46 @@ describe("instance CLI override API", () => {
     const overlapping = await api("PATCH", "/api/instances/ghost", { cli: "/tmp/ghost-overlap" });
     expect(overlapping.status).toBe(409);
     expect((await slowConfigWrite).status).toBe(200);
+  });
+
+  it.skipIf(process.platform !== "win32")("rolls back an external custom-key save on a Windows sharing violation", async () => {
+    const configPath = join(home, ".openmausbot", "config.json");
+    const original = readFileSync(configPath);
+    const endpoint = {
+      id: "transaction-rollback",
+      name: "Transaction rollback",
+      providerId: "transaction-rollback",
+      baseUrl: "https://transaction.example.test/v1",
+      defaultModel: "transaction-model",
+      context: 128_000,
+      discoverModels: false,
+      useForNewChats: false,
+    };
+    let releaseLock: (() => Promise<void>) | undefined;
+    let endpointCreated = false;
+    try {
+      releaseLock = await holdConfigFileWithoutDeleteSharing(configPath);
+      const failed = await api("PUT", "/api/custom-endpoints/transaction-rollback?secretStorage=external", {
+        ...endpoint,
+        apiKey: "transaction-secret-must-not-leak",
+      });
+      expect(failed.status).toBe(500);
+      expect(failed.body).toEqual({ error: "configuration transaction failed", outcome: "rolled_back" });
+      expect(JSON.stringify(failed.body)).not.toContain("transaction-secret-must-not-leak");
+
+      await releaseLock();
+      releaseLock = undefined;
+      const metadata = await api("PUT", "/api/custom-endpoints/transaction-rollback?secretStorage=external", endpoint);
+      expect(metadata.status).toBe(200);
+      expect(metadata.body.endpoint).toMatchObject({ id: endpoint.id, configured: false });
+      endpointCreated = true;
+    } finally {
+      if (releaseLock) await releaseLock().catch(() => {});
+      if (endpointCreated) {
+        await api("DELETE", "/api/custom-endpoints/transaction-rollback").catch(() => {});
+      }
+      writeFileSync(configPath, original);
+    }
   });
 });
 

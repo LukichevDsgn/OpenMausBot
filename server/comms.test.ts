@@ -266,15 +266,16 @@ describe("comms e2e (fake ACP fleet)", () => {
       const askerSelection = { instanceId: "askerDelegate", model: "fake-model" };
       const helper = (await api("POST", "/api/bots")).body.bot;
       await api("PATCH", `/api/bots/${helper.id}`, { name: "Helper", modelSelection: helperSelection });
+      const helperOriginalThread = helper.threadId;
       const asker = (await api("POST", "/api/bots")).body.bot;
       await api("PATCH", `/api/bots/${asker.id}`, { name: "Asker", modelSelection: askerSelection });
 
       const send = await api("POST", `/api/bots/${asker.id}/messages`, { text: "hey @Helper please pick this up" });
       expect(send.status).toBe(202);
 
-      // wait for A's turn to settle: it should NOT have a "peer says:" line
-      // (delegate_bot doesn't return the peer's reply to A) and the channel
-      // chip should be the "Messaged @Helper" kind, not the ask_bot one.
+      // Wait for the delegated target AND the reactive coordinator return.
+      // The first A turn only queues work; after B settles, OpenMaus resumes
+      // A in the same source task with B's actual result.
       const deadline = Date.now() + 30_000;
       let askerBot: any;
       let helperBot: any;
@@ -295,7 +296,13 @@ describe("comms e2e (fake ACP fleet)", () => {
         const helperReplied = helperBot.messages.some(
           (m: any) => m.role === "bot" && m.kind === "text" && m.text?.includes("hello from fake acp"),
         );
-        if (askerDelegated && note && helperReplied && !helperBot.busy) break;
+        const coordinatorReacted = askerBot.messages.some(
+          (m: any) =>
+            m.role === "bot" &&
+            m.kind === "text" &&
+            m.text?.includes("coordinator processed delegated result"),
+        );
+        if (askerDelegated && note && helperReplied && coordinatorReacted && !helperBot.busy && !askerBot.busy) break;
         if (Date.now() > deadline) {
           throw new Error(
             `delegate handoff never settled. asker busy=${askerBot.busy} helper busy=${helperBot.busy}\n` +
@@ -307,10 +314,9 @@ describe("comms e2e (fake ACP fleet)", () => {
         await new Promise((r) => setTimeout(r, 250));
       }
 
-      // A's reply is the queue-ack text the proxy returns, NOT a peer reply
-      const askerFinal = askerBot.messages.findLast((m: any) => m.kind === "text" && m.role === "bot");
-      expect(askerFinal.text).toContain("delegated:");
-      expect(askerFinal.text).not.toContain("hello from fake acp");
+      const askerReplies = askerBot.messages.filter((m: any) => m.kind === "text" && m.role === "bot");
+      expect(askerReplies.some((m: any) => m.text?.includes("delegated:"))).toBe(true);
+      expect(askerReplies.at(-1)?.text).toContain("coordinator processed delegated result");
 
       // A's comm chip links to the channel, attributed to @Helper
       expect(note).toBeTruthy();
@@ -323,12 +329,15 @@ describe("comms e2e (fake ACP fleet)", () => {
         (m: any) => m.role === "user" && m.kind === "text",
       );
       expect(helperInbound.text).toContain("[Delegated by @Asker");
-      expect(helperInbound.text).toContain("delegated task");
+      expect(helperInbound.text).toContain("[OBJECTIVE]");
       expect(helperInbound.text).toContain("[Reason: followup]");
       const helperReply = helperBot.messages.findLast(
         (m: any) => m.kind === "text" && m.role === "bot",
       );
       expect(helperReply.text).toContain("hello from fake acp");
+      expect(helperBot.threadId).not.toBe(helperOriginalThread);
+      expect(helperBot.tasks).toHaveLength(2);
+      expect(helperBot.tasks[0].title).toBe("Complete the delegated test stage.");
 
       // channel mirrors both sides, attributed by bot
       const state = (await api("GET", "/api/bots")).body;
@@ -338,7 +347,7 @@ describe("comms e2e (fake ACP fleet)", () => {
       expect(channel.memberIds).toContain(helper.id);
       // A's outgoing task is mirrored into the channel attributed to A.
       expect(
-        channel.messages.some((m: any) => m.from?.botId === asker.id && m.text?.includes("delegated task")),
+        channel.messages.some((m: any) => m.from?.botId === asker.id && m.kind === "text"),
       ).toBe(true);
       // B's reply IS mirrored too: the channel is the full record of the
       // handoff — every terminal state of an async delegation is visible
@@ -510,7 +519,11 @@ describe("comms e2e (fake ACP fleet)", () => {
           ? state.groups.find((g: any) => g.id === note.comm.groupId)
           : undefined;
         const terminal = channel?.messages.some(
-          (m: any) => m.kind === "activity" && m.tool?.ok === false && m.tool?.name?.includes("did not finish"),
+          (m: any) =>
+            m.kind === "activity"
+            && m.tool?.ok === false
+            && m.tool?.name?.includes("Delegated turn failed")
+            && m.tool?.name?.includes("simulated crash before result"),
         );
         if (terminal) break;
         if (Date.now() > deadline) {
@@ -525,7 +538,7 @@ describe("comms e2e (fake ACP fleet)", () => {
       // the request side of the exchange is still there, attributed to A —
       // the channel reads as a complete (if unsuccessful) handoff
       expect(
-        channel.messages.some((m: any) => m.from?.botId === asker.id && m.text?.includes("delegated task")),
+        channel.messages.some((m: any) => m.from?.botId === asker.id && m.kind === "text"),
       ).toBe(true);
     },
     45_000,

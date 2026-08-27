@@ -13,6 +13,7 @@
 // is never a security contract). session/load REPLAYS history as ordinary
 // session/update notifications, so updates are double-gated: nothing emits
 // before the prompt is sent, and `_meta.isReplay` updates are dropped.
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 
 import { WORKSPACE_CREDENTIAL_ENV } from "../../config.ts";
@@ -41,12 +42,14 @@ import { augmentedPath } from "../../env-path.ts";
 const COMPUTER_PROXY_PATH = SPAWNED_PROXIES.computer;
 import { appendNative } from "../native.ts";
 import { SPAWNED_PROXIES } from "../../proxy-paths.ts";
+import type { CustomEndpoint } from "../../custom-endpoints.ts";
 
 export interface AcpConfig {
   cli: string;
   fullAuto: boolean;
   /** Optional home for this instance's sessions. */
   workspace?: string;
+  customEndpoints?: CustomEndpoint[];
 }
 
 /** Per-harness specifics — everything that differs between Grok, Gemini, … */
@@ -82,6 +85,11 @@ export interface AcpSupport {
   install?: EngineInstall;
   /** CLI argv AFTER the binary name to enter ACP stdio mode. */
   spawnArgs(config: AcpConfig, turn: SendTurnInput): string[];
+  /** Cold session startup budget. Some ACP harnesses discover providers and
+   * initialize MCP servers inside session/new, which can legitimately take
+   * longer than the generic 30s budget on Windows. Keep this harness-scoped
+   * so one slow CLI does not weaken failure detection for every provider. */
+  newSessionTimeoutMs?: number;
   /** Provider credential variables this ACP child is allowed to inherit. */
   credentialEnv?: readonly string[];
   /** Select the model through a session config option instead of argv, for
@@ -91,7 +99,11 @@ export interface AcpSupport {
   selectModel?: { configId: string };
   /** Mutate the child env in place: strip a key, inject a policy. Receives the
    *  instance config so a support can vary with fullAuto. */
-  transformEnv?(env: Record<string, string | undefined>, config: AcpConfig): void;
+  transformEnv?(
+    env: Record<string, string | undefined>,
+    config: AcpConfig,
+    sourceEnv?: Record<string, string | undefined>,
+  ): void;
   /** Pick the ACP authenticate methodId from initialize's advertised
    * authMethods; return null to skip the authenticate step. */
   pickAuthMethod(authMethods: Array<{ id?: string }>): string | null;
@@ -111,6 +123,7 @@ export interface AcpSupport {
   resolveTurnModel?(
     model: string | undefined,
     env: Record<string, string | undefined>,
+    config?: AcpConfig,
   ): string | undefined;
   /** Apply per-session settings between session/new (or session/load) and the
    * first session/prompt. Some CLIs ignore argv and take the model/mode over
@@ -142,14 +155,19 @@ const PROVIDER_CREDENTIAL_ENV = [
   "CURSOR_AUTH_TOKEN",
 ] as const;
 
+export function resolveNewSessionTimeout(support: Pick<AcpSupport, "newSessionTimeoutMs">): number {
+  return support.newSessionTimeoutMs ?? NEW_SESSION_TIMEOUT;
+}
+
 function decodeAcpConfig(defaultCli: string) {
   return (raw: unknown): AcpConfig => {
     const o = (raw ?? {}) as Record<string, unknown>;
-    return {
-      cli: typeof o.cli === "string" ? o.cli : defaultCli,
-      fullAuto: o.fullAuto === true,
-      workspace: typeof o.workspace === "string" ? o.workspace : undefined,
-    };
+      return {
+        cli: typeof o.cli === "string" ? o.cli : defaultCli,
+        fullAuto: o.fullAuto === true,
+        workspace: typeof o.workspace === "string" ? o.workspace : undefined,
+        customEndpoints: Array.isArray(o.customEndpoints) ? o.customEndpoints as CustomEndpoint[] : undefined,
+      };
   };
 }
 
@@ -175,11 +193,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
     async create(input: DriverCreateInput<AcpConfig>): Promise<ProviderInstance> {
       const { instanceId, config } = input;
       const childEnv = () => {
-        const env: Record<string, string | undefined> = {
+        const sourceEnv: Record<string, string | undefined> = {
           ...process.env,
           ...input.environment,
           PATH: augmentedPath(),
         };
+        const env = { ...sourceEnv };
         const allowedCredentials = new Set(support.credentialEnv ?? []);
         // two lists, one rule: foreign PROVIDER keys must not flip a CLI's
         // billing off its own login, and WORKSPACE credentials (box token,
@@ -189,7 +208,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         for (const key of [...PROVIDER_CREDENTIAL_ENV, ...WORKSPACE_CREDENTIAL_ENV]) {
           if (!allowedCredentials.has(key)) delete env[key];
         }
-        support.transformEnv?.(env, config);
+        for (const key of Object.keys(env)) {
+          if (key.startsWith("OPENMAUSBOT_ENDPOINT_")) delete env[key];
+        }
+        support.transformEnv?.(env, config, sourceEnv);
         return env;
       };
       let models = support.models;
@@ -202,7 +224,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           // Keep the last usable catalog when an optional discovery source is down.
         }
       };
-      await refreshModels();
+      // Model discovery is optional picker metadata and may invoke a slow CLI
+      // (OpenCode can spend well over Electron's startup watchdog loading its
+      // provider catalog and plugins). Do not hold the harness boot on it.
+      // ProviderRegistry.describe() refreshes catalogs before returning the
+      // model picker payload, while turns can safely use the static fallback.
       const listeners = new Set<RuntimeEventListener>();
       interface Turn {
         stop: () => void;
@@ -277,7 +303,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         const turnId = newId();
         const cwd = turn.cwd ?? config.workspace ?? homedir();
         const env = childEnv();
-        const resolvedModel = support.resolveTurnModel?.(turn.model, env);
+        const resolvedModel = support.resolveTurnModel?.(turn.model, env, config);
         const cliTurn =
           resolvedModel !== undefined && resolvedModel !== turn.model
             ? { ...turn, model: resolvedModel }
@@ -434,12 +460,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               break;
             }
             case "tool_call": {
+              const command = String(u.rawInput?.command ?? u.title ?? "tool");
               emit({
                 ...base(threadId, turnId),
                 type: "item.started",
                 itemType: "tool",
                 itemId: u.toolCallId,
-                title: String(u.rawInput?.command ?? u.title ?? "tool").slice(0, 80),
+                title: command.slice(0, 80),
+                callFingerprint: createHash("sha256").update(command, "utf8").digest("hex").slice(0, 16),
               });
               break;
             }
@@ -562,7 +590,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               }
             }
             if (!sessionId) {
-              sessionResult = await request("session/new", { cwd, mcpServers }, NEW_SESSION_TIMEOUT);
+              sessionResult = await request(
+                "session/new",
+                { cwd, mcpServers },
+                resolveNewSessionTimeout(support),
+              );
               sessionId = typeof sessionResult?.sessionId === "string" ? sessionResult.sessionId : null;
               if (!sessionId) throw new Error("session/new returned no sessionId");
             }

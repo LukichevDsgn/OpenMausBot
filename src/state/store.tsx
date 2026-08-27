@@ -138,6 +138,40 @@ export interface TaskUsage {
   turns: number;
 }
 
+export interface RuntimeControls {
+  wallClockTimeoutMinutes: number;
+  idleTimeoutMinutes: number;
+  cancellationGraceSeconds: number;
+  retryCap: number;
+  maxToolAgentSteps: number;
+  delegationConcurrency: number;
+  freshSessionEnforcement: boolean;
+  handoffByteCap: number;
+  cumulativeTokenPolicy: {
+    mode: "disabled" | "soft" | "hard";
+    limit: number;
+  };
+}
+
+export type RuntimePolicy = RuntimeControls;
+
+/** Stable value key for the complete effective runtime policy returned by the server. */
+export function runtimePolicySignature(policy?: RuntimePolicy): string {
+  if (!policy) return "runtime-policy:missing";
+  return JSON.stringify([
+    policy.wallClockTimeoutMinutes,
+    policy.idleTimeoutMinutes,
+    policy.cancellationGraceSeconds,
+    policy.retryCap,
+    policy.maxToolAgentSteps,
+    policy.delegationConcurrency,
+    policy.freshSessionEnforcement,
+    policy.handoffByteCap,
+    policy.cumulativeTokenPolicy.mode,
+    policy.cumulativeTokenPolicy.limit,
+  ]);
+}
+
 export interface Bot {
   id: string;
   threadId: string;
@@ -164,6 +198,8 @@ export interface Bot {
   autoApprove?: boolean;
   /** tools this bot may always use without asking */
   alwaysAllow?: string[];
+  /** exact local desktop apps this bot may operate without per-action cards */
+  localComputerAllowApps?: string[];
   /** speak this bot's replies aloud as they settle */
   speakReplies?: boolean;
   /** this bot's own voice id (falls back to the app-wide one) */
@@ -182,6 +218,12 @@ export interface Bot {
   /** Whether this bot may use the workspace's connected apps. Unset means
    * allowed for existing bots; imported bots start with this disabled. */
   composio?: boolean;
+  /** Explicit skill ids; undefined keeps catalog defaults, [] denies all. */
+  skillGrants?: string[];
+  /** Explicit skill-owned tool ids; undefined keeps declared-tool defaults. */
+  skillToolGrants?: string[];
+  /** Complete effective runtime controls returned by the server. */
+  runtimePolicy?: RuntimePolicy;
   messages: Message[];
   /** leaf of the visible conversation branch (see visibleMessages) */
   activeLeafId?: string | null;
@@ -217,6 +259,8 @@ export function messageVersions(bot: Bot, message: Message): Message[] {
 /** GET /api/config — configured flags only; secrets are never echoed. */
 export interface ConfigStatus {
   xai?: { configured: boolean };
+  nvidia?: { configured: boolean };
+  openrouter?: { configured: boolean };
   composio: { configured: boolean; mode?: "managed" | "self-hosted" | "unavailable" };
   box: { configured: boolean };
   vps: { configured: boolean; sshAlias: string };
@@ -232,12 +276,14 @@ export interface ConfigStatus {
 
 export type ConfigStatusFrame = Pick<
   ConfigStatus,
-  "xai" | "composio" | "box" | "vps" | "rooms" | "opencodeGo" | "tts" | "profile"
+  "xai" | "nvidia" | "openrouter" | "composio" | "box" | "vps" | "rooms" | "opencodeGo" | "tts" | "profile"
 >;
 
 export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
   return {
     xai: frame.xai,
+    nvidia: frame.nvidia,
+    openrouter: frame.openrouter,
     composio: frame.composio,
     box: frame.box,
     vps: frame.vps,
@@ -266,6 +312,8 @@ export interface InstanceInfo {
   snapshot: {
     state: "available" | "unavailable";
     reason?: string;
+    /** True only when the local engine binary is missing. */
+    setup?: boolean;
     authenticated?: boolean;
     version?: string | null;
     /** a reported cost on a subscription is notional; the UI says so */
@@ -292,6 +340,21 @@ export interface InstanceInfo {
   cliCandidates?: string[];
 }
 
+export interface AntigravityQuotaWindow { remaining: number; resetsAt: string | null }
+export interface AntigravityAccountStatus {
+  profile: "a" | "b";
+  instanceId: string;
+  label: string;
+  email: string;
+  active: boolean;
+  available: boolean;
+  quota: {
+    gemini: { weekly: AntigravityQuotaWindow | null; fiveHour: AntigravityQuotaWindow | null };
+    other: { weekly: AntigravityQuotaWindow | null; fiveHour: AntigravityQuotaWindow | null };
+  };
+  error?: string;
+}
+
 export type AppSettingsSection =
   | "general"
   | "connections"
@@ -301,10 +364,22 @@ export type AppSettingsSection =
   | "computer"
   | "usage";
 
+export interface SkillCatalogEntry {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  defaultEnabled: boolean;
+  triggerTerms: string[];
+  requiredCapabilities: string[];
+  tools: string[];
+}
+
 export interface AppState {
   bots: Bot[];
   groups: Group[];
   instances: InstanceInfo[];
+  skills: SkillCatalogEntry[];
   config: ConfigStatus | null;
   /** selected chat — a bot id OR a group id */
   selectedId: string;
@@ -378,6 +453,7 @@ export type Action =
   | { type: "toggleReaction"; threadId: string; messageId: string; emoji: string }
   | { type: "interruptGroup"; groupId: string }
   | { type: "instances"; instances: InstanceInfo[] }
+  | { type: "skillsCatalog"; skills: SkillCatalogEntry[] }
   | { type: "configStatus"; config: ConfigStatus }
   | { type: "select"; id: string }
   | { type: "send"; botId: string; text: string }
@@ -402,7 +478,7 @@ export type Action =
   | { type: "taskSwitched"; bot: Bot }
   | { type: "renameTask"; botId: string; threadId: string; title: string }
   | { type: "deleteTask"; botId: string; threadId: string }
-  | { type: "newBot" }
+  | { type: "newBot"; section?: string; cwd?: string }
   | { type: "botAdded"; bot: Bot }
   | { type: "deleteBot"; botId: string }
   | { type: "duplicateBot"; botId: string }
@@ -448,6 +524,8 @@ export type Action =
           | "chiefOfStaff"
           | "approvePeerComms"
           | "composio"
+          | "skillGrants"
+          | "skillToolGrants"
           | "modelSelection"
         >
       >;
@@ -562,6 +640,8 @@ export function reducer(state: AppState, action: Action): AppState {
     }
     case "instances":
       return { ...state, instances: action.instances };
+    case "skillsCatalog":
+      return { ...state, skills: action.skills };
     case "configStatus":
       return { ...state, config: action.config };
     case "select": {
@@ -632,7 +712,9 @@ export function reducer(state: AppState, action: Action): AppState {
         ? {
             ...animated,
             bots: animated.bots.map((b) =>
-              b.id === action.bot.id ? b : { ...b, chiefOfStaff: false },
+              b.id === action.bot.id || (b.section || "") !== (action.bot.section || "")
+                ? b
+                : { ...b, chiefOfStaff: false },
             ),
           }
         : animated;
@@ -826,7 +908,9 @@ export function reducer(state: AppState, action: Action): AppState {
         ? {
             ...animated,
             bots: animated.bots.map((b) =>
-              b.id === action.botId ? b : { ...b, chiefOfStaff: false },
+              b.id === action.botId || (b.section || "") !== (animated.bots.find((candidate) => candidate.id === action.botId)?.section || "")
+                ? b
+                : { ...b, chiefOfStaff: false },
             ),
           }
         : animated;
@@ -914,6 +998,7 @@ export const initialState: AppState = {
   bots: [],
   groups: [],
   instances: [],
+  skills: [],
   config: null,
   selectedId: "",
   activeView: "chat",
@@ -1144,7 +1229,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         }
         case "newBot":
           api("/api/bots", { method: "POST" })
-            .then(({ bot }) => rawDispatch({ type: "botAdded", bot }))
+            .then(({ bot }) => {
+              if (!action.section && !action.cwd) {
+                rawDispatch({ type: "botAdded", bot });
+                return;
+              }
+              return api(`/api/bots/${bot.id}`, {
+                method: "PATCH",
+                body: JSON.stringify({ section: action.section, cwd: action.cwd }),
+              }).then(({ bot: patched }) => rawDispatch({ type: "botAdded", bot: patched }));
+            })
             .catch(showError);
           break;
         case "duplicateBot": {
@@ -1292,6 +1386,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           .catch(() => {}),
         api("/api/instances")
           .then(({ instances }) => alive && rawDispatch({ type: "instances", instances }))
+          .catch(() => {}),
+        api("/api/skills/catalog")
+          .then(({ skills }) => alive && rawDispatch({ type: "skillsCatalog", skills: skills ?? [] }))
           .catch(() => {}),
         api("/api/config")
           .then((config) => alive && rawDispatch({ type: "configStatus", config }))

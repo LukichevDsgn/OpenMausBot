@@ -74,6 +74,7 @@ const dumpEnv = Object.fromEntries(
     "UNSLOTH_STUDIO_AUTH_TOKEN",
     "CURSOR_API_KEY",
     "CURSOR_AUTH_TOKEN",
+    "OPENMAUSBOT_ENDPOINT_OPENROUTER_API_KEY",
   ].flatMap((key) => (process.env[key] === undefined ? [] : [[key, process.env[key]]] as const)),
 );
 const dumpState: Record<string, unknown> = { argv, env: dumpEnv };
@@ -351,6 +352,21 @@ function handle(msg: any) {
         finish();
         return;
       }
+      const promptText = String(msg.params?.prompt?.[0]?.text ?? "");
+      if (mode === "delegate-peer" && promptText.includes("OpenMausBot delegation update:")) {
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { text: "coordinator processed delegated result" },
+            },
+          },
+        });
+        complete();
+        return;
+      }
       if (mode === "delegate-peer" && agentsMcp) {
         // async peer-handoff e2e: queue the delegation and return
         // immediately; the harness fires the peer's depth-1 turn after our
@@ -362,7 +378,7 @@ function handle(msg: any) {
             name: "delegate_bot",
             args: (list) => ({
               bot_id: /id: ([\w-]+)/.exec(list)?.[1] ?? "",
-              message: "delegated task",
+              message: "[OBJECTIVE]\nComplete the delegated test stage.\n[BASE/WORKTREE]\nBase: main\nWorktree: D:/Codex/OpenMausBot-custom\n[ALLOWED FILES]\n- server/testing/fake-acp-cli.ts\n[FORBIDDEN SCOPE]\nDo not touch Onlook or unrelated files.\n[EXACT CHANGES]\nApply only the requested deterministic fixture change.\n[VERIFICATION]\nRun the focused fake ACP test.\n[RECEIPT]\nReturn changed files, command, result and remaining uncertainty.",
               reason: "followup",
             }),
           },

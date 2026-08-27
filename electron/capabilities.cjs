@@ -32,6 +32,15 @@ function localComputerReady(platform, connection) {
   if (platform === "darwin") {
     return connection?.mode === "embedded" || connection?.mode === "standalone";
   }
+  if (platform === "win32") {
+    return (
+      connection?.mode !== "unavailable" &&
+      typeof connection?.mcpCommand === "string" &&
+      connection.mcpCommand.length > 0 &&
+      Array.isArray(connection?.mcpArgs) &&
+      connection.mcpArgs[0] === "mcp"
+    );
+  }
   if (
     platform !== "linux" ||
     connection?.schemaVersion !== 1 ||
@@ -114,7 +123,9 @@ function desktopCapabilities({
   if (!localAvailable) {
     localComputer.reasonCode =
       localConnection?.reasonCode ??
-      (hostPlatform === "darwin" ? "cua-driver-unavailable" : "unsupported-platform");
+      (hostPlatform === "darwin" || hostPlatform === "win32"
+        ? "cua-driver-unavailable"
+        : "unsupported-platform");
   }
 
   return {
@@ -142,7 +153,9 @@ function desktopCapabilities({
 }
 
 function connectionEnabled(platform, connection) {
-  if (platform === "darwin") return localComputerReady(platform, connection);
+  if (platform === "darwin" || platform === "win32") {
+    return localComputerReady(platform, connection);
+  }
   return platform === "linux" && connection?.enabled === true;
 }
 

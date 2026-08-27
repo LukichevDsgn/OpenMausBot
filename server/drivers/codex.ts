@@ -4,11 +4,14 @@
 // Completion is a real `turn/completed` notification; approval requests
 // arrive as in-process server→client JSON-RPC requests and surface as
 // canonical request.opened events (answered via respondToRequest — no MCP
-// proxy or unix socket needed, unlike claude). Verified against
+// proxy or unix socket needed, unlike claude). MCP tool approval elicitations
+// use their own app-server response vocabulary and are normalized here too.
+// Verified against
 // codex-cli 0.144.4 by agentcal.
 //
 // resumeCursor is the codex thread id; a later turn tries thread/resume
 // and falls back to a fresh thread/start.
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 
 import { stripWorkspaceCredentialEnv } from "../config.ts";
@@ -27,7 +30,7 @@ import type {
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
 import { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
-import { codexLocalProviderArgs } from "./local-inject.ts";
+import { configuredCodexApiModels, codexLocalProviderArgs } from "./local-inject.ts";
 import { augmentedPath } from "../env-path.ts";
 import { appendNative } from "./native.ts";
 
@@ -51,6 +54,17 @@ function decodeConfig(raw: unknown): CodexConfig {
 const QUESTION_TIMEOUT_NOTE = "No answer was given — use your best judgment.";
 const DENY_TIMEOUT_NOTE =
   "OpenMausBot: nobody answered this permission request in time. Skip this action and finish what you can without it.";
+// Delegated turns can otherwise replay a nearly full context after every
+// small tool call. Cached input is cheaper, but still consumes quota. Keep
+// tool/project payloads compact and fail a runaway turn closed.
+const CODEX_TOOL_OUTPUT_TOKEN_LIMIT = 4_000;
+const DELEGATED_CODEX_TOOL_OUTPUT_TOKEN_LIMIT = 2_000;
+const CODEX_PROJECT_DOC_MAX_BYTES = 8_192;
+const DELEGATED_CODEX_PROJECT_DOC_MAX_BYTES = 0;
+
+function isDelegatedTurn(text: string): boolean {
+  return text.trimStart().startsWith("[Delegated by @");
+}
 
 type StdioMcpServer = { command: string; args: string[]; env: Record<string, string> };
 
@@ -91,7 +105,11 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
 
   async create(input: DriverCreateInput<CodexConfig>): Promise<ProviderInstance> {
     const { instanceId, config } = input;
-    const childEnv = (): Record<string, string | undefined> => {
+    const directProviderKeys = {
+      nvidia: input.environment.OPENMAUSBOT_NVIDIA_API_KEY,
+      openrouter: input.environment.OPENMAUSBOT_OPENROUTER_API_KEY,
+    };
+    const childEnv = (modelId?: string): Record<string, string | undefined> => {
       const env: Record<string, string | undefined> = {
         ...process.env,
         ...input.environment,
@@ -104,14 +122,34 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       // The harness process may hold workspace credentials (xai/box/voice
       // keys, env-injected at boot); none of them are this CLI's to see.
       stripWorkspaceCredentialEnv(env);
+      // Restore only the selected direct API credential after the generic
+      // workspace-secret strip. It never reaches another provider or CLI.
+      const provider = decodeCodexSelection(modelId).modelProvider;
+      if (provider === "nvidia" && directProviderKeys.nvidia) {
+        env.OPENMAUSBOT_NVIDIA_API_KEY = directProviderKeys.nvidia;
+      }
+      if (provider === "openrouter" && directProviderKeys.openrouter) {
+        env.OPENMAUSBOT_OPENROUTER_API_KEY = directProviderKeys.openrouter;
+      }
       return env;
     };
-    const catalogEnv = childEnv();
-    let models = STATIC_CODEX_MODELS;
+    const catalogEnv = { ...process.env, ...input.environment };
+    const directModels = configuredCodexApiModels(catalogEnv);
+    const withDirectModels = (catalog: typeof STATIC_CODEX_MODELS) => {
+      const seen = new Set(catalog.options.map((option) => option.id));
+      return {
+        default: catalog.default || directModels.default,
+        options: [
+          ...catalog.options,
+          ...directModels.options.filter((option) => !seen.has(option.id)),
+        ],
+      };
+    };
+    let models = withDirectModels(STATIC_CODEX_MODELS);
     const refreshModels = async () => {
       try {
         const resolved = await readCodexModelCatalog(catalogEnv, fetch, config.cli);
-        if (resolved.options.length) models = resolved;
+        if (resolved.options.length) models = withDirectModels(resolved);
       } catch {
         // Keep the last usable catalog when a local provider is down.
       }
@@ -140,9 +178,17 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       const { threadId } = turn;
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const turnId = newId();
+      const delegated = isDelegatedTurn(turn.text);
 
-      const env = childEnv();
-      const appServerArgs = ["app-server", ...codexLocalProviderArgs(env, turn.model)];
+      const env = childEnv(turn.model);
+      const appServerArgs = [
+        "app-server",
+        "-c",
+        `tool_output_token_limit=${delegated ? DELEGATED_CODEX_TOOL_OUTPUT_TOKEN_LIMIT : CODEX_TOOL_OUTPUT_TOKEN_LIMIT}`,
+        "-c",
+        `project_doc_max_bytes=${delegated ? DELEGATED_CODEX_PROJECT_DOC_MAX_BYTES : CODEX_PROJECT_DOC_MAX_BYTES}`,
+        ...codexLocalProviderArgs(env, turn.model),
+      ];
       if (turn.integrations?.composio) {
         mountMcpServer(appServerArgs, env, "openmausbot_connectors", turn.integrations.composio);
       }
@@ -236,7 +282,36 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         for (const p of rpcPending.values()) p.reject(new Error("turn settled"));
         rpcPending.clear();
         active.delete(threadId);
-        emit({ ...base(threadId, turnId), type: "turn.completed", ok, stopReason, cost: null, ...(state.usage ? { usage: state.usage } : {}) });
+        const completed = {
+          ...base(threadId, turnId),
+          type: "turn.completed" as const,
+          ok,
+          stopReason,
+          cost: null,
+          ...(state.usage ? { usage: state.usage } : {}),
+        };
+
+        // A delegated turn is drained synchronously from turn.completed.
+        // Emitting first used to start the next Codex app-server while this
+        // turn still owned the shared CODEX_HOME SQLite runtime. On Windows
+        // the overlap is long enough for the fresh worker to fail during
+        // initialize with "failed to initialize sqlite state runtime".
+        // Reap this per-turn app-server before advertising completion, so a
+        // handoff cannot overlap the source provider's state connection.
+        if (child.exitCode !== null || child.signalCode !== null) {
+          emit(completed);
+          return;
+        }
+        let completionEmitted = false;
+        const emitAfterExit = () => {
+          if (completionEmitted) return;
+          completionEmitted = true;
+          clearTimeout(exitDeadline);
+          emit(completed);
+        };
+        const exitDeadline = setTimeout(emitAfterExit, 10_000);
+        exitDeadline.unref?.();
+        child.once("close", emitAfterExit);
         stop(); // the app-server never exits on its own
       };
 
@@ -246,14 +321,43 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         const params = msg.params ?? {};
         const legacy = method === "execCommandApproval" || method === "applyPatchApproval";
         const isQuestion = method === "item/tool/requestUserInput";
+        const isMcpElicitation = method === "mcpServer/elicitation/request";
+        const mcpMeta = isMcpElicitation && params._meta && typeof params._meta === "object" ? params._meta : {};
+        const isMcpToolApproval = isMcpElicitation && mcpMeta.codex_approval_kind === "mcp_tool_call";
+        const mcpToolName =
+          typeof mcpMeta.tool_name === "string"
+            ? mcpMeta.tool_name
+            : typeof params.message === "string"
+              ? params.message.match(/tool ["']([^"']+)["']/)?.[1]
+              : undefined;
+        const mcpToolParams =
+          isMcpToolApproval && mcpMeta.tool_params && typeof mcpMeta.tool_params === "object"
+            ? mcpMeta.tool_params
+            : {};
+        const approvalTarget =
+          typeof mcpToolParams.app === "string" && mcpToolParams.app.trim()
+            ? mcpToolParams.app.trim().toLowerCase()
+            : undefined;
+        const isLocalComputerApproval =
+          isMcpToolApproval &&
+          approvalTarget !== undefined &&
+          ["node_repl", "computer"].includes(String(params.serverName ?? "").toLowerCase());
         const tool =
           method === "item/fileChange/requestApproval" || method === "applyPatchApproval"
             ? "edit"
-            : isQuestion
-              ? "ask_user"
-              : "shell";
+            : isMcpToolApproval
+              ? `mcp:${String(params.serverName ?? "server")}/${mcpToolName ?? "tool"}`
+              : isQuestion
+                ? "ask_user"
+                : "shell";
         if (config.fullAuto && !isQuestion) {
-          return send({ jsonrpc: "2.0", id: msg.id, result: { decision: legacy ? "approved" : "accept" } });
+          return send({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: isMcpElicitation
+              ? { action: "accept", content: {} }
+              : { decision: legacy ? "approved" : "accept" },
+          });
         }
         const requestId = newId();
         const summary =
@@ -276,6 +380,15 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
               answers[q.id] = { answers: [message || QUESTION_TIMEOUT_NOTE] };
             }
             send({ jsonrpc: "2.0", id: msg.id, result: { answers } });
+          } else if (isMcpElicitation) {
+            send({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result:
+                behavior === "allow"
+                  ? { action: "accept", content: {} }
+                  : { action: "decline", content: null },
+            });
           } else {
             send({
               jsonrpc: "2.0",
@@ -299,6 +412,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           tool,
           summary,
           choices,
+          approvalScope: isLocalComputerApproval ? "local-computer" : undefined,
+          approvalTarget: isLocalComputerApproval ? approvalTarget : undefined,
         });
       };
 
@@ -323,9 +438,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           }
           case "item/started": {
             const item = p.item ?? {};
+            const command = item.type === "commandExecution" ? String(item.command ?? "shell") : null;
             const title =
-              item.type === "commandExecution"
-                ? String(item.command ?? "shell").slice(0, 80)
+              command !== null
+                ? command.slice(0, 80)
                 : item.type === "fileChange"
                   ? "edit"
                   : item.type === "mcpToolCall"
@@ -333,7 +449,18 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                     : item.type === "webSearch"
                       ? "web_search"
                       : null;
-            if (title) emit({ ...base(threadId, turnId), type: "item.started", itemType: "tool", itemId: item.id, title });
+            if (title) {
+              emit({
+                ...base(threadId, turnId),
+                type: "item.started",
+                itemType: "tool",
+                itemId: item.id,
+                title,
+                callFingerprint: command === null
+                  ? undefined
+                  : createHash("sha256").update(command, "utf8").digest("hex").slice(0, 16),
+              });
+            }
             break;
           }
           case "item/completed": {
@@ -518,6 +645,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         );
       });
       if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+      if (directProviderKeys.nvidia || directProviderKeys.openrouter) {
+        return { state: "available", version, authenticated: true, billing: "metered" };
+      }
       const authenticated = await new Promise<boolean>((resolve) => {
         execCli(config.cli, ["login", "status"], { timeout: 8000, env }, (err, stdout, stderr) =>
           resolve(!err && /^logged in\b/im.test(`${stdout}\n${stderr ?? ""}`)),
@@ -542,6 +672,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         capabilities: {
           sessionModelSwitch: "unsupported",
           computerMcp: true,
+          // Codex app-server already mounts integrations.localComputer above.
+          // Advertise that implemented path so the router does not reject a
+          // Local destination before the CUA MCP server can be attached.
+          localComputerMcp: true,
           composioMcp: true,
           agentsMcp: true,
           phoneMcp: true,

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   appendFileSync,
   chmodSync,
@@ -81,6 +82,42 @@ function linuxDescriptor(userData: string, { session = "x11" }: { session?: "x11
     },
     toolNames: ["click", "get_window_state", "list_apps", "type_text"],
     doctorWarnings: [],
+  };
+}
+
+const WINDOWS_MCP_ENV = {
+  CUA_DRIVER_RS_UPDATE_CHECK: "false",
+  CUA_DRIVER_RS_TELEMETRY_ENABLED: "false",
+};
+
+function windowsDescriptor(userData: string, { version = "0.21.0" }: { version?: string } = {}) {
+  const binary = join(userData, "cua-driver.exe");
+  writeFileSync(binary, "fake windows driver", { mode: 0o700 });
+  const canonical = realpathSync(binary);
+  const stat = statSync(canonical, { bigint: true });
+  const fileIdentity = {
+    sha256: createHash("sha256").update("fake windows driver").digest("hex"),
+    size: String(stat.size),
+    mtimeNs: String(stat.mtimeNs),
+    ctimeNs: String(stat.ctimeNs),
+  };
+  return {
+    schemaVersion: 1,
+    mode: "standalone",
+    platform: "win32",
+    status: "ready",
+    enabled: true,
+    driver: {
+      path: canonical,
+      version,
+      source: "user-local",
+      manifestSchema: "1",
+      fileIdentity,
+    },
+    mcp: { command: canonical, args: ["mcp"], env: { ...WINDOWS_MCP_ENV } },
+    mcpCommand: canonical,
+    mcpArgs: ["mcp"],
+    mcpEnv: { ...WINDOWS_MCP_ENV },
   };
 }
 
@@ -256,10 +293,28 @@ describe("local computer descriptor", () => {
     expect(readCuaConnection({ platform: "linux", userData })).toBeNull();
   });
 
-  it("preserves the selected Windows descriptor contract", () => {
+  it("accepts the exact Windows descriptor and rejects a driver changed after publication", () => {
     const userData = privateUserData("windows-user-data");
+    const descriptor = windowsDescriptor(userData);
+    writeFileSync(join(userData, "cua-connection.json"), JSON.stringify(descriptor), { mode: 0o600 });
+
+    expect(readCuaConnection({ platform: "win32", userData })).toEqual({
+      command: descriptor.driver.path,
+      args: ["mcp"],
+      env: WINDOWS_MCP_ENV,
+      platform: "win32",
+      scope: "local-computer",
+    });
+
+    appendFileSync(descriptor.driver.path, "changed after descriptor publication");
+    expect(readCuaConnection({ platform: "win32", userData })).toBeNull();
+  });
+
+  it("rejects the old Windows legacy descriptor and exact-contract mutations", () => {
+    const userData = privateUserData("windows-invalid-user-data");
+    const file = join(userData, "cua-connection.json");
     writeFileSync(
-      join(userData, "cua-connection.json"),
+      file,
       JSON.stringify({
         mode: "embedded",
         mcpCommand: "C:\\cua-driver.exe",
@@ -267,21 +322,20 @@ describe("local computer descriptor", () => {
         mcpEnv: { CUA_DRIVER_EMBEDDED: "1" },
       }),
     );
-    expect(readCuaConnection({ platform: "win32", userData })).toEqual({
-      command: "C:\\cua-driver.exe",
-      args: ["mcp"],
-      env: { CUA_DRIVER_EMBEDDED: "1" },
-      platform: "win32",
-      scope: "local-computer",
-    });
-  });
-
-  it("rejects malformed legacy argv and environment values", () => {
-    const userData = privateUserData("invalid-user-data");
-    writeFileSync(
-      join(userData, "cua-connection.json"),
-      JSON.stringify({ mode: "embedded", mcpCommand: "cua-driver", mcpArgs: "mcp" }),
-    );
     expect(readCuaConnection({ platform: "win32", userData })).toBeNull();
+
+    const descriptor = windowsDescriptor(userData);
+    const invalidDescriptors = [
+      { ...descriptor, unexpected: true },
+      { ...descriptor, driver: { ...descriptor.driver, version: "not-a-version" } },
+      { ...descriptor, driver: { ...descriptor.driver, fileIdentity: { ...descriptor.driver.fileIdentity, sha256: "0".repeat(64) } } },
+      { ...descriptor, mcp: { ...descriptor.mcp, command: join(userData, "other-driver.exe") } },
+      { ...descriptor, mcp: { ...descriptor.mcp, args: ["mcp", "--evil"] } },
+      { ...descriptor, mcpEnv: { ...descriptor.mcpEnv, CUA_DRIVER_EVIL: "1" } },
+    ];
+    for (const invalid of invalidDescriptors) {
+      writeFileSync(file, JSON.stringify(invalid), { mode: 0o600 });
+      expect(readCuaConnection({ platform: "win32", userData })).toBeNull();
+    }
   });
 });
