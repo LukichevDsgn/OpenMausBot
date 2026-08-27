@@ -976,3 +976,29 @@ same-handoff correction; a further policy change receives `loop_blocked`.
 Successful task overrides persist an applied, prompt-free audit containing
 effective and override fingerprints. No applied audit is written when
 approval, task creation, or target dispatch fails.
+
+## 2026-08-28: adaptive Runtime Policy in-place v23 deployment
+
+Source commit `df12b7e1e51cc18d54d0c496169044e86bdd0240` was deployed in place
+to the existing `release-codex-local-v23` root. `pnpm build` and
+`pnpm build:server` passed; local packaged-server smoke passed with all 9
+proxy paths contained in the packaged server directory. Independent live UI
+acceptance confirmed compact/expanded Runtime controls and the separate
+Lucide Chief control row with `Allowed` state; settings were not changed.
+
+The launched v23 held stable HTTP 200 health for 15 seconds, with all 8 named
+OpenMausBot/cloudflared processes under the exact
+`release-codex-local-v23\\win-unpacked` root and the listener owned by that
+root. Deployed hashes are: `OpenMausBot.exe`
+`4368CCE59E02E32DFFC1D2C218AF3AE8F0386661938E50E938F133EA0BA15B12`,
+`resources/app.asar`
+`31803E0894D3B868ED2DAB945F6FC3F24069B2C8EAE9AB3C114518409F2BA63D`,
+server entry
+`DBD75E07642650D8666DFB616371661E5C3E2168A3FD5AD58F093946A241512E`, UI
+tree `2eb5476b085810eae9168154df08d7521e200152246e1d9e98a81bf71617ede7`
+(313 files), and server tree
+`1fe8436529a6d776880dc041baf1cee7c3d599c85f7736f77dd1673015b5d459`
+(201 files). The two verified deployment backups were removed after exact
+resolved-path and non-reparse guards. No new version or release was created;
+the `custom-v23` tag remains unchanged at peeled target
+`beee3148e15f0c73793fe58faf5c40f3865fce87`.
