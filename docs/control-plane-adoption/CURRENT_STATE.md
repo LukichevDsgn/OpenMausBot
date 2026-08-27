@@ -881,3 +881,43 @@ under the final v23 root and none outside it. The local listener at
 matched that packaged server PID. Unsigned Windows publisher authenticity
 remains deferred external trust work requiring separate certificate and
 credential authority; no signing credentials were requested or used.
+
+## Custom v23 renderer-only effort and runtime-controls patch
+
+The visual-only patch was accepted on 2026-08-28 against the actual Electron
+custom v23 window. Its exact five-file source scope is
+`src/components/ChatView.tsx`, `src/components/ModelPicker.tsx`,
+`src/components/SettingsPanel.tsx`, `src/components/EffortPicker.tsx`, and
+`src/components/PillDropdown.tsx`.
+
+The model dialog now selects only provider and model. A separate effort pill
+appears between the model and phone controls when the active engine advertises
+effort levels, and the Agent profile uses the same compact pill treatment.
+The reusable dropdown follows the existing Sidebar density-menu pattern while
+adding radio semantics, full keyboard navigation, outside-click and Escape
+handling, visible focus, disabled states, and responsive overflow protection.
+Runtime controls are collapsed by default with summary pills and preserve the
+existing policy values, ranges, draft, Save/Reset flow, and API. Their expanded
+state groups Turn limits, Recovery & coordination, and Token budget; token
+mode uses the same dropdown and its numeric limit is hidden while disabled.
+
+Focused oxlint for the five files, full client/server TypeScript, contrast
+checking, Vite renderer build, tracked and untracked whitespace checks, and
+exact scope checks passed. The actual-window review confirmed
+model → effort → phone header order, the Sidebar-matched dropdown, no Effort
+section in the model dialog, Model/Effort pill parity in Settings, and coherent
+expanded and compact Runtime controls. No model value, runtime value, Save
+action, or chat send was changed during visual acceptance.
+
+The already-built renderer was installed in place under the existing final v23
+`resources/ui`; no application package, version, executable, server bundle, or
+tag was rebuilt. The installed renderer tree SHA-256 is
+`490ACBB1D4D1BBAD0308B3C57FF5839E125BD3E5455C68BDDEB174F6EF6AB9A9`.
+Core SHA-256 values remain `4368CCE59E02E32DFFC1D2C218AF3AE8F0386661938E50E938F133EA0BA15B12`
+for `OpenMausBot.exe`,
+`31803E0894D3B868ED2DAB945F6FC3F24069B2C8EAE9AB3C114518409F2BA63D`
+for `resources/app.asar`, and
+`6F96BFE655602466F06D2E644C2BFDCAC3700A7E57A9964FBAD77175799AEFD3`
+for `resources/server/index.js`. The annotated `custom-v23` tag remains on the
+previous accepted `beee3148` baseline; the integration branch advances by this
+renderer-only UI patch without creating a new version or tag.

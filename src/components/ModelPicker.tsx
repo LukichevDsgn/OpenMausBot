@@ -268,16 +268,6 @@ export function ModelPicker({
     />
   );
 
-  const effortLevels = railInstance?.capabilities?.effortLevels ?? [];
-  const effortApplies = railInstance?.instanceId === selection.instanceId && effortLevels.length > 0;
-  const setEffort = (effort: ModelSelection["effort"]) => {
-    dispatch({
-      type: "setModel",
-      botId: bot.id,
-      selection: { ...selection, effort },
-    });
-  };
-
   const trigger = (
     <button
         type="button"
@@ -439,30 +429,6 @@ export function ModelPicker({
                   )}
                   {agyNotice && railInstance.driverKind === "antigravityAgent" && (
                     <div className="mt-2 text-[10.5px] text-ink-secondary">{agyNotice}</div>
-                  )}
-                  {effortApplies && (
-                    <div className="mt-2">
-                      <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-ink-secondary">Effort</div>
-                      <div className="flex overflow-hidden rounded-lg border border-hairline/40">
-                        {([undefined, ...effortLevels] as const).map((level, index) => (
-                          <button
-                            key={level ?? "default"}
-                            type="button"
-                            onClick={() => setEffort(level)}
-                            aria-pressed={selection.effort === level}
-                            className={cn(
-                              "min-w-0 flex-1 px-1 py-1.5 text-[10.5px] capitalize",
-                              index > 0 && "border-l border-hairline/40",
-                              selection.effort === level
-                                ? "bg-raised text-ink"
-                                : "text-ink-secondary hover:bg-raised/60 hover:text-ink",
-                            )}
-                          >
-                            {level === "xhigh" ? "X-High" : (level ?? "Default")}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
                   )}
                 </div>
 

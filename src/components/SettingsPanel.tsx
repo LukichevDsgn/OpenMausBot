@@ -3,7 +3,9 @@ import { useEffect, useState } from "react";
 import { api, runtimePolicySignature, useStore, type Bot, type RuntimePolicy } from "@/state/store";
 import { stateForBot } from "@/lib/mascot";
 import { CloudBackendPicker } from "./CloudBackendPicker";
+import { EffortPicker } from "./EffortPicker";
 import { ModelPicker } from "./ModelPicker";
+import { PillDropdown, type PillDropdownOption } from "./PillDropdown";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
 import { requestNotificationPermission } from "@/lib/notify";
@@ -354,6 +356,7 @@ function numberInputValue(value: number): number | string {
 
 function RuntimeControlsCard({ bot }: { bot: Bot }) {
   const { dispatch } = useStore();
+  const [expanded, setExpanded] = useState(false);
   const [base, setBase] = useState<RuntimePolicy>(() => copyRuntimePolicy(bot.runtimePolicy));
   const [draft, setDraft] = useState<RuntimePolicy>(() => copyRuntimePolicy(bot.runtimePolicy));
   const [status, setStatus] = useState<"clean" | "saving" | "saved" | "error">("clean");
@@ -384,7 +387,10 @@ function RuntimeControlsCard({ bot }: { bot: Bot }) {
   };
 
   const save = async (reset: boolean) => {
-    const runtimePolicy: Record<string, unknown> = {};
+    type RuntimePolicyPatch = Partial<Omit<RuntimePolicy, "cumulativeTokenPolicy">> & {
+      cumulativeTokenPolicy?: Partial<RuntimePolicy["cumulativeTokenPolicy"]>;
+    };
+    const runtimePolicy: RuntimePolicyPatch = {};
     if (!reset) {
       const scalarKeys = [
         "wallClockTimeoutMinutes",
@@ -396,10 +402,11 @@ function RuntimeControlsCard({ bot }: { bot: Bot }) {
         "freshSessionEnforcement",
         "handoffByteCap",
       ] as const;
-      for (const key of scalarKeys) {
+      const setChangedScalar = <K extends (typeof scalarKeys)[number]>(key: K) => {
         if (draft[key] !== base[key]) runtimePolicy[key] = draft[key];
-      }
-      const tokenPatch: Record<string, unknown> = {};
+      };
+      for (const key of scalarKeys) setChangedScalar(key);
+      const tokenPatch: Partial<RuntimePolicy["cumulativeTokenPolicy"]> = {};
       if (draft.cumulativeTokenPolicy.mode !== base.cumulativeTokenPolicy.mode) {
         tokenPatch.mode = draft.cumulativeTokenPolicy.mode;
       }
@@ -435,174 +442,163 @@ function RuntimeControlsCard({ bot }: { bot: Bot }) {
 
   const dirty = !sameRuntimePolicy(base, draft);
   const saving = status === "saving";
+  type TokenMode = RuntimePolicy["cumulativeTokenPolicy"]["mode"];
+  const tokenOptions: Array<PillDropdownOption<TokenMode>> = [
+    { id: "disabled", label: "Disabled", value: "disabled" },
+    { id: "soft", label: "Soft warning", value: "soft" },
+    { id: "hard", label: "Hard cap", value: "hard" },
+  ];
+  const tokenSummary = draft.cumulativeTokenPolicy.mode === "disabled"
+    ? "Tokens off"
+    : `${draft.cumulativeTokenPolicy.mode === "soft" ? "Soft" : "Hard"} · ${draft.cumulativeTokenPolicy.limit.toLocaleString()}`;
 
   return (
     <div className="rounded-xl bg-card p-4">
-      <div className="text-[15px] font-medium text-ink">Runtime controls</div>
-      <div className="mt-0.5 text-[13px] leading-relaxed text-ink-secondary">
-        Changes apply to the next admitted turn and never interrupt the current one. Deterministic repeat/loop and conflicting-writer guards stay active independently.
-      </div>
-
-      <div className="mt-4 text-[11.5px] font-medium uppercase tracking-[0.08em] text-ink-secondary">Turn limits</div>
-      <div className="mt-2 grid grid-cols-2 gap-3">
-        <Field label="Wall-clock (minutes; 0 = off)">
-          <input
-            className={inputCls}
-            type="number"
-            min={0}
-            max={1_440}
-            step={1}
-            disabled={saving}
-            value={numberInputValue(draft.wallClockTimeoutMinutes)}
-            onChange={(event) => updateNumber("wallClockTimeoutMinutes", event.currentTarget.value)}
-          />
-        </Field>
-        <Field label="Idle timeout (minutes; 1–1440)">
-          <input
-            className={inputCls}
-            type="number"
-            min={1}
-            max={1_440}
-            step={1}
-            disabled={saving}
-            value={numberInputValue(draft.idleTimeoutMinutes)}
-            onChange={(event) => updateNumber("idleTimeoutMinutes", event.currentTarget.value)}
-          />
-        </Field>
-        <Field label="Cancellation grace (seconds; 1–120)">
-          <input
-            className={inputCls}
-            type="number"
-            min={1}
-            max={120}
-            step={1}
-            disabled={saving}
-            value={numberInputValue(draft.cancellationGraceSeconds)}
-            onChange={(event) => updateNumber("cancellationGraceSeconds", event.currentTarget.value)}
-          />
-        </Field>
-        <Field label="Max tool/agent steps (0 = off; 1–1000)">
-          <input
-            className={inputCls}
-            type="number"
-            min={0}
-            max={1_000}
-            step={1}
-            disabled={saving}
-            value={numberInputValue(draft.maxToolAgentSteps)}
-            onChange={(event) => updateNumber("maxToolAgentSteps", event.currentTarget.value)}
-          />
-        </Field>
-      </div>
-
-      <div className="mt-4 text-[11.5px] font-medium uppercase tracking-[0.08em] text-ink-secondary">Coordination</div>
-      <div className="mt-2 grid grid-cols-2 gap-3">
-        <Field label="Automatic retries (0–1)">
-          <input
-            className={inputCls}
-            type="number"
-            min={0}
-            max={1}
-            step={1}
-            disabled={saving}
-            value={numberInputValue(draft.retryCap)}
-            onChange={(event) => updateNumber("retryCap", event.currentTarget.value)}
-          />
-        </Field>
-        <Field label="Delegation fan-out (1–4)">
-          <input
-            className={inputCls}
-            type="number"
-            min={1}
-            max={4}
-            step={1}
-            disabled={saving}
-            value={numberInputValue(draft.delegationConcurrency)}
-            onChange={(event) => updateNumber("delegationConcurrency", event.currentTarget.value)}
-          />
-        </Field>
-        <Field label="Handoff size (UTF-8 bytes; 1024–12000)">
-          <input
-            className={inputCls}
-            type="number"
-            min={1_024}
-            max={12_000}
-            step={1}
-            disabled={saving}
-            value={numberInputValue(draft.handoffByteCap)}
-            onChange={(event) => updateNumber("handoffByteCap", event.currentTarget.value)}
-          />
-        </Field>
-        <label className="flex min-h-[72px] items-center gap-2 rounded-lg border border-hairline/40 bg-inset px-3 py-2.5 text-[13px] text-ink">
-          <input
-            type="checkbox"
-            className="size-4 accent-accent"
-            disabled={saving}
-            checked={draft.freshSessionEnforcement}
-            onChange={(event) => {
-              setDraft((current) => ({ ...current, freshSessionEnforcement: event.currentTarget.checked }));
-              setStatus("clean");
-              setError(null);
-            }}
-          />
-          <span>
-            <span className="block">Fresh session each turn</span>
-            <span className="mt-0.5 block text-[11.5px] text-ink-secondary">Keeps the bounded active-branch replay.</span>
-          </span>
-        </label>
-      </div>
-
-      <div className="mt-4 grid grid-cols-2 gap-3">
-        <Field label="Cumulative token policy">
-          <select
-            className={inputCls}
-            disabled={saving}
-            value={draft.cumulativeTokenPolicy.mode}
-            onChange={(event) => updateToken({ mode: event.currentTarget.value as RuntimePolicy["cumulativeTokenPolicy"]["mode"] })}
-          >
-            <option value="disabled">Disabled</option>
-            <option value="soft">Soft warning</option>
-            <option value="hard">Hard cap</option>
-          </select>
-        </Field>
-        <Field label="Token limit (1,000–10,000,000)">
-          <input
-            className={inputCls}
-            type="number"
-            min={1_000}
-            max={10_000_000}
-            step={1}
-            disabled={saving || draft.cumulativeTokenPolicy.mode === "disabled"}
-            value={numberInputValue(draft.cumulativeTokenPolicy.limit)}
-            onChange={(event) => updateToken({ limit: event.currentTarget.value === "" ? Number.NaN : Number(event.currentTarget.value) })}
-          />
-        </Field>
-      </div>
-      <div className="mt-2 text-[12px] leading-relaxed text-ink-secondary">
-        Disabled token policy does not stop workers or research. Soft warns once; hard requests a stop after the provider reports a sample.
-      </div>
-
-      <div className="mt-3 flex items-center gap-3">
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-[15px] font-medium text-ink">Runtime controls</div>
+          <div className="mt-0.5 text-[13px] leading-relaxed text-ink-secondary">
+            Limits, recovery, and token budget for future turns.
+          </div>
+        </div>
         <button
           type="button"
-          onClick={() => void save(false)}
-          disabled={saving || !dirty}
-          className="rounded-lg bg-raised px-3 py-1.5 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-50"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((current) => !current)}
+          className="flex shrink-0 items-center gap-1.5 rounded-full border border-hairline/40 bg-control/60 py-1 pl-2.5 pr-2 text-[13px] text-ink hover:bg-raised-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
         >
-          {saving ? "Saving…" : "Save"}
+          {expanded ? "Hide" : "Configure"}
+          <ChevronDown size={14} aria-hidden="true" className={cn("text-ink-secondary transition-transform", expanded && "rotate-180")} />
         </button>
-        <button
-          type="button"
-          onClick={() => void save(true)}
-          disabled={saving}
-          className="rounded-lg px-2 py-1.5 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50"
-        >
-          Reset
-        </button>
-        {status === "saved" && <span className="text-[12px] text-ink-secondary">Saved</span>}
-        {status === "clean" && !dirty && <span className="text-[12px] text-ink-secondary">Up to date</span>}
       </div>
-      {error && <div className="mt-2 text-[12px] text-danger">{error}</div>}
+
+      <div className="mt-3 flex flex-wrap gap-1.5">
+        <span className="rounded-full bg-inset px-2 py-1 text-[11.5px] text-ink-secondary">
+          {draft.wallClockTimeoutMinutes === 0 ? "Turn cap off" : `${draft.wallClockTimeoutMinutes}m turn`}
+        </span>
+        <span className="rounded-full bg-inset px-2 py-1 text-[11.5px] text-ink-secondary">{draft.idleTimeoutMinutes}m idle</span>
+        <span className="rounded-full bg-inset px-2 py-1 text-[11.5px] text-ink-secondary">{draft.delegationConcurrency} delegates</span>
+        <span className="rounded-full bg-inset px-2 py-1 text-[11.5px] text-ink-secondary">{tokenSummary}</span>
+        {dirty && <span className="rounded-full bg-accent/10 px-2 py-1 text-[11.5px] text-accent">Unsaved</span>}
+      </div>
+
+      {expanded && (
+        <div className="mt-4 space-y-3">
+          <section className="rounded-xl border border-hairline/40 bg-inset p-3">
+            <div className="text-[11.5px] font-medium uppercase tracking-[0.08em] text-ink-secondary">Turn limits</div>
+            <div className="mt-3 grid grid-cols-2 gap-3">
+              <label className="block">
+                <span className="text-[13px] text-ink">Wall clock</span>
+                <span className="mt-0.5 block text-[11.5px] text-ink-secondary">Minutes · 0 disables · max 1,440</span>
+                <input className={cn(inputCls, "mt-1.5")} type="number" min={0} max={1_440} step={1} disabled={saving} value={numberInputValue(draft.wallClockTimeoutMinutes)} onChange={(event) => updateNumber("wallClockTimeoutMinutes", event.currentTarget.value)} />
+              </label>
+              <label className="block">
+                <span className="text-[13px] text-ink">Idle timeout</span>
+                <span className="mt-0.5 block text-[11.5px] text-ink-secondary">Minutes · 1–1,440</span>
+                <input className={cn(inputCls, "mt-1.5")} type="number" min={1} max={1_440} step={1} disabled={saving} value={numberInputValue(draft.idleTimeoutMinutes)} onChange={(event) => updateNumber("idleTimeoutMinutes", event.currentTarget.value)} />
+              </label>
+              <label className="block">
+                <span className="text-[13px] text-ink">Cancel grace</span>
+                <span className="mt-0.5 block text-[11.5px] text-ink-secondary">Seconds · 1–120</span>
+                <input className={cn(inputCls, "mt-1.5")} type="number" min={1} max={120} step={1} disabled={saving} value={numberInputValue(draft.cancellationGraceSeconds)} onChange={(event) => updateNumber("cancellationGraceSeconds", event.currentTarget.value)} />
+              </label>
+              <label className="block">
+                <span className="text-[13px] text-ink">Tool & agent steps</span>
+                <span className="mt-0.5 block text-[11.5px] text-ink-secondary">0 disables · 1–1,000</span>
+                <input className={cn(inputCls, "mt-1.5")} type="number" min={0} max={1_000} step={1} disabled={saving} value={numberInputValue(draft.maxToolAgentSteps)} onChange={(event) => updateNumber("maxToolAgentSteps", event.currentTarget.value)} />
+              </label>
+            </div>
+          </section>
+
+          <section className="rounded-xl border border-hairline/40 bg-inset p-3">
+            <div className="text-[11.5px] font-medium uppercase tracking-[0.08em] text-ink-secondary">Recovery & coordination</div>
+            <div className="mt-3 grid grid-cols-2 gap-3">
+              <label className="block">
+                <span className="text-[13px] text-ink">Retries</span>
+                <span className="mt-0.5 block text-[11.5px] text-ink-secondary">Automatic · 0–1</span>
+                <input className={cn(inputCls, "mt-1.5")} type="number" min={0} max={1} step={1} disabled={saving} value={numberInputValue(draft.retryCap)} onChange={(event) => updateNumber("retryCap", event.currentTarget.value)} />
+              </label>
+              <label className="block">
+                <span className="text-[13px] text-ink">Delegation</span>
+                <span className="mt-0.5 block text-[11.5px] text-ink-secondary">Concurrent agents · 1–4</span>
+                <input className={cn(inputCls, "mt-1.5")} type="number" min={1} max={4} step={1} disabled={saving} value={numberInputValue(draft.delegationConcurrency)} onChange={(event) => updateNumber("delegationConcurrency", event.currentTarget.value)} />
+              </label>
+              <label className="block">
+                <span className="text-[13px] text-ink">Handoff size</span>
+                <span className="mt-0.5 block text-[11.5px] text-ink-secondary">UTF-8 bytes · 1,024–12,000</span>
+                <input className={cn(inputCls, "mt-1.5")} type="number" min={1_024} max={12_000} step={1} disabled={saving} value={numberInputValue(draft.handoffByteCap)} onChange={(event) => updateNumber("handoffByteCap", event.currentTarget.value)} />
+              </label>
+              <div className="flex min-h-[72px] items-center justify-between gap-3 rounded-lg border border-hairline/40 bg-card px-3 py-2.5">
+                <div className="min-w-0">
+                  <div className="text-[13px] text-ink">Fresh session</div>
+                  <div className="mt-0.5 text-[11.5px] text-ink-secondary">Start each turn from bounded replay.</div>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={draft.freshSessionEnforcement}
+                  aria-label="Fresh session each turn"
+                  disabled={saving}
+                  onClick={() => {
+                    setDraft((current) => ({ ...current, freshSessionEnforcement: !current.freshSessionEnforcement }));
+                    setStatus("clean");
+                    setError(null);
+                  }}
+                  className={cn(
+                    "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 disabled:cursor-not-allowed disabled:opacity-50",
+                    draft.freshSessionEnforcement ? "bg-accent" : "bg-control",
+                  )}
+                >
+                  <span className={cn("absolute top-[3px] size-5 rounded-full bg-white transition-all", draft.freshSessionEnforcement ? "left-[21px]" : "left-[3px]")} />
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <section className="rounded-xl border border-hairline/40 bg-inset p-3">
+            <div className="text-[11.5px] font-medium uppercase tracking-[0.08em] text-ink-secondary">Token budget</div>
+            <div className="mt-3 flex flex-wrap items-end gap-3">
+              <div className="min-w-[160px] flex-1">
+                <div className="text-[13px] text-ink">Policy</div>
+                <div className="mt-0.5 text-[11.5px] text-ink-secondary">Disabled, warning, or hard cap</div>
+                <PillDropdown
+                  className="mt-1.5"
+                  value={draft.cumulativeTokenPolicy.mode}
+                  options={tokenOptions}
+                  disabled={saving}
+                  ariaLabel="Cumulative token policy"
+                  onChange={(mode) => updateToken({ mode })}
+                />
+              </div>
+              {draft.cumulativeTokenPolicy.mode !== "disabled" && (
+                <label className="min-w-[160px] flex-1">
+                  <span className="text-[13px] text-ink">Token limit</span>
+                  <span className="mt-0.5 block text-[11.5px] text-ink-secondary">1,000–10,000,000</span>
+                  <input className={cn(inputCls, "mt-1.5")} type="number" min={1_000} max={10_000_000} step={1} disabled={saving} value={numberInputValue(draft.cumulativeTokenPolicy.limit)} onChange={(event) => updateToken({ limit: event.currentTarget.value === "" ? Number.NaN : Number(event.currentTarget.value) })} />
+                </label>
+              )}
+            </div>
+            <div className="mt-2 text-[12px] leading-relaxed text-ink-secondary">
+              Soft warns once. Hard requests a stop after the provider reports a sample.
+            </div>
+          </section>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <button type="button" onClick={() => void save(false)} disabled={saving || !dirty} className="rounded-lg bg-raised px-3 py-1.5 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-50">
+              {saving ? "Saving…" : "Save"}
+            </button>
+            <button type="button" onClick={() => void save(true)} disabled={saving} className="rounded-lg px-2 py-1.5 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50">
+              Reset
+            </button>
+            {status === "saved" && <span className="text-[12px] text-ink-secondary">Saved</span>}
+            {status === "clean" && !dirty && <span className="text-[12px] text-ink-secondary">Up to date</span>}
+          </div>
+          {error && <div className="text-[12px] text-danger">{error}</div>}
+          <div className="text-[11.5px] leading-relaxed text-ink-secondary">
+            Changes apply to the next admitted turn. Repeat, loop, and conflicting-writer guards remain active.
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -853,34 +849,18 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
 
           {!!engine?.capabilities?.effortLevels?.length && (
             <div className="rounded-xl bg-card p-4">
-              <div className="text-[15px] font-medium text-ink">Effort</div>
-              {/* Says what the app does, not what the engine ends up at:
-                  Codex applies a level to the whole thread and has no way to
-                  take one back, so "currently: engine default" was a promise
-                  we could not keep for a thread that had already been sent
-                  one. Sending nothing is true on every engine. */}
-              <div className="mt-0.5 text-[13px] text-ink-secondary">
-                How hard this bot thinks{bot.modelSelection.effort ? "" : " (Default: no level is sent)"}
-              </div>
-              <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">
-                {([undefined, ...engine.capabilities.effortLevels] as const).map((level, i) => (
-                  <button
-                    key={level ?? "default"}
-                    aria-pressed={bot.modelSelection.effort === level}
-                    onClick={() => patch({ modelSelection: { ...bot.modelSelection, effort: level } })}
-                    className={cn(
-                      "flex-1 py-1.5 text-[13px] capitalize",
-                      i > 0 && "border-l border-hairline/40",
-                      bot.modelSelection.effort === level
-                        ? "bg-control text-ink"
-                        : "text-ink-secondary hover:bg-control/60 hover:text-ink",
-                    )}
-                  >
-                    {/* the others capitalize cleanly; "xhigh" would read "Xhigh" */}
-                    {level === "xhigh" ? "X-High" : (level ?? "Default")}
-                  </button>
-                ))}
-              </div>
+              <EffortPicker
+                bot={bot}
+                contained
+                label={
+                  <div>
+                    <div className="text-[15px] font-medium text-ink">Effort</div>
+                    <div className="mt-0.5 text-[13px] text-ink-secondary">
+                      How hard this bot thinks{bot.modelSelection.effort ? "" : " (Default: no level is sent)"}
+                    </div>
+                  </div>
+                }
+              />
             </div>
           )}
 
