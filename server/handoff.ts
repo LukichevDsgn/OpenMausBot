@@ -6,6 +6,8 @@ export const MAX_HANDOFF_BYTES = 12_000;
 export const MIN_HANDOFF_BYTES = 1_024;
 export const MAX_HANDOFF_REASON_BYTES = 512;
 
+export type HandoffAccessMode = "read-only" | "writer";
+
 const SECTION_NAMES = [
   "OBJECTIVE",
   "BASE/WORKTREE",
@@ -22,6 +24,7 @@ export interface HandoffScope {
   base: string;
   worktree: string;
   allowedFiles: string[];
+  accessMode: HandoffAccessMode;
 }
 
 export interface ParsedHandoff {
@@ -72,12 +75,15 @@ function parseScope(value: string, allowedFilesText: string): HandoffScope | nul
   const base = /^base\s*:\s*(.+)$/imu.exec(value)?.[1]?.trim();
   const worktree = /^worktree\s*:\s*(.+)$/imu.exec(value)?.[1]?.trim();
   if (!base || !worktree || /^(?:unknown|unspecified|n\/a)$/iu.test(worktree)) return null;
+  const accessLine = /^(?:access(?:\s+mode)?|mode)\s*:\s*(read-only|writer)\s*$/imu.exec(value);
+  const hasAccessLine = /^(?:access(?:\s+mode)?|mode)\s*:/imu.test(value);
+  if (hasAccessLine && !accessLine) return null;
   const allowedFiles = allowedFilesText
     .split(/\r?\n/u)
     .map((line) => /^\s*(?:[-*]|\d+[.)])\s+(.+?)\s*$/u.exec(line)?.[1]?.trim() ?? "")
     .filter(Boolean);
   if (!allowedFiles.length || allowedFiles.some((file) => /^(?:all|\*|everything)$/iu.test(file))) return null;
-  return { base, worktree, allowedFiles };
+  return { base, worktree, allowedFiles, accessMode: (accessLine?.[1] as HandoffAccessMode | undefined) ?? "writer" };
 }
 
 function requestedByteCap(value: number | { maxBytes?: number } | undefined): number | null {
@@ -137,7 +143,26 @@ function key(value: string): string {
 }
 
 export function scopesConflict(a: HandoffScope, b: HandoffScope): boolean {
-  if (key(a.worktree) === key(b.worktree)) return true;
+  if (scopeConflictReason(a, b)) return true;
+  return false;
+}
+
+/**
+ * Read-only is a coordination label, not a provider-neutral sandbox. Keep
+ * shared-checkout admission conservative: even two readers need separate
+ * worktrees. Different worktrees may share logical files because the
+ * worktree boundary is the actual isolation substrate.
+ */
+export function scopeConflictReason(a: HandoffScope, b: HandoffScope): string | null {
+  if (key(a.worktree) === key(b.worktree)) {
+    if (a.accessMode === "read-only" && b.accessMode === "read-only") {
+      return "read-only handoffs require different worktrees because read-only execution is not provider-enforced";
+    }
+    return "handoff worktree is already active for another task";
+  }
   const files = new Set(a.allowedFiles.map(key));
-  return b.allowedFiles.some((file) => files.has(key(file)));
+  if (a.accessMode === "writer" && b.accessMode === "writer" && b.allowedFiles.some((file) => files.has(key(file)))) {
+    return "writer handoffs cannot overlap the same logical files";
+  }
+  return null;
 }

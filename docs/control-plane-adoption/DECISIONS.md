@@ -320,3 +320,55 @@ historical and is not rewritten by this decision.
 Unsigned Windows publisher authenticity remains deferred external trust work.
 It still requires separate authority for a certificate and credentials; none
 are requested or used by this acceptance.
+
+## 2026-08-28: safe swarm access and adaptive Runtime Policy slice
+
+Structured handoffs now persist `accessMode: "read-only" | "writer"`; omitted
+legacy fields normalize to `writer`. Read-only execution is not provider
+enforced, so shared-checkout concurrency remains refused even for two readers.
+Concurrent readers require different worktrees. Different isolated worktrees
+may overlap logical files, while writer/writer overlap remains refused. The
+handoff parser, durable task scope, queue/restart path, conflict guard, and
+Chief instructions carry this distinction with deterministic refusal text.
+
+Only a visible section Chief of Staff admitted in the current turn receives
+server-authoritative runtime-policy inspection and persistent worker PATCH
+tools. The tools are limited to visible workers in the same section, reject
+self/Chief/hidden/cross-section targets, validate through the existing policy
+validator, require a bounded reason, persist provenance and prompt-free audit,
+and apply only at the next admission. The current turn snapshot is immutable.
+
+Each bot has a user-owned persisted `chiefRuntimePolicyLocked` boolean. Missing
+legacy data is treated as allowed and is migrated to `false`; the human bot
+PATCH/UI may change it, while Chief tools cannot. A locked worker refuses both
+persistent Chief policy PATCH and Chief one-task `runtimePolicyOverride`, with
+the same exact refusal reason and a persisted refusal audit. The user's lock
+or unlock action also writes a prompt-free `lock-change` audit. Ordinary
+delegation without an override remains allowed.
+
+`runtimePolicyOverride` is validator-normalized, Chief-only, stored with the
+task and pending queue item, survives restart, and merges after bot defaults.
+Task admission records effective-policy and override fingerprints without
+retaining prompt/tool data. The override fingerprint changes handoff evidence
+while the stage key and absolute one-retry cap remain unchanged, allowing one
+bounded evidence-changing correction and preventing a retry loop.
+
+Focused fake/local verification for this slice: 9 suites passed, 250 tests
+passed, 1 skipped; both server and client TypeScript no-emit checks passed.
+
+### 2026-08-28 correction: effective-policy evidence identity
+
+Handoff `evidenceKey` now includes the secret-free fingerprint of the target's
+effective admission policy, computed as persisted bot defaults merged with the
+optional task override. `stageKey` and the absolute retry cap are unchanged.
+The computed identity is persisted in the pending item and task control, so a
+restart preserves an already-issued identity; legacy pending records retain
+their stored identity and use a conservative compatibility fallback only when
+old evidence metadata is absent.
+
+An exact settled handoff is therefore `duplicate` under the same effective
+policy, becomes one allowed corrective attempt after a material persistent
+policy change, and is `loop_blocked` after the bounded retry is consumed.
+Successful override dispatches add a bounded prompt-free `task-override`
+`applied` audit with effective and override fingerprints. Approval, task
+creation, or dispatch failure cannot create that applied audit.

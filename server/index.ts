@@ -123,6 +123,7 @@ import { TurnWatchdog } from "./turn-watchdog.ts";
 import { TurnSupervision, type TurnStopIntent, type UnknownTurn } from "./turn-supervision.ts";
 import {
   effectiveBotRuntimePolicy,
+  effectiveTaskRuntimePolicy,
   legacyCancellationGraceMs,
   legacyIdleTimeoutMs,
   mergeRuntimePolicy,
@@ -262,7 +263,7 @@ const phoneProxyPath = SPAWNED_PROXIES.phone;
 // in the packaged app process.execPath is Electron — run the proxy as node
 const AGENTS_NODE_FLAG = { ELECTRON_RUN_AS_NODE: "1" };
 
-function agentsIntegration(botId: string, threadId: string, depth: number, policy: BotRuntimePolicy) {
+function agentsIntegration(botId: string, threadId: string, depth: number, policy: BotRuntimePolicy, chiefOfStaff = false) {
   return {
     command: process.execPath,
     args: [agentsProxyPath],
@@ -276,6 +277,7 @@ function agentsIntegration(botId: string, threadId: string, depth: number, polic
       OMB_RETRY_CAP: String(policy.retryCap),
       OMB_DELEGATION_CONCURRENCY: String(policy.delegationConcurrency),
       OMB_HANDOFF_BYTE_CAP: String(policy.handoffByteCap),
+      OMB_CHIEF_OF_STAFF: chiefOfStaff ? "1" : "0",
     },
   };
 }
@@ -411,12 +413,14 @@ const wireBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => {
     runtimePolicy: _runtimePolicy,
     skillGrants: _skillGrants,
     skillToolGrants: _skillToolGrants,
+    runtimePolicyAudit: _runtimePolicyAudit,
     ...rest
   } = bot;
   return {
     ...rest,
     avatarUrl: rest.avatarUrl ?? null,
     runtimePolicy: effectiveBotRuntimePolicy(bot.runtimePolicy),
+    chiefRuntimePolicyLocked: bot.chiefRuntimePolicyLocked === true,
     ...(tasks ? { tasks: tasks.map(wireTask) } : {}),
   };
 };
@@ -1640,16 +1644,21 @@ const runDelegatedTurn: Parameters<typeof drainDelegations>[3] = (toBotId, text,
         tool: { name: `error: delegation to @${bot?.name ?? toBotId} could not start — ${why.slice(0, 120)}`, ok: false },
       });
     };
-    return startTurn(toBotId, text, {
-      commsDepth,
-      threadId: activeTargetThreadId,
-      unattended: isUnattended(store.botByThread(sourceThreadId)?.id),
-      // startTurn schedules provider/integration setup after marking the bot
-      // busy. Those asynchronous setup failures do not emit turn.completed,
-      // so clear the watch and report them through this callback too.
-      onDispatchError: reportStartFailure,
-    }).catch((err) => {
-      reportStartFailure(err);
+    return new Promise<void>((resolve, reject) => {
+      const fail = (error: unknown) => {
+        reportStartFailure(error);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      };
+      void startTurn(toBotId, text, {
+        commsDepth,
+        threadId: activeTargetThreadId,
+        unattended: isUnattended(store.botByThread(sourceThreadId)?.id),
+        // startTurn schedules provider/integration setup after marking the bot
+        // busy. Resolve only after the provider accepted the turn, so an
+        // override audit cannot claim a dispatch that failed asynchronously.
+        onDispatchError: fail,
+        onDispatchSuccess: resolve,
+      }).catch(fail);
     });
 };
 
@@ -1841,6 +1850,7 @@ async function startTurn(
     /** Earlier text message this user turn is replying to. */
     replyTo?: Message;
     onDispatchError?: (message: string) => void;
+    onDispatchSuccess?: () => void;
   },
 ) {
   const bot = store.bot(botId);
@@ -1860,8 +1870,8 @@ async function startTurn(
   if (!task) throw Object.assign(new Error("no such task"), { status: 404 });
   // Snapshot once, before any asynchronous setup. A live PATCH may change
   // the next admission, never this turn's timers, grace, or limits.
-  const runtimePolicy = effectiveBotRuntimePolicy(bot.runtimePolicy);
-  const runtimeTiming = runtimePolicyTiming(bot.runtimePolicy);
+  const runtimePolicy = effectiveTaskRuntimePolicy(bot.runtimePolicy, task.runtimePolicyOverride);
+  const runtimeTiming = runtimePolicyTiming(mergeRuntimePolicy(bot.runtimePolicy, task.runtimePolicyOverride));
   const recordLaunchFailure = (reason: string, eventId = `launch-failure:${threadId}`) => {
     store.markTaskRunning(bot.id, threadId);
     store.recordTaskOutcome(bot.id, threadId, {
@@ -2000,6 +2010,7 @@ async function startTurn(
     releaseSupervisedTurn(bot.id, threadId);
     throw Object.assign(new Error("runtime controls could not be admitted for this turn"), { status: 500 });
   }
+  store.recordTaskRuntimePolicy(bot.id, threadId, runtimePolicy);
   store.setActivity(bot.id, "working");
   store.patchBot(bot.id, { unread: false });
   turnUsage.delete(threadId);
@@ -2217,7 +2228,7 @@ async function startTurn(
         store.bots.filter((b) => b.id !== bot.id && !b.hidden).length > 0 &&
         admissionPolicy
       ) {
-        integrations.agents = agentsIntegration(bot.id, threadId, commsDepth, admissionPolicy);
+        integrations.agents = agentsIntegration(bot.id, threadId, commsDepth, admissionPolicy, Boolean(bot.chiefOfStaff));
       }
       // @mentions in the user's message (the composer's tagging UI) become
       // an explicit delegation nudge — the agent still does the ask_bot call
@@ -2295,6 +2306,7 @@ async function startTurn(
         cwd,
       });
       // dispatched: the rewind is spent, and the old cursors are dead
+      opts?.onDispatchSuccess?.();
       if (rewound) store.patchBot(bot.id, { rewound: false, resumeCursors: {} });
       // and this engine now owns the thread's most recent turn
       store.markTaskDispatched(bot.id, threadId, instanceId);
@@ -2573,7 +2585,7 @@ async function runGroupMemberTurn(
     .join("\n");
 
   if (hop < MAX_COMMS_DEPTH && instance.adapter.capabilities.agentsMcp === true) {
-    integrations.agents = agentsIntegration(bot.id, group.threadId, hop, runtimePolicy);
+    integrations.agents = agentsIntegration(bot.id, group.threadId, hop, runtimePolicy, Boolean(bot.chiefOfStaff));
   }
   const text = `${serializeRoomContext(group.threadId, userName)}\n\n(Reply to the conversation above as ${bot.name}.)${
     continuationText ? `\n\n${continuationText}` : ""
@@ -3419,8 +3431,111 @@ const server = createServer(async (req, res) => {
             busy: !!b.busy,
             title: b.title || undefined,
             description: b.description || undefined,
+            ...(sender.chiefOfStaff
+              ? {
+                  runtimePolicy: effectiveBotRuntimePolicy(b.runtimePolicy),
+                  chiefRuntimePolicyLocked: b.chiefRuntimePolicyLocked === true,
+                }
+              : {}),
           }));
         return json(res, 200, { bots });
+      }
+      if (method === "GET" && path === "/api/internal/runtime-policy") {
+        const chiefId = url.searchParams.get("fromBotId") ?? "";
+        const threadId = url.searchParams.get("fromThreadId") ?? "";
+        const chief = store.bot(chiefId);
+        if (!chief || chief.hidden || !chief.chiefOfStaff) {
+          return json(res, 403, { error: "only a visible section Chief of Staff can inspect worker runtime policy" });
+        }
+        const sourceIsChiefTask = store.taskByThread(chief.id, threadId) ||
+          Boolean(store.groupByThread(threadId)?.memberIds.includes(chief.id));
+        if (!sourceIsChiefTask) {
+          return json(res, 403, { error: "source thread does not belong to Chief of Staff" });
+        }
+        if (!runtimeLimits.policySnapshot(threadId)) {
+          return json(res, 409, { error: "Chief runtime-policy tools require an actively admitted turn" });
+        }
+        const workers = store.bots
+          .filter((bot) => bot.id !== chief.id && !bot.hidden && !bot.chiefOfStaff && sectionKey(bot.section) === sectionKey(chief.section))
+          .map((bot) => ({
+            id: bot.id,
+            routingKey: bot.routingKey,
+            name: bot.name,
+            busy: Boolean(bot.busy),
+            chiefRuntimePolicyLocked: bot.chiefRuntimePolicyLocked === true,
+            runtimePolicy: effectiveBotRuntimePolicy(bot.runtimePolicy),
+            audit: (bot.runtimePolicyAudit ?? []).slice(-5),
+          }));
+        return json(res, 200, { section: sectionKey(chief.section) || "General", workers });
+      }
+      if (method === "PATCH" && path === "/api/internal/runtime-policy") {
+        const body = await readBody(req);
+        const chiefId = String(body.fromBotId ?? "");
+        const sourceThreadId = String(body.fromThreadId ?? "");
+        const chief = store.bot(chiefId);
+        if (!chief || chief.hidden || !chief.chiefOfStaff) {
+          return json(res, 403, { error: "only a visible section Chief of Staff can patch worker runtime policy" });
+        }
+        const sourceIsChiefTask = store.taskByThread(chief.id, sourceThreadId) ||
+          Boolean(store.groupByThread(sourceThreadId)?.memberIds.includes(chief.id));
+        if (!sourceIsChiefTask) {
+          return json(res, 403, { error: "source thread does not belong to Chief of Staff" });
+        }
+        if (!runtimeLimits.policySnapshot(sourceThreadId)) {
+          return json(res, 409, { error: "Chief runtime-policy tools require an actively admitted turn" });
+        }
+        const targetId = String(body.targetBotId ?? "");
+        const target = store.bot(targetId);
+        if (!target) return json(res, 404, { error: "no such runtime-policy target" });
+        if (target.id === chief.id) {
+          return json(res, 403, { error: "Chief cannot change its own runtime policy through this tool" });
+        }
+        if (target.hidden) return json(res, 403, { error: "hidden bots cannot be managed by Chief runtime-policy tools" });
+        if (target.chiefOfStaff) return json(res, 403, { error: "Chief runtime-policy tools can target workers only" });
+        if (sectionKey(target.section) !== sectionKey(chief.section)) {
+          return json(res, 403, { error: "runtime-policy target belongs to a different section" });
+        }
+        const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+        if (!reason) return json(res, 400, { error: "reason is required for a persistent runtime-policy change" });
+        if (Buffer.byteLength(reason, "utf8") > 240) {
+          return json(res, 400, { error: "reason must be at most 240 UTF-8 bytes" });
+        }
+        let policyPatch: ReturnType<typeof validateRuntimePolicyPatch>;
+        try {
+          policyPatch = validateRuntimePolicyPatch(body.runtimePolicy);
+        } catch (error) {
+          return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+        if (policyPatch === undefined) return json(res, 400, { error: "runtimePolicy is required" });
+        const before = effectiveBotRuntimePolicy(target.runtimePolicy);
+        if (target.chiefRuntimePolicyLocked === true) {
+          const refusal = "target has Chief runtime policy control locked by the user";
+          store.recordRuntimePolicyAudit(target.id, {
+            actorBotId: chief.id,
+            actorThreadId: sourceThreadId,
+            change: "persistent-patch",
+            outcome: "refused",
+            reason: refusal,
+            provenance: "chief-of-staff-tool",
+          });
+          return json(res, 403, { error: refusal });
+        }
+        const changed = store.patchBotRuntimePolicy(target.id, policyPatch, {
+          actorBotId: chief.id,
+          actorThreadId: sourceThreadId,
+          change: "persistent-patch",
+          reason,
+          provenance: "chief-of-staff-tool",
+        });
+        if (!changed) return json(res, 404, { error: "no such runtime-policy target" });
+        return json(res, 200, {
+          targetBotId: target.id,
+          policy: effectiveBotRuntimePolicy(changed.bot.runtimePolicy),
+          nextAdmissionOnly: true,
+          activeTurnUnaffected: runtimeLimits.active(target.threadId),
+          audit: changed.audit,
+          previousPolicy: before,
+        });
       }
       if (method === "POST" && path === "/api/internal/ask-bot") {
         const body = await readBody(req);
@@ -3508,6 +3623,13 @@ const server = createServer(async (req, res) => {
         const toBotName = typeof body.toBotName === "string" ? body.toBotName.trim() : undefined;
         const message = String(body.message ?? "").trim();
         const reason = typeof body.reason === "string" && body.reason.trim() ? body.reason.trim() : undefined;
+        let runtimePolicyOverride: ReturnType<typeof validateRuntimePolicyPatch>;
+        try {
+          runtimePolicyOverride = validateRuntimePolicyPatch(body.runtimePolicyOverride);
+        } catch (error) {
+          return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+        if (runtimePolicyOverride === null) runtimePolicyOverride = undefined;
         const depth = Number(body.depth ?? 0) || 0;
         if (!toBotId || !message) return json(res, 400, { error: "toBotId and message required" });
         const requestedThreadId = String(body.fromThreadId ?? "");
@@ -3526,6 +3648,30 @@ const server = createServer(async (req, res) => {
         if (!store.taskByThread(from.id, fromThreadId)) {
           return json(res, 403, { error: "source thread does not belong to sender" });
         }
+        if (runtimePolicyOverride !== undefined && !from.chiefOfStaff) {
+          const refusal = "only a section Chief of Staff may set a task runtime policy override";
+          store.recordRuntimePolicyAudit(target.id, {
+            actorBotId: from.id,
+            actorThreadId: fromThreadId,
+            change: "task-override",
+            outcome: "refused",
+            reason: refusal,
+            provenance: "delegate-bot",
+          });
+          return json(res, 403, { error: refusal });
+        }
+        if (runtimePolicyOverride !== undefined && target.chiefRuntimePolicyLocked === true) {
+          const refusal = "target has Chief runtime policy control locked by the user";
+          store.recordRuntimePolicyAudit(target.id, {
+            actorBotId: from.id,
+            actorThreadId: fromThreadId,
+            change: "task-override",
+            outcome: "refused",
+            reason: refusal,
+            provenance: "delegate-bot",
+          });
+          return json(res, 403, { error: refusal });
+        }
         // Delegation limits belong to the admitted source turn. A stale or
         // forged proxy request must never create durable work after that
         // snapshot has settled.
@@ -3543,7 +3689,7 @@ const server = createServer(async (req, res) => {
         const result = queueDelegation(
           commsBus,
           from,
-          { toBotId, toRoutingKey: inferredRoutingKey, toBotName, message, reason, depth },
+          { toBotId, toRoutingKey: inferredRoutingKey, toBotName, message, reason, depth, ...(runtimePolicyOverride ? { runtimePolicyOverride } : {}) },
           MAX_COMMS_DEPTH,
           fromThreadId,
           {
@@ -3562,7 +3708,12 @@ const server = createServer(async (req, res) => {
             no_target: `target bot not found (id=${toBotId || "missing"}${inferredRoutingKey ? `, routing_key=${inferredRoutingKey}` : ""})`,
             too_many: "the source turn reached its delegation fan-out or queue cap — finish some first",
             invalid_handoff: "handoff was rejected by the compact seven-section validator; read the exact validation error and rebuild it instead of retrying unchanged",
-            conflict: "another delegated task already owns this worktree or file scope — serialize the handoffs",
+            invalid_runtime_policy: "runtimePolicyOverride was rejected by the server-owned runtime-policy validator",
+            runtime_policy_locked: "target has Chief runtime policy control locked by the user; delegate without a task override",
+            runtime_policy_chief_only: "only a section Chief of Staff may set a task runtime policy override",
+            conflict: parsedHandoff.ok && parsedHandoff.handoff.scope.accessMode === "read-only"
+              ? "read-only handoffs require different worktrees because read-only execution is not provider-enforced"
+              : "another delegated task already owns this worktree or file scope — serialize the handoffs",
             duplicate: "this target already received the same workflow stage with the same evidence — do not retry or rephrase it",
             loop_blocked: "this target already used the bounded retry for this workflow stage — stop automatic routing and report BLOCKED with the missing evidence or authority",
           };
@@ -4774,6 +4925,12 @@ const server = createServer(async (req, res) => {
       for (const key of ["modelSelection", "unread", "computer", "cloudBackend", "color", "mascotExpression", "pinned", "hidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
+      if (body.chiefRuntimePolicyLocked !== undefined) {
+        if (typeof body.chiefRuntimePolicyLocked !== "boolean") {
+          return json(res, 400, { error: "chiefRuntimePolicyLocked must be true or false" });
+        }
+        patch.chiefRuntimePolicyLocked = body.chiefRuntimePolicyLocked;
+      }
       Object.assign(patch, skillGrantPatch);
       if (runtimePolicyPatch !== undefined) {
         patch.runtimePolicy = mergeRuntimePolicy(existingBot?.runtimePolicy, runtimePolicyPatch);
@@ -4883,8 +5040,24 @@ const server = createServer(async (req, res) => {
         body.chiefOfStaff !== false &&
         section !== undefined &&
         sectionKey(existingBot?.section) !== sectionKey(section);
+      const previousChiefRuntimePolicyLocked = existingBot?.chiefRuntimePolicyLocked === true;
       const bot = store.patchBot(m[1], patch);
       if (!bot) return json(res, 404, { error: "no such bot" });
+      if (
+        body.chiefRuntimePolicyLocked !== undefined &&
+        body.chiefRuntimePolicyLocked !== previousChiefRuntimePolicyLocked
+      ) {
+        store.recordRuntimePolicyAudit(bot.id, {
+          actorBotId: "user",
+          actorThreadId: "settings",
+          change: "lock-change",
+          outcome: "applied",
+          reason: body.chiefRuntimePolicyLocked
+            ? "user locked Chief runtime policy control"
+            : "user unlocked Chief runtime policy control",
+          provenance: "human-settings",
+        });
+      }
       const chiefChanges =
         body.chiefOfStaff === true || chiefMovedSections
           ? store.setChiefOfStaff(bot.id)

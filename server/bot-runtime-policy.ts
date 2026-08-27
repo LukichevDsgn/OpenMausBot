@@ -4,6 +4,8 @@
  * wire shape is always the complete effective policy.
  */
 
+import { createHash } from "node:crypto";
+
 export type CumulativeTokenPolicyMode = "disabled" | "soft" | "hard";
 
 export interface CumulativeTokenPolicy {
@@ -300,4 +302,64 @@ export function effectiveBotRuntimePolicy(overrides?: RuntimePolicyOverrides): B
       limit: explicit.cumulativeTokenPolicy?.limit ?? defaults.cumulativeTokenPolicy.limit,
     },
   };
+}
+
+export interface RuntimePolicyAuditEntry {
+  id: string;
+  at: number;
+  targetBotId: string;
+  actorBotId: string;
+  actorThreadId: string;
+  change: "persistent-patch" | "task-override" | "lock-change";
+  outcome: "applied" | "refused";
+  reason: string;
+  provenance: "chief-of-staff-tool" | "delegate-bot" | "human-settings";
+  beforeFingerprint?: string;
+  afterFingerprint?: string;
+  overrideFingerprint?: string;
+}
+
+/** Effective policy for one task. Task overrides are applied after the bot's
+ * persisted defaults and never write back to that bot record. */
+export function effectiveTaskRuntimePolicy(
+  botOverrides: RuntimePolicyOverrides | undefined,
+  taskOverride: RuntimePolicyOverrides | undefined,
+): BotRuntimePolicy {
+  return effectiveBotRuntimePolicy(mergeRuntimePolicy(botOverrides, taskOverride));
+}
+
+/** Stable, secret-free evidence for an immutable admission snapshot. */
+export function runtimePolicyFingerprint(policy: BotRuntimePolicy): string {
+  const vector = [
+    policy.wallClockTimeoutMinutes,
+    policy.idleTimeoutMinutes,
+    policy.cancellationGraceSeconds,
+    policy.retryCap,
+    policy.maxToolAgentSteps,
+    policy.delegationConcurrency,
+    policy.freshSessionEnforcement,
+    policy.handoffByteCap,
+    policy.cumulativeTokenPolicy.mode,
+    policy.cumulativeTokenPolicy.limit,
+  ];
+  return createHash("sha256").update(JSON.stringify(vector), "utf8").digest("hex");
+}
+
+/** Stable evidence for the explicit task override, without retaining raw
+ * tool arguments in anti-loop identity or audit metadata. */
+export function runtimePolicyOverrideFingerprint(overrides?: RuntimePolicyOverrides): string | undefined {
+  if (!overrides) return undefined;
+  const vector = [
+    overrides.wallClockTimeoutMinutes,
+    overrides.idleTimeoutMinutes,
+    overrides.cancellationGraceSeconds,
+    overrides.retryCap,
+    overrides.maxToolAgentSteps,
+    overrides.delegationConcurrency,
+    overrides.freshSessionEnforcement,
+    overrides.handoffByteCap,
+    overrides.cumulativeTokenPolicy?.mode,
+    overrides.cumulativeTokenPolicy?.limit,
+  ];
+  return createHash("sha256").update(JSON.stringify(vector), "utf8").digest("hex");
 }

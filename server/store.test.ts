@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { DATA_DIR } from "./config.ts";
 import type { ModelSelection } from "./contracts.ts";
 import { peerAllowKey } from "./peer-approval-key.ts";
+import { effectiveBotRuntimePolicy } from "./bot-runtime-policy.ts";
 import { Store, type BotRecord } from "./store.ts";
 
 const selection = (): ModelSelection => ({ instanceId: "claude", model: "claude-sonnet-5" });
@@ -173,6 +174,58 @@ describe("Store", () => {
     expect(reloaded.bot(bot.id)?.runtimePolicy).toBeUndefined();
     const disk = JSON.parse(readFileSync(botsPath, "utf8")) as Array<Record<string, unknown>>;
     expect(disk.find((candidate) => candidate.id === bot.id)).not.toHaveProperty("turnBudgetMode");
+  });
+
+  it("persists the user-owned Chief lock and records policy audit without prompts", () => {
+    const store = new Store(selection);
+    const chief = store.createBot({ name: "Chief", section: "Work" });
+    const worker = store.createBot({ name: "Worker", section: "Work" });
+    store.setChiefOfStaff(chief.id);
+    expect(worker.chiefRuntimePolicyLocked).toBe(false);
+    store.patchBot(worker.id, { chiefRuntimePolicyLocked: true });
+    const audit = store.recordRuntimePolicyAudit(worker.id, {
+      actorBotId: chief.id,
+      actorThreadId: chief.threadId,
+      change: "persistent-patch",
+      outcome: "refused",
+      reason: "target has Chief runtime policy control locked by the user",
+      provenance: "chief-of-staff-tool",
+    });
+    expect(audit).toMatchObject({ targetBotId: worker.id, outcome: "refused" });
+    expect(JSON.stringify(audit)).not.toContain("prompt");
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(worker.id)?.chiefRuntimePolicyLocked).toBe(true);
+    expect(reloaded.bot(worker.id)?.runtimePolicyAudit).toHaveLength(1);
+  });
+
+  it("persists a task override and includes immutable policy evidence in its receipt", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.patchBot(bot.id, { runtimePolicy: { retryCap: 0 } });
+    const task = store.createTask(bot.id, "bounded", true, undefined, undefined, {
+      maxToolAgentSteps: 12,
+      cumulativeTokenPolicy: { mode: "soft", limit: 2_000 },
+    })!;
+    expect(store.taskByThread(bot.id, task.threadId)?.runtimePolicyOverride).toEqual({
+      maxToolAgentSteps: 12,
+      cumulativeTokenPolicy: { mode: "soft", limit: 2_000 },
+    });
+    store.recordTaskRuntimePolicy(bot.id, task.threadId, effectiveBotRuntimePolicy({
+      retryCap: 0,
+      maxToolAgentSteps: 12,
+      cumulativeTokenPolicy: { mode: "soft", limit: 2_000 },
+    }));
+    store.markTaskRunning(bot.id, task.threadId);
+    store.recordTaskOutcome(bot.id, task.threadId, { eventId: "bounded-done", state: "completed" });
+    expect(store.taskByThread(bot.id, task.threadId)?.lifecycle?.terminalReceipt).toMatchObject({
+      eventId: "bounded-done",
+      runtimePolicyFingerprint: expect.any(String),
+      runtimePolicyOverrideFingerprint: expect.any(String),
+    });
+    expect(new Store(selection).taskByThread(bot.id, task.threadId)?.runtimePolicyOverride).toEqual({
+      maxToolAgentSteps: 12,
+      cumulativeTokenPolicy: { mode: "soft", limit: 2_000 },
+    });
   });
 
   it("rotates colors across created bots", () => {

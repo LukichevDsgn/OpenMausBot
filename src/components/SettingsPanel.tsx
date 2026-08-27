@@ -1,6 +1,6 @@
-import { ChevronDown, ChevronLeft, Crown, FolderOpen, X } from "lucide-react";
+import { ChevronDown, ChevronLeft, Crown, FolderOpen, Lock, LockOpen, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import { api, runtimePolicySignature, useStore, type Bot, type RuntimePolicy } from "@/state/store";
+import { api, chiefRuntimePolicyLocked, runtimePolicySignature, useStore, type Bot, type RuntimePolicy } from "@/state/store";
 import { stateForBot } from "@/lib/mascot";
 import { CloudBackendPicker } from "./CloudBackendPicker";
 import { EffortPicker } from "./EffortPicker";
@@ -361,6 +361,8 @@ function RuntimeControlsCard({ bot }: { bot: Bot }) {
   const [draft, setDraft] = useState<RuntimePolicy>(() => copyRuntimePolicy(bot.runtimePolicy));
   const [status, setStatus] = useState<"clean" | "saving" | "saved" | "error">("clean");
   const [error, setError] = useState<string | null>(null);
+  const [chiefLockSaving, setChiefLockSaving] = useState(false);
+  const [chiefLockError, setChiefLockError] = useState<string | null>(null);
   const policySignature = runtimePolicySignature(bot.runtimePolicy);
 
   useEffect(() => {
@@ -442,6 +444,23 @@ function RuntimeControlsCard({ bot }: { bot: Bot }) {
 
   const dirty = !sameRuntimePolicy(base, draft);
   const saving = status === "saving";
+  const chiefLocked = chiefRuntimePolicyLocked(bot);
+
+  const toggleChiefControl = async () => {
+    setChiefLockSaving(true);
+    setChiefLockError(null);
+    try {
+      const result: { bot: Bot } = await api(`/api/bots/${bot.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ chiefRuntimePolicyLocked: !chiefLocked }),
+      });
+      dispatch({ type: "botPatched", bot: result.bot });
+    } catch (cause) {
+      setChiefLockError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setChiefLockSaving(false);
+    }
+  };
   type TokenMode = RuntimePolicy["cumulativeTokenPolicy"]["mode"];
   const tokenOptions: Array<PillDropdownOption<TokenMode>> = [
     { id: "disabled", label: "Disabled", value: "disabled" },
@@ -481,6 +500,39 @@ function RuntimeControlsCard({ bot }: { bot: Bot }) {
         <span className="rounded-full bg-inset px-2 py-1 text-[11.5px] text-ink-secondary">{tokenSummary}</span>
         {dirty && <span className="rounded-full bg-accent/10 px-2 py-1 text-[11.5px] text-accent">Unsaved</span>}
       </div>
+
+      <div className="mt-3 flex items-center gap-3 rounded-lg border border-hairline/40 bg-inset px-3 py-2.5">
+        <span className={cn(
+          "flex size-7 shrink-0 items-center justify-center rounded-md",
+          chiefLocked ? "bg-control text-ink-secondary" : "bg-accent/10 text-accent",
+        )}>
+          {chiefLocked ? <Lock size={14} aria-hidden="true" /> : <LockOpen size={14} aria-hidden="true" />}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="text-[13px] font-medium text-ink">Chief control</div>
+          <div className="text-[11.5px] leading-relaxed text-ink-secondary">
+            {chiefLocked ? "Locked · the Chief cannot adapt this bot's limits." : "Allowed · the Chief may adapt limits for future tasks."}
+          </div>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={!chiefLocked}
+          aria-label="Allow the Chief to adapt limits"
+          disabled={chiefLockSaving}
+          onClick={() => void toggleChiefControl()}
+          className={cn(
+            "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+            chiefLocked ? "bg-control" : "bg-accent",
+          )}
+        >
+          <span className={cn(
+            "absolute top-[3px] size-5 rounded-full bg-white transition-all",
+            chiefLocked ? "left-[3px]" : "left-[21px]",
+          )} />
+        </button>
+      </div>
+      {chiefLockError && <div className="mt-2 text-[12px] text-danger">{chiefLockError}</div>}
 
       {expanded && (
         <div className="mt-4 space-y-3">

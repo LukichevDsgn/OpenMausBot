@@ -20,6 +20,13 @@ import { getOrCreateChannel, mirrorExchange, type CommsBus } from "./comms-visib
 import { DATA_DIR } from "./config.ts";
 import { newId } from "./contracts.ts";
 import { parseHandoff, scopesConflict, type ParsedHandoff } from "./handoff.ts";
+import {
+  effectiveTaskRuntimePolicy,
+  runtimePolicyFingerprint,
+  runtimePolicyOverrideFingerprint,
+  validateRuntimePolicyPatch,
+  type RuntimePolicyOverrides,
+} from "./bot-runtime-policy.ts";
 import { requestPeerApproval, type ApprovalBus } from "./peer-approval.ts";
 import type { BotRecord, GroupRecord } from "./store.ts";
 
@@ -31,6 +38,9 @@ export interface DelegationItem {
   toBotName?: string;
   message: string;
   reason?: string;
+  /** Optional one-task policy. Only a Chief may set it, and a user lock can
+   * refuse it without blocking ordinary delegation. */
+  runtimePolicyOverride?: RuntimePolicyOverrides;
   /** The source bot's comms depth (0 for a user-initiated turn). The
    * delegated-to bot runs at `depth + 1`, which equals MAX_COMMS_DEPTH
    * (= 1) for a user turn — so the peer has no agents integration, and
@@ -59,7 +69,7 @@ export interface DelegationAdmission {
   releaseDelegation?: () => void;
 }
 
-export type QueueResult = "ok" | "no_target" | "self" | "too_deep" | "too_many" | "invalid_handoff" | "conflict" | "duplicate" | "loop_blocked";
+export type QueueResult = "ok" | "no_target" | "self" | "too_deep" | "too_many" | "invalid_handoff" | "invalid_runtime_policy" | "runtime_policy_locked" | "runtime_policy_chief_only" | "conflict" | "duplicate" | "loop_blocked";
 
 /** Per source-thread queue. Persisted to delegations.json on every change
  * and reloaded at boot: a handoff queued right before a restart runs after
@@ -87,7 +97,13 @@ function objectiveStage(objective: string): string {
     ?? objective;
 }
 
-function handoffControl(sourceBotId: string, targetBotId: string, handoff: ParsedHandoff) {
+function handoffControl(
+  sourceBotId: string,
+  targetBotId: string,
+  handoff: ParsedHandoff,
+  targetPolicy?: RuntimePolicyOverrides,
+  runtimePolicyOverride?: RuntimePolicyOverrides,
+) {
   const files = [...handoff.scope.allowedFiles].map(normalized).sort();
   const stageKey = digest([
     sourceBotId,
@@ -101,6 +117,10 @@ function handoffControl(sourceBotId: string, targetBotId: string, handoff: Parse
     normalized(handoff.scope.base),
     normalized(handoff.exactChanges),
     normalized(handoff.verification),
+    runtimePolicyOverrideFingerprint(runtimePolicyOverride) ?? "none",
+    targetPolicy
+      ? runtimePolicyFingerprint(effectiveTaskRuntimePolicy(targetPolicy, runtimePolicyOverride))
+      : "legacy-policy-unknown",
   ]);
   return { stageKey, evidenceKey, fingerprint: digest([stageKey, evidenceKey]) };
 }
@@ -131,10 +151,20 @@ export function _loadPending(): void {
         ) return [];
         const parsed = parseHandoff(item.message, typeof item.reason === "string" ? item.reason : undefined);
         if (!parsed.ok) return [];
+        let runtimePolicyOverride: RuntimePolicyOverrides | undefined;
+        if (item.runtimePolicyOverride !== undefined) {
+          try {
+            const validated = validateRuntimePolicyPatch(item.runtimePolicyOverride);
+            if (!validated || typeof validated !== "object") return [];
+            runtimePolicyOverride = validated;
+          } catch {
+            return [];
+          }
+        }
         if (loadedScopes.some((loaded) => scopesConflict(loaded.scope, parsed.handoff.scope))) return [];
         loadedScopes.push(parsed.handoff);
         const sourceBotId = typeof item.sourceBotId === "string" && item.sourceBotId ? item.sourceBotId : threadId;
-        const computed = handoffControl(sourceBotId, item.toBotId, parsed.handoff);
+        const computed = handoffControl(sourceBotId, item.toBotId, parsed.handoff, undefined, runtimePolicyOverride);
         return [{
           id: typeof item.id === "string" && item.id ? item.id : newId(),
           toBotId: item.toBotId,
@@ -142,6 +172,7 @@ export function _loadPending(): void {
           ...(typeof item.toBotName === "string" ? { toBotName: item.toBotName } : {}),
           message: item.message,
           ...(typeof item.reason === "string" ? { reason: item.reason } : {}),
+          ...(runtimePolicyOverride ? { runtimePolicyOverride } : {}),
           depth: Math.max(0, Math.trunc(item.depth!)),
           handoff: parsed.handoff,
           sourceBotId,
@@ -199,8 +230,20 @@ export function queueDelegation(
   if (!parsed.ok) return "invalid_handoff";
   const target = bus.store.resolveBotReference(item.toBotId, item.toRoutingKey, item.toBotName);
   if (!target) return "no_target";
+  let runtimePolicyOverride: RuntimePolicyOverrides | undefined;
+  if (item.runtimePolicyOverride !== undefined) {
+    try {
+      const validated = validateRuntimePolicyPatch(item.runtimePolicyOverride);
+      if (!validated || typeof validated !== "object") return "invalid_runtime_policy";
+      runtimePolicyOverride = validated;
+    } catch {
+      return "invalid_runtime_policy";
+    }
+    if (!from.chiefOfStaff) return "runtime_policy_chief_only";
+    if (target.chiefRuntimePolicyLocked === true) return "runtime_policy_locked";
+  }
   const list = pendingDelegations.get(sourceThreadId) ?? [];
-  const control = handoffControl(from.id, target.id, parsed.handoff);
+  const control = handoffControl(from.id, target.id, parsed.handoff, target.runtimePolicy, runtimePolicyOverride);
   const allPending = [...pendingDelegations.values()].flat();
   if (
     bus.store.hasHandoffFingerprint(target.id, control.fingerprint) ||
@@ -225,6 +268,7 @@ export function queueDelegation(
   try {
     list.push({
       ...item,
+      ...(runtimePolicyOverride ? { runtimePolicyOverride } : {}),
       id: newId(),
       handoff: parsed.handoff,
       sourceBotId: from.id,
@@ -365,6 +409,26 @@ async function processOne(
     });
     return;
   }
+  if (item.runtimePolicyOverride && (!sender.chiefOfStaff || target.chiefRuntimePolicyLocked === true)) {
+    const reason = target.chiefRuntimePolicyLocked === true
+      ? "target has Chief runtime policy control locked by the user"
+      : "only a section Chief of Staff may set a task runtime policy override";
+    bus.store.recordRuntimePolicyAudit(target.id, {
+      actorBotId: sender.id,
+      actorThreadId: sourceThreadId,
+      change: "task-override",
+      outcome: "refused",
+      reason,
+      provenance: "delegate-bot",
+      overrideFingerprint: runtimePolicyOverrideFingerprint(item.runtimePolicyOverride),
+    });
+    bus.store.appendMessage(sourceThreadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: `Delegation to @${target.name} canceled — ${reason}`, ok: false },
+    });
+    return;
+  }
   if (sender.approvePeerComms) {
     const verdict = await requestPeerApproval(
       approvalBus,
@@ -400,6 +464,26 @@ async function processOne(
     sender = currentSender;
     target = current;
   }
+  if (item.runtimePolicyOverride && (!sender.chiefOfStaff || target.chiefRuntimePolicyLocked === true)) {
+    const reason = target.chiefRuntimePolicyLocked === true
+      ? "target has Chief runtime policy control locked by the user"
+      : "only a section Chief of Staff may set a task runtime policy override";
+    bus.store.recordRuntimePolicyAudit(target.id, {
+      actorBotId: sender.id,
+      actorThreadId: sourceThreadId,
+      change: "task-override",
+      outcome: "refused",
+      reason,
+      provenance: "delegate-bot",
+      overrideFingerprint: runtimePolicyOverrideFingerprint(item.runtimePolicyOverride),
+    });
+    bus.store.appendMessage(sourceThreadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: `Delegation to @${target.name} canceled — ${reason}`, ok: false },
+    });
+    return;
+  }
   if (bus.store.hasActiveHandoffConflict(item.handoff.scope)) {
     bus.store.appendMessage(sourceThreadId, {
       role: "bot",
@@ -418,7 +502,7 @@ async function processOne(
     evidenceKey: item.evidenceKey,
     fingerprint: item.fingerprint,
     attempt: item.attempt,
-  });
+  }, item.runtimePolicyOverride);
   if (!task) {
     bus.store.appendMessage(sourceThreadId, {
       role: "bot",
@@ -438,6 +522,22 @@ async function processOne(
   // delegation had already been accepted into the queue.
   try {
     await runTarget(target.id, prefixed, item.depth + 1, sourceThreadId, channel, task.threadId);
+    if (item.runtimePolicyOverride) {
+      const admittedTask = bus.store.taskByThread(target.id, task.threadId);
+      const effectiveFingerprint = admittedTask?.runtimePolicyFingerprint ?? runtimePolicyFingerprint(
+        effectiveTaskRuntimePolicy(target.runtimePolicy, item.runtimePolicyOverride),
+      );
+      bus.store.recordRuntimePolicyAudit(target.id, {
+        actorBotId: sender.id,
+        actorThreadId: sourceThreadId,
+        change: "task-override",
+        outcome: "applied",
+        reason: "one-task Chief runtime policy override admitted",
+        provenance: "delegate-bot",
+        afterFingerprint: effectiveFingerprint,
+        overrideFingerprint: runtimePolicyOverrideFingerprint(item.runtimePolicyOverride),
+      });
+    }
   } catch (error) {
     // Dispatch failed before a provider turn could settle. This task has no
     // receipt and therefore cannot become durable replay evidence.

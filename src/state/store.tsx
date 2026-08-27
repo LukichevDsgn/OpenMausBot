@@ -247,6 +247,8 @@ export interface Bot {
   pinnedMessageId?: string;
   /** This sidebar section's primary coordinator. */
   chiefOfStaff?: boolean;
+  /** User-owned guard. Missing legacy data means Chief control is allowed. */
+  chiefRuntimePolicyLocked?: boolean;
   /** When this bot wants to talk to another bot (ask_bot/delegate_bot),
    * pause and ask the user first. Off by default. */
   approvePeerComms?: boolean;
@@ -262,6 +264,11 @@ export interface Bot {
   messages: Message[];
   /** leaf of the visible conversation branch (see visibleMessages) */
   activeLeafId?: string | null;
+}
+
+/** Legacy-safe UI interpretation of the user-owned Chief control guard. */
+export function chiefRuntimePolicyLocked(bot?: Pick<Bot, "chiefRuntimePolicyLocked">): boolean {
+  return bot?.chiefRuntimePolicyLocked === true;
 }
 
 /** The visible conversation: walk parentId links from the active leaf back

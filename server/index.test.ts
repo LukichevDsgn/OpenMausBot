@@ -2048,6 +2048,91 @@ describe("harness HTTP API", () => {
     }
   });
 
+  it("keeps Chief runtime authority scoped and proves the user lock blocks both paths", async () => {
+    const source = await api("POST", "/api/bots", {});
+    const target = await api("POST", "/api/bots", {});
+    const sourceId = source.body.bot.id;
+    const targetId = target.body.bot.id;
+    const sourceThreadId = source.body.bot.threadId;
+    const internal = async (method: string, path: string, body?: unknown) => {
+      const dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+      const token = dump.mcpConfig?.mcpServers?.agents?.env?.OMB_COMMS_TOKEN;
+      const response = await fetch(`${BASE}${path}`, {
+        method,
+        headers: {
+          authorization: `Bearer ${token}`,
+          ...(body ? { "content-type": "application/json" } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      return { status: response.status, body: await response.json() as any };
+    };
+    try {
+      expect((await api("PATCH", `/api/bots/${sourceId}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+        chiefOfStaff: true,
+      })).status).toBe(200);
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/bots/${sourceId}/messages`, { text: "hold chief authority turn" })).status).toBe(202);
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+      await expect.poll(async () => (await api("GET", "/api/bots")).body.bots.find((bot: { id: string }) => bot.id === sourceId)?.busy, { timeout: 5_000 }).toBe(true);
+
+      const inspected = await internal("GET", `/api/internal/runtime-policy?fromBotId=${sourceId}&fromThreadId=${sourceThreadId}`);
+      expect(inspected.status).toBe(200);
+      expect(inspected.body.workers.find((worker: { id: string }) => worker.id === targetId)).toMatchObject({
+        chiefRuntimePolicyLocked: false,
+        runtimePolicy: { retryCap: 1 },
+      });
+
+      const patched = await internal("PATCH", "/api/internal/runtime-policy", {
+        fromBotId: sourceId,
+        fromThreadId: sourceThreadId,
+        targetBotId: targetId,
+        runtimePolicy: { maxToolAgentSteps: 12 },
+        reason: "test matrix now needs a bounded tool-step allowance",
+      });
+      expect(patched).toMatchObject({ status: 200, body: { nextAdmissionOnly: true, activeTurnUnaffected: false } });
+      expect(patched.body.audit).toMatchObject({ outcome: "applied", provenance: "chief-of-staff-tool" });
+
+      expect((await api("PATCH", `/api/bots/${targetId}`, { chiefRuntimePolicyLocked: true })).body.bot.chiefRuntimePolicyLocked).toBe(true);
+      const deniedPatch = await internal("PATCH", "/api/internal/runtime-policy", {
+        fromBotId: sourceId,
+        fromThreadId: sourceThreadId,
+        targetBotId: targetId,
+        runtimePolicy: { maxToolAgentSteps: 24 },
+        reason: "attempt after user lock",
+      });
+      expect(deniedPatch).toMatchObject({ status: 403, body: { error: "target has Chief runtime policy control locked by the user" } });
+
+      const deniedOverride = await internal("POST", "/api/internal/delegate-bot", {
+        fromBotId: sourceId,
+        fromThreadId: sourceThreadId,
+        toBotId: targetId,
+        message: testHandoff("locked task override", "D:/work/locked-task-override", "server/locked-task.ts"),
+        runtimePolicyOverride: { maxToolAgentSteps: 24 },
+        depth: 0,
+      });
+      expect(deniedOverride).toMatchObject({ status: 403, body: { error: "target has Chief runtime policy control locked by the user" } });
+      const saved = JSON.parse(readFileSync(join(home, ".openmausbot", "bots.json"), "utf8"));
+      const audits = saved.find((bot: { id: string }) => bot.id === targetId)?.runtimePolicyAudit ?? [];
+      expect(audits).toEqual(expect.arrayContaining([
+        expect.objectContaining({ change: "persistent-patch", outcome: "applied" }),
+        expect.objectContaining({ change: "lock-change", outcome: "applied", provenance: "human-settings" }),
+        expect.objectContaining({ change: "persistent-patch", outcome: "refused", reason: "target has Chief runtime policy control locked by the user" }),
+        expect.objectContaining({ change: "task-override", outcome: "refused", reason: "target has Chief runtime policy control locked by the user" }),
+      ]));
+      expect(JSON.stringify(audits)).not.toContain("hold chief authority turn");
+    } finally {
+      const state = (await api("GET", "/api/bots")).body;
+      if (state.bots.find((bot: { id: string }) => bot.id === sourceId)?.busy) {
+        await api("POST", `/api/bots/${sourceId}/interrupt`);
+        await expect.poll(async () => (await api("GET", "/api/bots")).body.bots.find((bot: { id: string }) => bot.id === sourceId)?.busy, { timeout: 8_000 }).toBe(false);
+      }
+      await api("DELETE", `/api/bots/${targetId}`);
+      await api("DELETE", `/api/bots/${sourceId}`);
+    }
+  });
+
   it("keeps live delegation enforcement on the captured snapshot after an HTTP PATCH", async () => {
     const source = await api("POST", "/api/bots", {});
     const target = await api("POST", "/api/bots", {});

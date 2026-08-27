@@ -14,6 +14,7 @@ describe("delegation handoff contract", () => {
         base: "main",
         worktree: "D:/Codex/OpenMausBot-custom",
         allowedFiles: ["server/index.ts"],
+        accessMode: "writer",
       });
     }
   });
@@ -60,5 +61,22 @@ describe("delegation handoff contract", () => {
     expect(first.ok && sameWorktree.ok && scopesConflict(first.handoff.scope, sameWorktree.handoff.scope)).toBe(true);
     expect(first.ok && sameFile.ok && scopesConflict(first.handoff.scope, sameFile.handoff.scope)).toBe(true);
     expect(first.ok && disjoint.ok && scopesConflict(first.handoff.scope, disjoint.handoff.scope)).toBe(false);
+  });
+
+  it("parses explicit access modes and keeps read-only isolation conservative", () => {
+    const reader = parseHandoff(valid("D:/work/reader-a", "server/shared.ts").replace("Worktree: D:/work/reader-a", "Worktree: D:/work/reader-a\nAccess mode: read-only"));
+    const secondReader = parseHandoff(valid("D:/work/reader-a", "server/other.ts").replace("Worktree: D:/work/reader-a", "Worktree: D:/work/reader-a\nAccess mode: read-only"));
+    const isolatedReader = parseHandoff(valid("D:/work/reader-b", "server/shared.ts").replace("Worktree: D:/work/reader-b", "Worktree: D:/work/reader-b\nAccess mode: read-only"));
+    const writer = parseHandoff(valid("D:/work/writer", "server/shared.ts"));
+    expect(reader.ok && reader.handoff.scope.accessMode).toBe("read-only");
+    expect(reader.ok && secondReader.ok && scopesConflict(reader.handoff.scope, secondReader.handoff.scope)).toBe(true);
+    expect(reader.ok && isolatedReader.ok && scopesConflict(reader.handoff.scope, isolatedReader.handoff.scope)).toBe(false);
+    expect(reader.ok && writer.ok && scopesConflict(reader.handoff.scope, writer.handoff.scope)).toBe(false);
+  });
+
+  it("rejects an invalid explicit access mode instead of silently treating it as writer", () => {
+    const invalid = parseHandoff(valid().replace("Worktree: D:/Codex/OpenMausBot-custom", "Worktree: D:/Codex/OpenMausBot-custom\nAccess mode: writable"));
+    expect(invalid.ok).toBe(false);
+    if (!invalid.ok) expect(invalid.error).toContain("exact file list");
   });
 });

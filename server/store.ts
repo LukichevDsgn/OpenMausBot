@@ -13,7 +13,17 @@ import { workspaceDir } from "./workspace.ts";
 import { newId, type CloudBackend, type ModelSelection, type ThreadId } from "./contracts.ts";
 import { pickBotName } from "./names.ts";
 import { redactSecretsInText } from "./redact.ts";
-import type { RuntimePolicyOverrides } from "./bot-runtime-policy.ts";
+import {
+  effectiveBotRuntimePolicy,
+  runtimePolicyFingerprint,
+  runtimePolicyOverrideFingerprint,
+  type BotRuntimePolicy,
+  type RuntimePolicyAuditEntry,
+  type RuntimePolicyOverrides,
+  type RuntimePolicyPatch,
+  mergeRuntimePolicy,
+} from "./bot-runtime-policy.ts";
+import { scopeConflictReason } from "./handoff.ts";
 import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
 
 export type MausColor =
@@ -207,6 +217,7 @@ export interface TaskRecord {
     base: string;
     worktree: string;
     allowedFiles: string[];
+    accessMode?: "read-only" | "writer";
   };
   /** Durable anti-loop identity for a delegated workflow stage. The full
    * handoff is deliberately not stored here: only bounded hashes and the
@@ -222,6 +233,11 @@ export interface TaskRecord {
      * survive a restart. Only a real turn.completed makes it `settled`. */
     state?: "active" | "settled" | "interrupted";
   };
+  /** Optional one-task policy, applied after the bot defaults at admission. */
+  runtimePolicyOverride?: RuntimePolicyOverrides;
+  /** Secret-free evidence of the policy snapshot used by this task's turn. */
+  runtimePolicyFingerprint?: string;
+  runtimePolicyOverrideFingerprint?: string;
   /** Durable lifecycle of the task's most recent provider turn. `unknown`
    * means the process restarted before it could observe a terminal event;
    * it is never silently converted into success. */
@@ -235,6 +251,8 @@ export interface TaskTerminalReceipt {
   state: Exclude<TaskLifecycleState, "pending" | "running">;
   recordedAt: number;
   reason?: string;
+  runtimePolicyFingerprint?: string;
+  runtimePolicyOverrideFingerprint?: string;
 }
 
 export interface TaskLifecycle {
@@ -382,6 +400,8 @@ export interface BotRecord {
   /** The coordinator for this bot's sidebar section. The store enforces
    * at most one Chief per section (including the unsectioned area). */
   chiefOfStaff?: boolean;
+  /** User-owned guard. Absent legacy data means Chief management is allowed. */
+  chiefRuntimePolicyLocked?: boolean;
   /** Pause for human approval before this bot talks to a peer (ask_bot,
    * delegate_bot). Off by default: a chief-of-staff-style bot is most
    * useful when it can coordinate without nagging. */
@@ -401,6 +421,8 @@ export interface BotRecord {
   /** Explicit per-bot runtime controls. The server fills effective defaults
    * on the wire; bots.json keeps only fields the user supplied. */
   runtimePolicy?: RuntimePolicyOverrides;
+  /** Bounded, prompt-free policy change audit for Chief tools. */
+  runtimePolicyAudit?: RuntimePolicyAuditEntry[];
   /** Public, package-authored playbooks installed for this bot. They carry
    * process guidance only—never executable code, credentials, or grants. */
   playbooks?: InstalledPlaybook[];
@@ -587,6 +609,10 @@ export class Store {
     let groupsMigrated = false;
     for (const b of this.bots) {
       for (const task of b.tasks ?? []) {
+        if (task.handoffScope && task.handoffScope.accessMode !== "read-only" && task.handoffScope.accessMode !== "writer") {
+          task.handoffScope.accessMode = "writer";
+          botsMigrated = true;
+        }
         const control = task.handoffControl;
         const inferred = (task.usage?.turns ?? 0) > 0 ? "settled" : "interrupted";
         if (control?.state === "active" || task.lifecycle?.state === "running") {
@@ -612,6 +638,10 @@ export class Store {
       if (b.busy || (b.activity !== undefined && b.activity !== "idle")) botsMigrated = true;
       b.busy = false;
       b.activity = "idle";
+      if (b.chiefRuntimePolicyLocked !== true && b.chiefRuntimePolicyLocked !== false) {
+        b.chiefRuntimePolicyLocked = false;
+        botsMigrated = true;
+      }
       // Builds from 2026-08-23 briefly persisted a per-role turn budget.
       // Hard token/tool-call stops were removed for every role, so discard
       // the obsolete flag instead of exposing a control that no longer acts.
@@ -1019,6 +1049,7 @@ export class Store {
       ...(profile.mascotExpression ? { mascotExpression: profile.mascotExpression } : {}),
       unread: false,
       modelSelection: profile.modelSelection ?? this.defaultSelection(),
+      chiefRuntimePolicyLocked: false,
       resumeCursors: {},
       createdAt: Date.now(),
     };
@@ -1242,6 +1273,7 @@ export class Store {
     activate = true,
     handoffScope?: TaskRecord["handoffScope"],
     handoffControl?: TaskRecord["handoffControl"],
+    runtimePolicyOverride?: RuntimePolicyOverrides,
   ): TaskRecord | null {
     const bot = this.bot(botId);
     if (!bot) return null;
@@ -1252,6 +1284,7 @@ export class Store {
       resumeCursors: {},
       ...(handoffScope ? { handoffScope } : {}),
       ...(handoffControl ? { handoffControl: { ...handoffControl, state: "active" as const } } : {}),
+      ...(runtimePolicyOverride ? { runtimePolicyOverride: structuredClone(runtimePolicyOverride) } : {}),
       lifecycle: { state: "pending" },
     };
     bot.tasks = [task, ...(bot.tasks ?? [])];
@@ -1262,6 +1295,64 @@ export class Store {
     this.saveBots();
     this.emit({ type: "bot", botId });
     return task;
+  }
+
+  /** Persist the secret-free policy evidence captured at this task's turn
+   * admission. The runtime limiter remains the immutable in-memory owner. */
+  recordTaskRuntimePolicy(botId: string, threadId: string, policy: BotRuntimePolicy): TaskRecord | null {
+    const task = this.taskByThread(botId, threadId);
+    if (!task) return null;
+    task.runtimePolicyFingerprint = runtimePolicyFingerprint(policy);
+    task.runtimePolicyOverrideFingerprint = runtimePolicyOverrideFingerprint(task.runtimePolicyOverride);
+    this.saveBots();
+    this.emit({ type: "bot", botId });
+    return task;
+  }
+
+  /** Append a bounded policy audit entry without storing prompts or secrets. */
+  recordRuntimePolicyAudit(
+    targetBotId: string,
+    entry: Omit<RuntimePolicyAuditEntry, "id" | "at" | "targetBotId">,
+  ): RuntimePolicyAuditEntry | null {
+    const bot = this.bot(targetBotId);
+    if (!bot) return null;
+    const audit: RuntimePolicyAuditEntry = {
+      ...entry,
+      id: newId(),
+      at: Date.now(),
+      targetBotId,
+    };
+    bot.runtimePolicyAudit = [...(bot.runtimePolicyAudit ?? []), audit].slice(-100);
+    this.saveBots();
+    this.emit({ type: "bot", botId: targetBotId });
+    return audit;
+  }
+
+  /** Apply a validated persistent patch and its audit as one store mutation. */
+  patchBotRuntimePolicy(
+    targetBotId: string,
+    patch: RuntimePolicyPatch,
+    context: Omit<RuntimePolicyAuditEntry, "id" | "at" | "targetBotId" | "outcome" | "beforeFingerprint" | "afterFingerprint">,
+  ): { bot: BotRecord; audit: RuntimePolicyAuditEntry } | null {
+    const bot = this.bot(targetBotId);
+    if (!bot) return null;
+    const beforeFingerprint = runtimePolicyFingerprint(effectiveBotRuntimePolicy(bot.runtimePolicy));
+    const next = mergeRuntimePolicy(bot.runtimePolicy, patch);
+    bot.runtimePolicy = next;
+    const afterFingerprint = runtimePolicyFingerprint(effectiveBotRuntimePolicy(next));
+    const audit: RuntimePolicyAuditEntry = {
+      ...context,
+      id: newId(),
+      at: Date.now(),
+      targetBotId,
+      outcome: "applied",
+      beforeFingerprint,
+      afterFingerprint,
+    };
+    bot.runtimePolicyAudit = [...(bot.runtimePolicyAudit ?? []), audit].slice(-100);
+    this.saveBots();
+    this.emit({ type: "bot", botId: targetBotId });
+    return { bot, audit };
   }
 
   /** Persist the point at which a provider turn is actually admitted. */
@@ -1293,6 +1384,8 @@ export class Store {
       terminalReceipt: {
         ...receipt,
         recordedAt: receipt.recordedAt ?? Date.now(),
+        ...(task.runtimePolicyFingerprint ? { runtimePolicyFingerprint: task.runtimePolicyFingerprint } : {}),
+        ...(task.runtimePolicyOverrideFingerprint ? { runtimePolicyOverrideFingerprint: task.runtimePolicyOverrideFingerprint } : {}),
       },
     };
     if (task.handoffControl) task.handoffControl.state = "settled";
@@ -1348,17 +1441,17 @@ export class Store {
   }
 
   /** True when another delegated task is currently running in the same
-   * worktree or owns one of the exact files in the proposed scope. */
+  * worktree or owns one of the exact files in the proposed scope. */
   hasActiveHandoffConflict(scope: NonNullable<TaskRecord["handoffScope"]>): boolean {
-    const normalize = (value: string) => value.trim().replaceAll("\\", "/").replace(/\/+$/u, "").toLocaleLowerCase();
-    const files = new Set(scope.allowedFiles.map(normalize));
     return this.bots.some((bot) => {
       if (!bot.busy) return false;
       return (bot.tasks ?? []).some((task) => {
         const active = task.handoffScope;
         if (!active || task.threadId !== bot.threadId) return false;
-        if (normalize(active.worktree) === normalize(scope.worktree)) return true;
-        return active.allowedFiles.some((file) => files.has(normalize(file)));
+        return Boolean(scopeConflictReason(
+          { ...active, accessMode: active.accessMode ?? "writer" },
+          { ...scope, accessMode: scope.accessMode ?? "writer" },
+        ));
       });
     });
   }

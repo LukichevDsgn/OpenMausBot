@@ -5,6 +5,9 @@ import {
   defaultBotRuntimePolicy,
   effectiveBotRuntimePolicy,
   mergeRuntimePolicy,
+  effectiveTaskRuntimePolicy,
+  runtimePolicyFingerprint,
+  runtimePolicyOverrideFingerprint,
   runtimePolicyTiming,
   validateRuntimePolicyPatch,
 } from "./bot-runtime-policy.ts";
@@ -96,5 +99,16 @@ describe("bot runtime policy", () => {
       idleMs: 120_000,
       graceMs: 3_000,
     });
+  });
+
+  it("merges a task override after bot defaults and creates stable evidence", () => {
+    const botDefaults = { retryCap: 0, idleTimeoutMinutes: 30, maxToolAgentSteps: 10 };
+    const override = { idleTimeoutMinutes: 5, cumulativeTokenPolicy: { mode: "soft" as const, limit: 2_000 } };
+    const effective = effectiveTaskRuntimePolicy(botDefaults, override);
+    expect(effective).toMatchObject({ retryCap: 0, idleTimeoutMinutes: 5, maxToolAgentSteps: 10 });
+    expect(effective.cumulativeTokenPolicy).toEqual({ mode: "soft", limit: 2_000 });
+    expect(runtimePolicyFingerprint(effective)).toBe(runtimePolicyFingerprint(structuredClone(effective)));
+    expect(runtimePolicyOverrideFingerprint(override)).toBe(runtimePolicyOverrideFingerprint(structuredClone(override)));
+    expect(runtimePolicyOverrideFingerprint(override)).not.toBe(runtimePolicyOverrideFingerprint({ ...override, idleTimeoutMinutes: 6 }));
   });
 });

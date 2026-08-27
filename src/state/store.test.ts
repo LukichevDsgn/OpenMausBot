@@ -8,6 +8,7 @@ import {
   type Bot,
   type Message,
   runtimePolicySignature,
+  chiefRuntimePolicyLocked,
   type RuntimePolicy,
 } from "./store";
 
@@ -107,6 +108,42 @@ describe("runtime policy synchronization signature", () => {
     for (const changed of changedPolicies) {
       expect(runtimePolicySignature(changed)).not.toBe(runtimePolicySignature(policy));
     }
+  });
+});
+
+describe("Chief runtime policy lock", () => {
+  it("keeps legacy bots allowed and preserves an explicit lock in state", () => {
+    expect(chiefRuntimePolicyLocked({})).toBe(false);
+    expect(chiefRuntimePolicyLocked({ chiefRuntimePolicyLocked: false })).toBe(false);
+    expect(chiefRuntimePolicyLocked({ chiefRuntimePolicyLocked: true })).toBe(true);
+  });
+
+  it("folds the authoritative lock without changing the runtime policy", () => {
+    const bot = {
+      id: "worker",
+      threadId: "thread-worker",
+      name: "Worker",
+      title: "",
+      description: "",
+      notifications: true,
+      color: "green" as const,
+      unread: false,
+      modelSelection: { instanceId: "claude", model: "default" },
+      runtimePolicy: {
+        wallClockTimeoutMinutes: 0,
+        idleTimeoutMinutes: 20,
+        cancellationGraceSeconds: 5,
+        retryCap: 1,
+        maxToolAgentSteps: 0,
+        delegationConcurrency: 4,
+        freshSessionEnforcement: false,
+        handoffByteCap: 12_000,
+        cumulativeTokenPolicy: { mode: "disabled" as const, limit: 1_000_000 },
+      },
+      messages: [],
+    };
+    const next = reducer(initialState, { type: "botPatched", bot: { ...bot, chiefRuntimePolicyLocked: true } });
+    expect(next.bots[0]).toMatchObject({ chiefRuntimePolicyLocked: true, runtimePolicy: bot.runtimePolicy });
   });
 });
 

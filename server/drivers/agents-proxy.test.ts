@@ -198,6 +198,7 @@ describe("agents-proxy MCP surface", () => {
       bot_name: "Helper",
       message: "take this",
       reason: "follow-up",
+      runtimePolicyOverride: { maxToolAgentSteps: 12 },
     });
     expect(res.result.content[0].text).toContain("Delegation queued");
     expect(lastDelegateBody).toMatchObject({
@@ -208,6 +209,7 @@ describe("agents-proxy MCP surface", () => {
       toBotName: "Helper",
       message: "take this",
       reason: "follow-up",
+      runtimePolicyOverride: { maxToolAgentSteps: 12 },
       depth: 0,
     });
   });

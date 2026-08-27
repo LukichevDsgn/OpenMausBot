@@ -345,6 +345,100 @@ describe("queueDelegation", () => {
     }, 1, from.threadId, admission)).toBe("ok");
   });
 
+  it("stores a Chief task override and allows one evidence-changing policy retry only", async () => {
+    store.setChiefOfStaff(from.id);
+    const sendAndSettle = async (steps: number) => {
+      const result = queueDelegation(commsBus, from, {
+        toBotId: target.id,
+        message: handoff("ARCH-11A-R1 runtime correction", "D:/work/runtime-correction", "server/runtime.ts", `steps-${steps}`),
+        runtimePolicyOverride: { maxToolAgentSteps: steps },
+        depth: 0,
+      }, 1, from.threadId, { retryCap: 1, handoffByteCap: 12_000 });
+      if (result === "ok") {
+        drainDelegations(commsBus, approvalBus, from.threadId, async () => {});
+        await waitFor(() => _pendingCount(from.threadId) === 0);
+        const task = store.activeTask(target.id)!;
+        expect(task.runtimePolicyOverride).toEqual({ maxToolAgentSteps: steps });
+        expect(store.bot(target.id)?.runtimePolicyAudit?.at(-1)).toMatchObject({
+          change: "task-override",
+          outcome: "applied",
+          provenance: "delegate-bot",
+          afterFingerprint: expect.any(String),
+          overrideFingerprint: expect.any(String),
+        });
+        store.markTaskRunning(target.id, task.threadId);
+        store.recordTaskOutcome(target.id, task.threadId, { eventId: `runtime-${steps}`, state: "failed", reason: "runtime limit" });
+      }
+      return result;
+    };
+
+    expect(await sendAndSettle(12)).toBe("ok");
+    expect(await sendAndSettle(24)).toBe("ok");
+    expect(await sendAndSettle(48)).toBe("loop_blocked");
+  });
+
+  it("does not audit an applied override when target dispatch fails", async () => {
+    store.setChiefOfStaff(from.id);
+    expect(queueDelegation(commsBus, from, {
+      toBotId: target.id,
+      message: handoff("ARCH-11A-R1 failed dispatch override", "D:/work/failed-dispatch", "server/failed.ts"),
+      runtimePolicyOverride: { maxToolAgentSteps: 12 },
+      depth: 0,
+    }, 1, from.threadId, { retryCap: 1, handoffByteCap: 12_000 })).toBe("ok");
+    drainDelegations(commsBus, approvalBus, from.threadId, async () => {
+      throw new Error("provider dispatch rejected");
+    });
+    await waitFor(() => _pendingCount(from.threadId) === 0);
+    expect(Boolean(store.bot(target.id)?.runtimePolicyAudit?.some((audit) =>
+      audit.change === "task-override" && audit.outcome === "applied",
+    ))).toBe(false);
+  });
+
+  it("keys the same handoff to the effective target policy for one persistent correction", async () => {
+    const message = handoff("ARCH-11A-R1 persistent runtime correction", "D:/work/persistent-runtime", "server/persistent.ts", "same evidence");
+    const sendAndSettle = async () => {
+      const result = queueDelegation(commsBus, from, { toBotId: target.id, message, depth: 0 }, 1, from.threadId, {
+        retryCap: 1,
+        handoffByteCap: 12_000,
+      });
+      if (result === "ok") {
+        drainDelegations(commsBus, approvalBus, from.threadId, async () => {});
+        await waitFor(() => _pendingCount(from.threadId) === 0);
+        const task = store.activeTask(target.id)!;
+        store.markTaskRunning(target.id, task.threadId);
+        store.recordTaskOutcome(target.id, task.threadId, { eventId: `persistent-${store.tasks(target.id).length}`, state: "completed" });
+        store.setHandoffTaskState(target.id, task.threadId, "settled");
+      }
+      return result;
+    };
+
+    expect(await sendAndSettle()).toBe("ok");
+    const first = store.activeTask(target.id)!;
+    expect(await sendAndSettle()).toBe("duplicate");
+
+    store.patchBot(target.id, { runtimePolicy: { maxToolAgentSteps: 12 } });
+    expect(await sendAndSettle()).toBe("ok");
+    const second = store.activeTask(target.id)!;
+    expect(second.handoffControl?.stageKey).toBe(first.handoffControl?.stageKey);
+    expect(second.handoffControl?.evidenceKey).not.toBe(first.handoffControl?.evidenceKey);
+    expect(second.handoffControl?.fingerprint).not.toBe(first.handoffControl?.fingerprint);
+
+    store.patchBot(target.id, { runtimePolicy: { maxToolAgentSteps: 24 } });
+    expect(await sendAndSettle()).toBe("loop_blocked");
+  });
+
+  it("refuses a task override when the user-owned Chief lock is enabled", () => {
+    store.setChiefOfStaff(from.id);
+    store.patchBot(target.id, { chiefRuntimePolicyLocked: true });
+    expect(queueDelegation(commsBus, from, {
+      toBotId: target.id,
+      message: handoff("locked override", "D:/work/locked-override", "server/locked.ts"),
+      runtimePolicyOverride: { maxToolAgentSteps: 12 },
+      depth: 0,
+    }, 1, from.threadId, { retryCap: 1, handoffByteCap: 12_000 })).toBe("runtime_policy_locked");
+    expect(_pendingCount(from.threadId)).toBe(0);
+  });
+
   it("allows N successful queues from one admission and rejects N+1", () => {
     let queued = 0;
     const admission = {

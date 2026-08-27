@@ -921,3 +921,58 @@ for `resources/app.asar`, and
 for `resources/server/index.js`. The annotated `custom-v23` tag remains on the
 previous accepted `beee3148` baseline; the integration branch advances by this
 renderer-only UI patch without creating a new version or tag.
+
+## 2026-08-28: safe swarm access and adaptive Runtime Policy implementation
+
+The current source slice adds durable handoff access modes. `read-only` is an
+explicit coordination label, not a sandbox claim: because the provider-neutral
+substrate cannot prevent writes, readers sharing a worktree are refused and
+parallel read-only work requires separate worktrees. Isolated reader/reader or
+reader/writer overlap of logical files is permitted; writer/writer overlap and
+same-worktree overlap remain server-guarded. Legacy handoffs remain writers.
+
+Runtime Policy authority is server-owned. A visible section Chief may inspect
+effective policies, user locks, and the bounded audit for visible workers in
+its section, and may persist a validated PATCH for a future admission with a
+non-sensitive reason. The Chief cannot target itself, another Chief, hidden or
+cross-section bots; only Chief turns that are currently admitted may use these
+tools. Persistent changes do not mutate an admitted snapshot.
+
+Bot records now carry the user-owned `chiefRuntimePolicyLocked` boolean.
+Legacy/missing values default to allowed and persist as `false`. Human bot
+PATCH and the compact Runtime Controls row can toggle it with Lucide
+Lock/LockOpen state. Chief persistent PATCH and Chief task override both fail
+closed for a locked target with the exact reason
+`target has Chief runtime policy control locked by the user`; each attempt is
+visible through the persisted, prompt-free target audit. The user lock/unlock
+action writes its own `lock-change` audit, and no Chief tool can change the
+lock itself.
+
+Delegated tasks accept an optional validator-owned `runtimePolicyOverride`.
+It is permitted only from a section Chief, is stored with the task and queue,
+revalidated during restart/drain and before execution, and merges after the
+target bot defaults for that one admission. Effective policy and override
+fingerprints are recorded in the task receipt. Changing override evidence can
+support one bounded corrective retry after a precise runtime-limit failure;
+the immutable stage key and absolute retry cap still prevent cycling.
+
+Focused fake/local verification for the implementation is green: 9 suites,
+250 passed tests, 1 skipped. `tsconfig.server.json` and the full client/server
+TypeScript no-emit checks passed. No build, runtime process, release, tag, or
+credential operation was performed for this slice.
+
+### Correction: effective-policy fingerprint in handoff evidence
+
+`handoffControl` now fingerprints the target effective runtime policy after
+merging bot defaults with a task override and places that fingerprint only in
+`evidenceKey`. `stageKey` remains the same. The resulting evidence identity is
+stored in the pending queue item and task control; restart preserves it, while
+legacy pending data remains accepted with its existing identity or a
+conservative legacy fallback when metadata is missing.
+
+Focused regression coverage proves: same stage and same effective policy
+remain `duplicate`; one material persistent policy change permits exactly one
+same-handoff correction; a further policy change receives `loop_blocked`.
+Successful task overrides persist an applied, prompt-free audit containing
+effective and override fingerprints. No applied audit is written when
+approval, task creation, or target dispatch fails.

@@ -1,12 +1,13 @@
 // Agent-to-agent comms MCP proxy — spawned as an MCP server inside a bot's
-// agent process (via the "agents" integration). Exposes five tools that
+// agent process (via the "agents" integration). Exposes the base coordination
+// tools plus two Chief-only runtime-policy tools that
 // let one bot talk to another, routed back through the harness so the
 // harness stays the single owner of turns, permissions, and recursion
 // limits:
 //
 //   list_bots()                          → the other bots in this section + their status
 //   ask_bot(bot_id, msg)                 → send msg to that bot, wait, return its reply
-//   delegate_bot(bot_id, msg, reason?)   → hand the task to a peer ASYNC: returns
+//   delegate_bot(bot_id, msg, reason?, runtimePolicyOverride?) → hand the task to a peer ASYNC
 //                                          immediately, the peer runs after your
 //                                          current turn finishes, the user sees
 //                                          the peer's reply as its own turn
@@ -44,6 +45,7 @@ function boundedEnvInteger(name: string, min: number, max: number, fallback: num
 const RETRY_CAP = boundedEnvInteger("OMB_RETRY_CAP", 0, 1, 1);
 const DELEGATION_CONCURRENCY = boundedEnvInteger("OMB_DELEGATION_CONCURRENCY", 1, 4, 4);
 const HANDOFF_BYTE_CAP = boundedEnvInteger("OMB_HANDOFF_BYTE_CAP", 1_024, 12_000, 12_000);
+const IS_CHIEF_OF_STAFF = process.env.OMB_CHIEF_OF_STAFF === "1";
 const RETRY_GUIDANCE = RETRY_CAP === 0
   ? "No automatic evidence-changing retry is available."
   : `Up to ${RETRY_CAP} evidence-changing automatic retry is available.`;
@@ -52,7 +54,7 @@ const TOOLS = [
   {
     name: "list_bots",
     description:
-      "List the other bots (agents) in your OpenMausBot section you can message, with their model and whether they're busy. Call this before ask_bot to discover who's available.",
+      "List the other visible bots in your OpenMausBot section with their model and busy state. When you are Chief of Staff, this also includes effective runtime policy and whether the user locked Chief control. Call this before coordinating.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -73,7 +75,7 @@ const TOOLS = [
   {
     name: "delegate_bot",
     description:
-      `Hand one long-running stage to an existing bot in a fresh task. The message MUST be a compact handoff with exactly these headings: [OBJECTIVE], [BASE/WORKTREE] containing Base: and Worktree:, [ALLOWED FILES] with bullet-listed exact files, [FORBIDDEN SCOPE], [EXACT CHANGES], [VERIFICATION], [RECEIPT]. Maximum ${HANDOFF_BYTE_CAP} UTF-8 bytes for this turn. Never include parent history, transcripts, logs or large documents. The peer runs after your current turn and the coordinator resumes with its result. Identical stage/evidence replay is rejected. ${RETRY_GUIDANCE} Queue/fan-out is capped at ${DELEGATION_CONCURRENCY} successful delegations from this turn. Backend enforcement owns these limits.`,
+      `Hand one long-running stage to an existing bot in a fresh task. The message MUST be a compact handoff with exactly these headings: [OBJECTIVE], [BASE/WORKTREE] containing Base:, Worktree: and optional Access mode: read-only|writer, [ALLOWED FILES] with bullet-listed exact files, [FORBIDDEN SCOPE], [EXACT CHANGES], [VERIFICATION], [RECEIPT]. Omitted access mode keeps legacy writer semantics. Maximum ${HANDOFF_BYTE_CAP} UTF-8 bytes for this turn. Never include parent history, transcripts, logs or large documents. The peer runs after your current turn and the coordinator resumes with its result. Identical stage/evidence replay is rejected. A read-only label is not a sandbox: use a different worktree for concurrent readers. ${RETRY_GUIDANCE} Queue/fan-out is capped at ${DELEGATION_CONCURRENCY} successful delegations from this turn. Backend enforcement owns these limits.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -82,8 +84,31 @@ const TOOLS = [
         bot_name: { type: "string", description: "Exact target display name, only for compatibility with an older roster." },
         message: { type: "string", description: `Seven-section handoff, at most ${HANDOFF_BYTE_CAP} UTF-8 bytes.` },
         reason: { type: "string", description: "Optional one-line reason for the delegation (shown to the user as a chip)." },
+        runtimePolicyOverride: {
+          type: "object",
+          description: "Chief-only validated one-task runtime exception. It applies only to this fresh task, never changes bot defaults, and is refused when the user locked Chief control.",
+          additionalProperties: true,
+        },
       },
       required: ["bot_id", "message"],
+    },
+  },
+  {
+    name: "inspect_runtime_policy",
+    description: "Chief-only server-authoritative view of visible workers in your section: effective policy, busy state, user lock, and bounded policy audit. Use it before adapting limits.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "patch_runtime_policy",
+    description: "Chief-only persistent patch for one visible worker in your section. Requires a concrete reason, never changes the active turn, and applies only at the next admission. Use a delegate task override for a one-off exception; use this only when the pool's task character changed. The user's lock is authoritative.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target_bot_id: { type: "string", description: "Visible worker id from list_bots or inspect_runtime_policy." },
+        runtimePolicy: { type: ["object", "null"], description: "Validated partial policy patch, or null to reset the worker to defaults." },
+        reason: { type: "string", description: "Concrete non-sensitive reason for changing future admissions." },
+      },
+      required: ["target_bot_id", "runtimePolicy", "reason"],
     },
   },
   {
@@ -146,6 +171,9 @@ async function api(path: string, init?: RequestInit): Promise<Json> {
 }
 
 async function callTool(name: string, args: Json): Promise<{ text: string; isError?: boolean }> {
+  if (!IS_CHIEF_OF_STAFF && (name === "inspect_runtime_policy" || name === "patch_runtime_policy")) {
+    return { text: "only a visible section Chief of Staff can use runtime-policy tools", isError: true };
+  }
   if (name === "list_bots") {
     const r = await api(`/api/internal/agents?self=${encodeURIComponent(BOT_ID)}`);
     const bots = (r.bots as Array<Json>) ?? [];
@@ -154,9 +182,38 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
       const role = b.title ? ` — ${b.title}` : "";
       const about = b.description ? ` (${String(b.description).slice(0, 120)})` : "";
       const routing = b.routingKey ? `, routing_key: ${b.routingKey}` : "";
-      return `- ${b.name}${role}${about} [id: ${b.id}${routing}, model: ${b.model}${b.busy ? ", busy" : ""}]`;
+      const policy = IS_CHIEF_OF_STAFF && b.runtimePolicy
+        ? `, policy lock: ${b.chiefRuntimePolicyLocked ? "locked" : "allowed"}`
+        : "";
+      return `- ${b.name}${role}${about} [id: ${b.id}${routing}, model: ${b.model}${b.busy ? ", busy" : ""}${policy}]`;
     });
     return { text: `Other bots you can message with ask_bot:\n${lines.join("\n")}` };
+  }
+  if (name === "inspect_runtime_policy") {
+    const r = await api(`/api/internal/runtime-policy?fromBotId=${encodeURIComponent(BOT_ID)}&fromThreadId=${encodeURIComponent(THREAD_ID)}`);
+    const workers = (r.workers as Array<Json>) ?? [];
+    if (!workers.length) return { text: "No visible workers in this section." };
+    return {
+      text: workers.map((worker) => `- ${worker.name} [id: ${worker.id}${worker.routingKey ? `, routing_key: ${worker.routingKey}` : ""}, ${worker.busy ? "busy" : "idle"}, Chief control: ${worker.chiefRuntimePolicyLocked ? "Locked" : "Allowed"}] policy=${JSON.stringify(worker.runtimePolicy)}${Array.isArray(worker.audit) && worker.audit.length ? ` audit=${JSON.stringify(worker.audit)}` : ""}`).join("\n"),
+    };
+  }
+  if (name === "patch_runtime_policy") {
+    const targetBotId = String(args.target_bot_id ?? "").trim();
+    const reason = typeof args.reason === "string" ? args.reason.trim() : "";
+    if (!targetBotId || !reason || !Object.prototype.hasOwnProperty.call(args, "runtimePolicy")) {
+      return { text: "patch_runtime_policy needs target_bot_id, runtimePolicy, and reason.", isError: true };
+    }
+    const r = await api("/api/internal/runtime-policy", {
+      method: "PATCH",
+      body: JSON.stringify({
+        fromBotId: BOT_ID,
+        fromThreadId: THREAD_ID,
+        targetBotId,
+        runtimePolicy: args.runtimePolicy,
+        reason,
+      }),
+    });
+    return { text: `Runtime policy for ${targetBotId} patched for the next admission. Active turn unaffected: ${Boolean(r.activeTurnUnaffected)}. Audit: ${JSON.stringify(r.audit)}` };
   }
   if (name === "ask_bot") {
     const toBotId = String(args.bot_id ?? "").trim();
@@ -198,6 +255,9 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     if (routingKey) body.toRoutingKey = routingKey;
     if (botName) body.toBotName = botName;
     if (reason) body.reason = reason;
+    if (Object.prototype.hasOwnProperty.call(args, "runtimePolicyOverride")) {
+      body.runtimePolicyOverride = args.runtimePolicyOverride;
+    }
     const r = await api(`/api/internal/delegate-bot`, { method: "POST", body: JSON.stringify(body) });
     if (r.error) {
       const failureKey = `${toBotId}\n${routingKey}\n${botName}\n${message}`;
@@ -285,7 +345,7 @@ async function handle(msg: Json) {
       ok(id, {});
       return;
     case "tools/list":
-      ok(id, { tools: TOOLS });
+      ok(id, { tools: IS_CHIEF_OF_STAFF ? TOOLS : TOOLS.filter((tool) => !["inspect_runtime_policy", "patch_runtime_policy"].includes(tool.name)) });
       return;
     case "tools/call": {
       const name = params.name as string;
