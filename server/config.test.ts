@@ -11,10 +11,13 @@ import {
   instanceConfigs,
   isValidSshAlias,
   loadConfig,
+  localVmMaxInstances,
+  localVmMode,
   parseConfigPatch,
   parseStoredConfig,
   sanitizeStoredCustomEndpointUrls,
   roomTurnTimeoutMinutes,
+  skillRecorderEnabled,
   stripWorkspaceCredentialEnv,
   runConfigTransaction,
   syncCredentialEnv,
@@ -224,6 +227,35 @@ describe("configuration boundaries", () => {
       );
     },
   );
+
+  it("preserves shared Local VM behavior by default and accepts bounded per-bot mode", () => {
+    expect(localVmMode({})).toBe("shared");
+    expect(localVmMaxInstances({})).toBe(2);
+    expect(parseConfigPatch({ localVm: { mode: "per-bot", maxInstances: 4 } })).toEqual({
+      localVm: { mode: "per-bot", maxInstances: 4 },
+    });
+    expect(localVmMode({ localVm: { mode: "per-bot" } })).toBe("per-bot");
+    expect(localVmMaxInstances({ localVm: { maxInstances: 3 } })).toBe(3);
+  });
+
+  it("keeps experimental features off by default and accepts an explicit opt-in", () => {
+    expect(skillRecorderEnabled({})).toBe(false);
+    expect(parseConfigPatch({ features: { skillRecorder: true } })).toEqual({
+      features: { skillRecorder: true },
+    });
+    expect(skillRecorderEnabled({ features: { skillRecorder: true } })).toBe(true);
+    expect(() => parseConfigPatch({ features: { skillRecorder: "yes" } })).toThrow(
+      "features.skillRecorder",
+    );
+  });
+
+  it.each([0, 1.5, 5, "2", null])("rejects an invalid per-bot VM limit: %j", (maxInstances) => {
+    expect(() => parseConfigPatch({ localVm: { maxInstances } })).toThrow("localVm.maxInstances");
+  });
+
+  it.each(["one-per-bot", "windows", 1, null])("rejects an invalid Local VM mode: %j", (mode) => {
+    expect(() => parseConfigPatch({ localVm: { mode } })).toThrow("localVm.mode");
+  });
 });
 
 describe("config transaction boundaries", () => {
@@ -457,12 +489,58 @@ describe("default fleet", () => {
     expect(map.cursor).toEqual({ driver: "cursorAgent", environment: {} });
   });
 
+  it("carries the saved OpenAI-compatible URL into the live default instance", () => {
+    const map = instanceConfigs({
+      openaiCompat: { key: "secret", url: "https://models.example.test/v1" },
+    });
+    expect(map.openaiCompat.config).toEqual({ url: "https://models.example.test/v1" });
+    expect(map.openaiCompat.environment).toEqual({
+      OPENAI_COMPAT_API_KEY: "secret",
+      OPENAI_COMPAT_URL: "https://models.example.test/v1",
+    });
+  });
+
+  it("preserves a per-instance OpenAI-compatible URL override", () => {
+    const map = instanceConfigs({
+      openaiCompat: { url: "https://workspace.example.test/v1" },
+      instances: {
+        custom: {
+          driver: "openai-compat",
+          config: { url: "https://instance.example.test/v1", apiKeyEnv: "CUSTOM_KEY" },
+        },
+      },
+    });
+    expect(map.custom.config).toEqual({
+      url: "https://instance.example.test/v1",
+      apiKeyEnv: "CUSTOM_KEY",
+    });
+  });
+
+  it("does not retain an injected OpenAI-compatible URL across config refreshes", () => {
+    const config: AppConfig = {
+      openaiCompat: { url: "https://first.example.test/v1" },
+      instances: {
+        custom: { driver: "openai-compat" },
+      },
+    };
+
+    expect(instanceConfigs(config).custom.config).toEqual({
+      url: "https://first.example.test/v1",
+    });
+    config.openaiCompat = { url: "https://second.example.test/v1" };
+    expect(instanceConfigs(config).custom.config).toEqual({
+      url: "https://second.example.test/v1",
+    });
+    expect(config.instances?.custom.config).toBeUndefined();
+  });
+
   it("adds missing custom-only engines onto an existing product fleet", () => {
     const map = instanceConfigs({ instances: { claude: { driver: "claudeAgent" } } });
     expect(map.claude.driver).toBe("claudeAgent");
     expect(map.qwen?.driver).toBe("qwenAgent");
     expect(map.hermes?.driver).toBe("hermesAgent");
     expect(map.cursor?.driver).toBe("cursorAgent");
+    expect(map.openaiCompat?.driver).toBe("openai-compat");
   });
 
   it("does not expand a one-off shadow fleet", () => {
@@ -629,9 +707,12 @@ describe("credential env preference", () => {
     "XAI_API_KEY",
     "NVIDIA_API_KEY",
     "OPENROUTER_API_KEY",
+    "OPENAI_COMPAT_API_KEY",
+    "OPENAI_COMPAT_URL",
     "BOX_TOKEN",
     "OPENCODE_API_KEY",
     "OMB_TTS_KEY",
+    "OMB_OPENAI_IMAGE_KEY",
     "COMPOSIO_API_KEY",
   ] as const;
   let saved: Record<string, string | undefined>;
@@ -663,6 +744,7 @@ describe("credential env preference", () => {
         box: { token: "file-box" },
         opencodeGo: { apiKey: "file-ocg" },
         tts: { key: "file-tts", voice: "narrator" },
+        imageGen: { key: "file-image" },
       }),
     );
     process.env.XAI_API_KEY = "env-xai";
@@ -671,6 +753,7 @@ describe("credential env preference", () => {
     process.env.BOX_TOKEN = "env-box";
     process.env.OPENCODE_API_KEY = "env-ocg";
     process.env.OMB_TTS_KEY = "env-tts";
+    process.env.OMB_OPENAI_IMAGE_KEY = "env-image";
     const cfg = loadConfig();
     expect(cfg.xai).toEqual({ key: "env-xai", url: "https://api.example.test/v1" });
     expect(cfg.nvidia).toEqual({ apiKey: "env-nvidia" });
@@ -678,16 +761,18 @@ describe("credential env preference", () => {
     expect(cfg.box).toEqual({ token: "env-box" });
     expect(cfg.opencodeGo).toEqual({ apiKey: "env-ocg" });
     expect(cfg.tts).toEqual({ key: "env-tts", voice: "narrator" });
+    expect(cfg.imageGen).toEqual({ key: "env-image" });
   });
 
   it("falls back to the config file when the env var is unset (dev mode)", () => {
     writeFileSync(
       join(DATA_DIR, "config.json"),
-      JSON.stringify({ xai: { key: "file-xai" }, tts: { key: "file-tts" } }),
+      JSON.stringify({ xai: { key: "file-xai" }, tts: { key: "file-tts" }, imageGen: { key: "file-image" } }),
     );
     const cfg = loadConfig();
     expect(cfg.xai?.key).toBe("file-xai");
     expect(cfg.tts?.key).toBe("file-tts");
+    expect(cfg.imageGen?.key).toBe("file-image");
   });
 
   it("treats a blanked file field as absent when env supplies the secret", () => {
@@ -735,5 +820,6 @@ describe("workspace credential env strip", () => {
     expect(WORKSPACE_CREDENTIAL_ENV).toContain("OMB_TTS_KEY");
     expect(WORKSPACE_CREDENTIAL_ENV).toContain("API_KEY_21ST");
     expect(WORKSPACE_CREDENTIAL_ENV).toContain("API_KEY_SECRET");
+    expect(WORKSPACE_CREDENTIAL_ENV).toContain("OMB_OPENAI_IMAGE_KEY");
   });
 });

@@ -15,7 +15,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ensureDirs } from "../../config.ts";
 import type { ProviderInstance } from "../../contracts.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
-import { createAcpDriver, resolveNewSessionTimeout, type AcpSupport } from "./core.ts";
+import {
+  createAcpDriver,
+  resolveNewSessionTimeout,
+  skipSubscriptionAuthForLocalInject,
+  type AcpSupport,
+} from "./core.ts";
 import { GrokAgentDriver } from "./grok.ts";
 import { GeminiAgentDriver } from "./gemini.ts";
 import { KimiAgentDriver } from "./kimi.ts";
@@ -71,6 +76,15 @@ const ClassifiedErrorDriver = createAcpDriver({
     error && typeof error === "object" && (error as { code?: unknown }).code === -32000
       ? "invalid_credentials"
       : undefined,
+});
+
+describe("skipSubscriptionAuthForLocalInject", () => {
+  it("is true only for a host:: inject id", () => {
+    expect(skipSubscriptionAuthForLocalInject("omlx::MiniMax-M3-4bit")).toBe(true);
+    expect(skipSubscriptionAuthForLocalInject("unsloth::orcarouter/Qwen3.8-27B-Uncensored-GGUF")).toBe(true);
+    expect(skipSubscriptionAuthForLocalInject("grok-4.6")).toBe(false);
+    expect(skipSubscriptionAuthForLocalInject(undefined)).toBe(false);
+  });
 });
 
 describe("ACP decodeConfig", () => {
@@ -264,10 +278,10 @@ describe("ACP turns (fake CLI)", () => {
       "turn.started",
       "session.started",
       "content.delta",
+      "item.completed", // assistant_text before the tool, not summed on settle
       "item.started", // tool tc-1
       "item.completed", // tool tc-1 done
       "thread.token-usage.updated",
-      "item.completed", // assistant_text (summed) on settle
       "turn.completed",
     ]);
     expect(recorder.events.every((e) => e.turnId === turnId && e.provider === "grokAgent")).toBe(true);
@@ -278,6 +292,34 @@ describe("ACP turns (fake CLI)", () => {
     const done = recorder.events.at(-1)!;
     expect(done).toMatchObject({ type: "turn.completed", ok: true });
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
+  });
+
+  it("emits each assistant text block before the tool that follows it", async () => {
+    await create(GrokAgentDriver, "interleave");
+    await instance.adapter.sendTurn({ threadId: "t-interleave", text: "go", model: "grok-4.5" });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const types = recorder.events.map((e) => e.type);
+    expect(types).toEqual([
+      "turn.started",
+      "session.started",
+      "content.delta",
+      "item.completed", // before one
+      "item.started", // tc-1
+      "item.completed", // tc-1
+      "content.delta",
+      "item.completed", // before two
+      "item.started", // tc-2
+      "item.completed", // tc-2
+      "content.delta",
+      "thread.token-usage.updated",
+      "item.completed", // after — no following tool, so settle flushes
+      "turn.completed",
+    ]);
+    const texts = recorder.events
+      .filter((e) => e.type === "item.completed" && (e as { itemType?: string }).itemType === "assistant_text")
+      .map((e) => (e as { text: string }).text);
+    expect(texts).toEqual(["before one", "before two", "after"]);
   });
 
   it("reads token usage from the root of the prompt result", async () => {
@@ -495,6 +537,27 @@ describe("ACP turns (fake CLI)", () => {
     expect(err.message).toMatch(/not signed in/);
   });
 
+  it("grok local inject does not require grok.com login", async () => {
+    process.env.FAKE_ACP_MODE = "no-auth";
+    mkdirSync(join(scratch, ".grok"), { recursive: true });
+    instance = await GrokAgentDriver.create({
+      instanceId: "acp-test",
+      displayName: "ACP Test",
+      environment: { HOME: scratch, GROK_HOME: join(scratch, ".grok") },
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    recorder = recordEvents(instance.adapter);
+    await instance.adapter.sendTurn({
+      threadId: "t-local-auth",
+      text: "go",
+      model: "omlx::MiniMax-M3-4bit",
+    });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+  });
+
   it("gemini proceeds through a missing auth method (lenient login)", async () => {
     await create(GeminiAgentDriver, "no-auth");
     await instance.adapter.sendTurn({ threadId: "t-lenient", text: "go" });
@@ -599,6 +662,39 @@ describe("ACP turns (fake CLI)", () => {
     expect(started).toMatchObject({ sessionId: "resumed-thread-1", model: "m-two" });
     const done = await recorder.until((e) => e.type === "turn.completed");
     expect(done).toMatchObject({ ok: true });
+  });
+
+  it("applyTurnEnv sees the picker model after resolveTurnModel", async () => {
+    const dump = join(scratch, "turn-env.json");
+    process.env.FAKE_ACP_DUMP = dump;
+    const TurnEnvDriver = createAcpDriver({
+      ...SELECT_MODEL_SUPPORT,
+      driverKind: "turnEnvTest",
+      selectModel: undefined,
+      resolveTurnModel: (model) => (model ? `resolved/${model}` : model),
+      applyTurnEnv: (env, { model, requestedModel }) => {
+        env.TEST_TURN_MODEL = `${model ?? ""}|${requestedModel ?? ""}`;
+      },
+    });
+    instance = await TurnEnvDriver.create({
+      instanceId: "turn-env-test",
+      displayName: undefined,
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    recorder = recordEvents(instance.adapter);
+
+    await instance.adapter.sendTurn({
+      threadId: "t-turn-env",
+      text: "go",
+      model: "ollama::ornith:35b-bf16",
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    expect(JSON.parse(readFileSync(dump, "utf8")).env.TEST_TURN_MODEL).toBe(
+      "resolved/ollama::ornith:35b-bf16|ollama::ornith:35b-bf16",
+    );
   });
 
   it("transformEnv sees the instance config", async () => {

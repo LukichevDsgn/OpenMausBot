@@ -41,12 +41,23 @@ try {
     validateArchiveEntryNames(listing);
     const extraction = join(temporary, "extracted");
     mkdirSync(extraction, { recursive: true });
-    const command = process.platform === "win32" ? "tar" : "unzip";
-    const args = process.platform === "win32" ? ["-xf", zip, "-C", extraction] : ["-q", zip, "-d", extraction];
-    const result = spawnSync(command, args, { encoding: "utf8" });
-    if (result.status !== 0) {
-      throw new Error(command + " failed: " + (result.stderr || result.stdout).trim());
+    // A bare "tar" is Windows' bundled bsdtar (zip-capable) in cmd/PowerShell
+    // but git-bash puts GNU tar (cannot read .zip) ahead of it on PATH, so
+    // name the System32 binary absolutely. unzip remains the fallback for a
+    // rare Windows installation without System32 tar.
+    const systemTar = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe");
+    const extractors = process.platform === "win32"
+      ? [[systemTar, ["-xf", zip, "-C", extraction]], ["unzip", ["-q", zip, "-d", extraction]]]
+      : [["unzip", ["-q", zip, "-d", extraction]]];
+    const describeFailure = (result) => result.error?.message ??
+      (`${result.stderr || result.stdout || ""}`.trim() || `exit status ${result.status}`);
+    let result;
+    for (const [command, args] of extractors) {
+      result = spawnSync(command, args, { encoding: "utf8" });
+      if (result.status === 0) break;
+      console.error(`${command} failed: ${describeFailure(result)} — trying next`);
     }
+    if (result.status !== 0) throw new Error(`could not extract Android Platform Tools: ${describeFailure(result)}`);
     installValidatedPlatformTools({
       sourceRoot: join(extraction, "platform-tools"),
       finalDir,

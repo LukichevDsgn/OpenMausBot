@@ -5,7 +5,8 @@
 // session/prompt, and streams session/update notifications for a scripted
 // turn. Failure modes mirror how real ACP agents misbehave:
 //
-//   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | hang | no-auth | auth-required | permission
+//   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | fail-after-text | hang | no-auth | auth-required | permission
+//                   | interleave (message → tool → message → tool → message)
 //                   | no-session-config (reject session/set_mode + set_model
 //                     with -32601, i.e. an agent predating those methods)
 //                   | ask-peer (spawn the injected "agents" MCP server from
@@ -13,6 +14,8 @@
 //                     peer, and reply with what the peer said — the comms e2e)
 //                   | delegate-peer (same as ask-peer but uses delegate_bot —
 //                     returns immediately, the peer runs after our turn)
+//                   | create-peer (a Chief creates a specialist, then delegates
+//                     work to it through the returned id)
 //                   | echo-gated (reply by echoing the full prompt, and when
 //                     FAKE_ACP_GATE_FILE is set hold the turn open until that
 //                     file exists — a deterministic busy window for the
@@ -54,6 +57,20 @@ const configOptions = () =>
         },
       ]
     : null;
+// cursor-shaped surface: the session advertises `models.availableModels` with
+// parameterised ids (`default[]`) that differ from the argv `--model` slugs
+// (`auto`). Off unless FAKE_ACP_SESSION_MODELS is set, so every existing mode
+// stays byte-identical. Format: "id|Name,id|Name" — the name is optional.
+const acpModels = (process.env.FAKE_ACP_SESSION_MODELS ?? "")
+  .split(",")
+  .filter(Boolean)
+  .map((entry) => {
+    const [modelId, name] = entry.split("|");
+    return name ? { modelId, name } : { modelId };
+  });
+const sessionModels = () =>
+  acpModels.length ? { currentModelId: acpModels[0].modelId, availableModels: acpModels } : null;
+
 const argv = process.argv.slice(2);
 const dumpEnv = Object.fromEntries(
   [
@@ -71,10 +88,17 @@ const dumpEnv = Object.fromEntries(
     "XAI_API_KEY",
     "BOX_TOKEN",
     "OMB_TTS_KEY",
+    "FACTORY_API_KEY",
     "UNSLOTH_STUDIO_AUTH_TOKEN",
     "CURSOR_API_KEY",
     "CURSOR_AUTH_TOKEN",
     "OPENMAUSBOT_ENDPOINT_OPENROUTER_API_KEY",
+    "KIMI_MODEL_NAME",
+    "KIMI_MODEL_API_KEY",
+    "KIMI_MODEL_BASE_URL",
+    "KIMI_MODEL_PROVIDER_TYPE",
+    "KIMI_MODEL_DISPLAY_NAME",
+    "TEST_TURN_MODEL",
   ].flatMap((key) => (process.env[key] === undefined ? [] : [[key, process.env[key]]] as const)),
 );
 const dumpState: Record<string, unknown> = { argv, env: dumpEnv };
@@ -94,6 +118,24 @@ if (argv[0] === "status" || argv[0] === "whoami") {
   process.exit(0);
 }
 if (argv[0] === "models" || argv.includes("--list-models")) {
+  if (models.length) {
+    const verbose = argv.includes("--verbose");
+    console.log(
+      models.flatMap((slug) => verbose
+        ? [
+            slug,
+            JSON.stringify({
+              id: slug.slice(slug.indexOf("/") + 1),
+              providerID: slug.slice(0, slug.indexOf("/")),
+              name: slug,
+              status: "active",
+              limit: { context: 200_000 },
+            }, null, 2),
+          ]
+        : [slug]).join("\n"),
+    );
+    process.exit(0);
+  }
   console.log(
     [
       "Available models",
@@ -182,6 +224,17 @@ function playTurn() {
   out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "tool_call_update", toolCallId: "tc-1", status: "completed" } } });
 }
 
+/** Scripted text → tool → text → tool → text turn for order-contract tests. */
+function playInterleaveTurn() {
+  out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: "before one" } } } });
+  out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "tool_call", toolCallId: "tc-1", title: "run" } } });
+  out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "tool_call_update", toolCallId: "tc-1", status: "completed" } } });
+  out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: "before two" } } } });
+  out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "tool_call", toolCallId: "tc-2", title: "run" } } });
+  out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "tool_call_update", toolCallId: "tc-2", status: "completed" } } });
+  out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: "after" } } } });
+}
+
 let buf = "";
 process.stdin.on("data", (c) => {
   buf += c;
@@ -242,12 +295,18 @@ function handle(msg: any) {
         writeFileSync(`${process.env.FAKE_ACP_DUMP}.mcp.json`, JSON.stringify(servers, null, 2));
       }
       const opts = configOptions();
-      result(msg.id, opts ? { sessionId: "fake-acp-session", configOptions: opts } : { sessionId: "fake-acp-session" });
+      const mdls = sessionModels();
+      result(msg.id, {
+        sessionId: "fake-acp-session",
+        ...(opts ? { configOptions: opts } : {}),
+        ...(mdls ? { models: mdls } : {}),
+      });
       break;
     }
     case "session/load": {
       const opts = configOptions();
-      result(msg.id, opts ? { configOptions: opts } : {});
+      const mdls = sessionModels();
+      result(msg.id, { ...(opts ? { configOptions: opts } : {}), ...(mdls ? { models: mdls } : {}) });
       break;
     }
     // per-session settings (droid sets model/autonomy here, not via argv).
@@ -259,6 +318,11 @@ function handle(msg: any) {
       if (mode === "no-session-config") {
         // an older agent that predates these methods
         return out({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "method not found" } });
+      }
+      if (mode === "set-model-invalid-params" && msg.method === "session/set_model") {
+        // an agent whose ACP model namespace does not contain the id it was
+        // sent — Cursor's answer when handed an argv slug like `auto`.
+        return out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Invalid params" } });
       }
       const settingId = msg.method === "session/set_mode" ? "modeId" : "modelId";
       if (typeof msg.params?.sessionId !== "string" || typeof msg.params?.[settingId] !== "string") {
@@ -299,6 +363,16 @@ function handle(msg: any) {
         setInterval(() => {}, 1_000);
         return;
       }
+      if (mode === "fail-after-text") {
+        // Stream real text, THEN fail the turn — the shape of a crash
+        // mid-answer. This is the one case where the routine-failed/done
+        // notification dedup is load-bearing: the reply is non-empty, so
+        // nothing else suppresses the generic done.
+        out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: "half a report, then a crash" } } } });
+        recordMethod("session/prompt.error");
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "fake acp: turn failed after streaming" } });
+        return;
+      }
       const complete = () => {
         recordMethod("session/prompt.result");
         result(
@@ -327,6 +401,36 @@ function handle(msg: any) {
           })
           .catch((e) => {
             out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: `peer error: ${(e as Error).message}` } } } });
+            complete();
+          });
+        return;
+      }
+      if (mode === "create-peer" && agentsMcp) {
+        void driveMcp(agentsMcp, [
+          {
+            name: "create_bot",
+            args: () => ({
+              name: "Pixel",
+              role: "Product designer",
+              instructions: "Design and review the user experience.",
+            }),
+          },
+          {
+            name: "delegate_bot",
+            args: (created) => ({
+              bot_id: /id: ([\w-]+)/.exec(created)?.[1] ?? "",
+              message: "[OBJECTIVE]\nReview the new onboarding flow.\n[BASE/WORKTREE]\nBase: main\nWorktree: D:/Codex/OpenMausBot-custom\n[ALLOWED FILES]\n- server/index.ts\n[FORBIDDEN SCOPE]\nDo not change unrelated files or access Onlook.\n[EXACT CHANGES]\nReview the new onboarding flow and report the concrete findings.\n[VERIFICATION]\nRun the focused local review checks.\n[RECEIPT]\nReturn the findings, checks and remaining uncertainty.",
+              reason: "design review",
+            }),
+          },
+        ])
+          .then((reply) => {
+            out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: `team created: ${reply}` } } } });
+            complete();
+          })
+          .catch((e) => {
+            const message = e instanceof Error ? e.message : String(e);
+            out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: `create error: ${message}` } } } });
             complete();
           });
         return;
@@ -393,7 +497,8 @@ function handle(msg: any) {
           });
         return;
       }
-      if (mode !== "empty-reply") playTurn();
+      if (mode === "interleave") playInterleaveTurn();
+      else if (mode !== "empty-reply") playTurn();
       if (mode === "permission") {
         // ask the client to approve a tool, then complete once answered
         pendingPermissionId = 9001;

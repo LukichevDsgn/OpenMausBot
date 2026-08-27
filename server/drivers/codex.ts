@@ -32,6 +32,7 @@ import { newEventId, newId } from "../contracts.ts";
 import { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 import { configuredCodexApiModels, codexLocalProviderArgs } from "./local-inject.ts";
 import { augmentedPath } from "../env-path.ts";
+import { classifyError, computeBackoff, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import { appendNative } from "./native.ts";
 
 export { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
@@ -175,64 +176,72 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     });
 
     const sendTurn = async (turn: SendTurnInput) => {
+      // One driver instance serves many threads. Interrupt state belongs to
+      // this turn so activity elsewhere cannot cancel or revive its retry.
+      let stopRequested = false;
       const { threadId } = turn;
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const turnId = newId();
       const delegated = isDelegatedTurn(turn.text);
+      // a retry relaunches the whole app-server; the backoff is scaled down in
+      // tests so a fake's transient failures don't stall real seconds
+      const retryScale = Number(process.env.FAKE_CODEX_RETRY_SCALE ?? "1");
 
-      const env = childEnv(turn.model);
-      const appServerArgs = [
-        "app-server",
-        "-c",
-        `tool_output_token_limit=${delegated ? DELEGATED_CODEX_TOOL_OUTPUT_TOKEN_LIMIT : CODEX_TOOL_OUTPUT_TOKEN_LIMIT}`,
-        "-c",
-        `project_doc_max_bytes=${delegated ? DELEGATED_CODEX_PROJECT_DOC_MAX_BYTES : CODEX_PROJECT_DOC_MAX_BYTES}`,
-        ...codexLocalProviderArgs(env, turn.model),
-      ];
-      if (turn.integrations?.composio) {
-        mountMcpServer(appServerArgs, env, "openmausbot_connectors", turn.integrations.composio);
-      }
-      if (turn.integrations?.agents) {
-        mountMcpServer(appServerArgs, env, "agents", turn.integrations.agents);
-      }
-      if (turn.integrations?.computer) {
-        const proxyEnv = computerProxyEnv(turn.integrations.computer);
-        mountMcpServer(appServerArgs, env, "computer", {
-          command: process.execPath,
-          args: [SPAWNED_PROXIES.computer],
-          env: {
-            ELECTRON_RUN_AS_NODE: "1",
-            OGB_BOX_ID: proxyEnv.OGB_BOX_ID ?? "",
-            OGB_BOX_TOKEN: proxyEnv.OGB_BOX_TOKEN ?? "",
-            // who-is-driving endpoint, so a person taking the wheel in the
-            // panel pauses this bot's hands mid-turn
-            OMB_CONTROL_URL: proxyEnv.OMB_CONTROL_URL ?? "",
-            OMB_CONTROL_TOKEN: proxyEnv.OMB_CONTROL_TOKEN ?? "",
-          },
+      const launchAttempt = async (attempt: number): Promise<void> => {
+        const env = childEnv(turn.model);
+        const appServerArgs = [
+          "app-server",
+          "-c",
+          `tool_output_token_limit=${delegated ? DELEGATED_CODEX_TOOL_OUTPUT_TOKEN_LIMIT : CODEX_TOOL_OUTPUT_TOKEN_LIMIT}`,
+          "-c",
+          `project_doc_max_bytes=${delegated ? DELEGATED_CODEX_PROJECT_DOC_MAX_BYTES : CODEX_PROJECT_DOC_MAX_BYTES}`,
+          ...codexLocalProviderArgs(env, turn.model),
+        ];
+        if (turn.integrations?.composio) {
+          mountMcpServer(appServerArgs, env, "openmausbot_connectors", turn.integrations.composio);
+        }
+        if (turn.integrations?.agents) {
+          mountMcpServer(appServerArgs, env, "agents", turn.integrations.agents);
+        }
+        if (turn.integrations?.computer) {
+          const proxyEnv = computerProxyEnv(turn.integrations.computer);
+          mountMcpServer(appServerArgs, env, "computer", {
+            command: process.execPath,
+            args: [SPAWNED_PROXIES.computer],
+            env: {
+              ELECTRON_RUN_AS_NODE: "1",
+              OGB_BOX_ID: proxyEnv.OGB_BOX_ID ?? "",
+              OGB_BOX_TOKEN: proxyEnv.OGB_BOX_TOKEN ?? "",
+              // who-is-driving endpoint, so a person taking the wheel in the
+              // panel pauses this bot's hands mid-turn
+              OMB_CONTROL_URL: proxyEnv.OMB_CONTROL_URL ?? "",
+              OMB_CONTROL_TOKEN: proxyEnv.OMB_CONTROL_TOKEN ?? "",
+            },
+          });
+        } else if (turn.integrations?.localComputer) {
+          // The host daemon and isolated Local VM both arrive as a direct Cua
+          // Driver stdio MCP server. Codex sees the same computer tool surface.
+          mountMcpServer(appServerArgs, env, "computer", turn.integrations.localComputer);
+        }
+        if (turn.integrations?.phone) {
+          const bridge = turn.integrations.phone;
+          Object.assign(env, bridge.env);
+          const prefix = "mcp_servers.openmausbot_phone";
+          appServerArgs.push(
+            "-c", `${prefix}.command=${JSON.stringify(bridge.command)}`,
+            "-c", `${prefix}.args=${JSON.stringify(bridge.args)}`,
+            "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(bridge.env))}`,
+            "-c", `${prefix}.default_tools_approval_mode="auto"`,
+          );
+        }
+
+        const child = spawnCli(config.cli, appServerArgs, {
+          cwd: turn.cwd ?? homedir(),
+          env,
+          stdio: ["pipe", "pipe", "pipe"],
         });
-      } else if (turn.integrations?.localComputer) {
-        // The host daemon and isolated Local VM both arrive as a direct Cua
-        // Driver stdio MCP server. Codex sees the same computer tool surface.
-        mountMcpServer(appServerArgs, env, "computer", turn.integrations.localComputer);
-      }
-      if (turn.integrations?.phone) {
-        const bridge = turn.integrations.phone;
-        Object.assign(env, bridge.env);
-        const prefix = "mcp_servers.openmausbot_phone";
-        appServerArgs.push(
-          "-c", `${prefix}.command=${JSON.stringify(bridge.command)}`,
-          "-c", `${prefix}.args=${JSON.stringify(bridge.args)}`,
-          "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(bridge.env))}`,
-          "-c", `${prefix}.default_tools_approval_mode="auto"`,
-        );
-      }
 
-      const child = spawnCli(config.cli, appServerArgs, {
-        cwd: turn.cwd ?? homedir(),
-        env,
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-
+      let abandoned = false;
       const state = {
         settled: false,
         lastText: "",
@@ -241,6 +250,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // wants this turn's figure, so the last report is banked on settle
         usage: undefined as { input: number; output: number } | undefined,
       };
+
       const asks = new Map<string, (behavior: "allow" | "deny" | "answer", message?: string, source?: "user" | "timeout" | "system") => void>();
       let nextId = 1;
       const rpcPending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
@@ -273,7 +283,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           send({ jsonrpc: "2.0", id, method, params });
         });
 
-      const stop = () => killCliTree(child);
+      const stop = () => {
+        stopRequested = true;
+        killCliTree(child);
+      };
 
       const settle = (ok: boolean, stopReason: string | null) => {
         if (state.settled) return;
@@ -316,6 +329,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       };
 
       // server→client approval request → canonical request.opened
+      // Host-scope tagging mirrors claude.ts: when this turn mounts the real
+      // Mac (not a VM), every card carries approvalScope so the harness's
+      // local-computer-block backstop applies to remembered always-allows.
+      const controlsHost = turn.integrations?.localComputer?.scope === "local-computer";
       const handleServerRequest = (msg: any) => {
         const method = msg.method as string;
         const params = msg.params ?? {};
@@ -334,6 +351,13 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           isMcpToolApproval && mcpMeta.tool_params && typeof mcpMeta.tool_params === "object"
             ? mcpMeta.tool_params
             : {};
+        // Codex 0.149's elicitation shape carries an empty tool_params object
+        // and uses the plain MCP tool name. Older app-server elicitations and
+        // explicit tool_name payloads need the namespaced identity retained
+        // by the custom approval/repeat guards.
+        const namespacedMcpTool =
+          isMcpToolApproval &&
+          (typeof mcpMeta.tool_name === "string" || !Object.prototype.hasOwnProperty.call(mcpMeta, "tool_params"));
         const approvalTarget =
           typeof mcpToolParams.app === "string" && mcpToolParams.app.trim()
             ? mcpToolParams.app.trim().toLowerCase()
@@ -342,8 +366,15 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           isMcpToolApproval &&
           approvalTarget !== undefined &&
           ["node_repl", "computer"].includes(String(params.serverName ?? "").toLowerCase());
+        const mcpTool = isMcpElicitation
+          ? String(params.message ?? "").match(/tool \"([^\"]+)\"/)?.[1]
+          : undefined;
         const tool =
-          method === "item/fileChange/requestApproval" || method === "applyPatchApproval"
+          isMcpElicitation
+            ? namespacedMcpTool
+              ? `mcp:${String(params.serverName ?? "server")}/${mcpToolName ?? mcpTool ?? "tool"}`
+              : (mcpTool ?? "mcp")
+            : method === "item/fileChange/requestApproval" || method === "applyPatchApproval"
             ? "edit"
             : isMcpToolApproval
               ? `mcp:${String(params.serverName ?? "server")}/${mcpToolName ?? "tool"}`
@@ -361,8 +392,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         }
         const requestId = newId();
         const summary =
-          typeof params.command === "string"
-            ? params.command.slice(0, 200)
+          isMcpElicitation && typeof params.message === "string"
+            ? params.message
+            : typeof params.command === "string"
+            ? params.command
             : Array.isArray(params.questions)
               ? params.questions.map((q: any) => q.question ?? q.header).filter(Boolean).join(" · ")
               : typeof params.reason === "string"
@@ -412,7 +445,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           tool,
           summary,
           choices,
-          approvalScope: isLocalComputerApproval ? "local-computer" : undefined,
+          approvalScope: isLocalComputerApproval || controlsHost ? "local-computer" : undefined,
           approvalTarget: isLocalComputerApproval ? approvalTarget : undefined,
         });
       };
@@ -441,7 +474,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             const command = item.type === "commandExecution" ? String(item.command ?? "shell") : null;
             const title =
               command !== null
-                ? command.slice(0, 80)
+                ? command
                 : item.type === "fileChange"
                   ? "edit"
                   : item.type === "mcpToolCall"
@@ -474,7 +507,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                 state.sawStreamDelta = false;
                 emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text: item.text });
               }
-            } else if (["commandExecution", "fileChange", "mcpToolCall"].includes(item.type)) {
+            } else if (["commandExecution", "fileChange", "mcpToolCall", "webSearch"].includes(item.type)) {
               emit({
                 ...base(threadId, turnId),
                 type: "item.completed",
@@ -558,10 +591,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         if (stderr.length > 8192) stderr = stderr.slice(-8192);
       });
       child.on("error", (e) => {
+        if (abandoned) return;
         emit({ ...base(threadId, turnId), type: "runtime.error", ...describeSpawnFailure(e, config.cli) });
         settle(false, "spawn_error");
       });
       child.on("close", (code) => {
+        if (abandoned) return;
         if (!state.settled) {
           emit({
             ...base(threadId, turnId),
@@ -573,137 +608,165 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       });
 
       active.set(threadId, { stop, turnId, asks });
-      emit({ ...base(threadId, turnId), type: "turn.started" });
+      // Relaunching the app-server is still the same logical turn. Keep the
+      // active process current on every attempt, but announce the turn once.
+      if (attempt === 0) emit({ ...base(threadId, turnId), type: "turn.started" });
 
-      // handshake + kickoff; any refusal surfaces as failure, not a hang
-      (async () => {
-        try {
-          await request("initialize", { clientInfo: { name: "openmausbot", version: "1" } });
-          send({ jsonrpc: "2.0", method: "initialized", params: {} });
-          const cursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
-          let codexThreadId: string | null = null;
-          let startedModel: string | null = null;
-          if (cursor) {
-            try {
-              const resumed = await request("thread/resume", { threadId: cursor });
-              codexThreadId = resumed?.thread?.id ?? cursor;
-            } catch {
-              /* resume unsupported or thread gone — start fresh below */
-            }
-          }
-          if (!codexThreadId) {
-            const selection = decodeCodexSelection(turn.model);
-            const started = await request("thread/start", {
-              cwd: turn.cwd ?? homedir(),
-              model: selection.model,
-              ...(selection.modelProvider ? { modelProvider: selection.modelProvider } : {}),
-              sandbox: config.fullAuto ? "danger-full-access" : "workspace-write",
-              approvalPolicy: config.fullAuto ? "never" : "on-request",
-              ephemeral: false,
-            });
-            codexThreadId = started?.thread?.id ?? null;
-            startedModel = started?.model ?? null;
-          }
-          emit({ ...base(threadId, turnId), type: "session.started", sessionId: codexThreadId, model: startedModel ?? turn.model ?? null });
-          await request("turn/start", {
-            threadId: codexThreadId,
-            input: [{ type: "text", text: turn.system ? `${turn.system}\n\n${turn.text}` : turn.text }],
-            // Spread, not `effort: turn.effort ?? null`. Probed against
-            // codex-cli 0.146.0: null is indistinguishable from an absent key
-            // — both leave the thread's current effort alone, emitting no
-            // thread/settings/updated, and thread/resume reads the old value
-            // back. The app-server offers no way to clear a level either:
-            // "" is rejected outright and thread/start takes no effort at
-            // all. So a thread keeps the last level it was sent until it is
-            // sent another, and choosing Default lands on the bot's next new
-            // thread rather than the current one.
-            ...(turn.effort ? { effort: turn.effort } : {}),
-          });
-        } catch (e) {
-          if (!state.settled) {
-            const message = e instanceof Error ? e.message : String(e);
-            const needsAuth = /(?:\b401\b|unauthorized|missing bearer|authentication required)/i.test(message);
-            emit({
-              ...base(threadId, turnId),
-              type: "runtime.error",
-              message,
-              ...(needsAuth ? { setup: true } : {}),
-            });
-            settle(false, needsAuth ? "auth_required" : "rpc_error");
+      // handshake + kickoff; a transient failure (5xx/overloaded/reset) gets
+      // one relaunch of the whole app-server after backoff — but only when
+      // nothing streamed yet, and never for auth/shape errors or interrupts
+      try {
+        await request("initialize", { clientInfo: { name: "openmausbot", version: "1" } });
+        send({ jsonrpc: "2.0", method: "initialized", params: {} });
+        const cursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
+        let codexThreadId: string | null = null;
+        let startedModel: string | null = null;
+        if (cursor) {
+          try {
+            const resumed = await request("thread/resume", { threadId: cursor });
+            codexThreadId = resumed?.thread?.id ?? cursor;
+          } catch {
+            /* resume unsupported or thread gone — start fresh below */
           }
         }
-      })();
-
-      return { turnId };
-    };
-
-    const snapshot = async (): Promise<ProviderSnapshot> => {
-      const env = childEnv();
-      const version = await new Promise<string | null>((resolve) => {
-        execCli(config.cli, ["--version"], { timeout: 8000, env }, (err, stdout) =>
-          resolve(err ? null : stdout.trim()),
-        );
-      });
-      if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
-      if (directProviderKeys.nvidia || directProviderKeys.openrouter) {
-        return { state: "available", version, authenticated: true, billing: "metered" };
+        if (!codexThreadId) {
+          const selection = decodeCodexSelection(turn.model);
+          const started = await request("thread/start", {
+            cwd: turn.cwd ?? homedir(),
+            model: selection.model,
+            ...(selection.modelProvider ? { modelProvider: selection.modelProvider } : {}),
+            sandbox: config.fullAuto ? "danger-full-access" : "workspace-write",
+            approvalPolicy: config.fullAuto ? "never" : "on-request",
+            ephemeral: false,
+          });
+          codexThreadId = started?.thread?.id ?? null;
+          startedModel = started?.model ?? null;
+        }
+        emit({ ...base(threadId, turnId), type: "session.started", sessionId: codexThreadId, model: startedModel ?? turn.model ?? null });
+        await request("turn/start", {
+          threadId: codexThreadId,
+          input: [{ type: "text", text: turn.system ? `${turn.system}\n\n${turn.text}` : turn.text }],
+          // Spread, not `effort: turn.effort ?? null`. Probed against
+          // codex-cli 0.146.0: null is indistinguishable from an absent key
+          // — both leave the thread's current effort alone, emitting no
+          // thread/settings/updated, and thread/resume reads the old value
+          // back. The app-server offers no way to clear a level either:
+          // "" is rejected outright and thread/start takes no effort at
+          // all. So a thread keeps the last level it was sent until it is
+          // sent another, and choosing Default lands on the bot's next new
+          // thread rather than the current one.
+          ...(turn.effort ? { effort: turn.effort } : {}),
+        });
+      } catch (e) {
+        const failure = e instanceof Error ? e : { text: String(e) };
+        const message = e instanceof Error ? e.message : String(e);
+        const needsAuth = /(?:\b401\b|unauthorized|missing bearer|authentication required)/i.test(message);
+        const verdict = classifyError(failure);
+        if (!state.settled && !needsAuth && verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1 && state.sawStreamDelta === false) {
+          const delayMs = computeBackoff(attempt);
+          attempt++;
+          emit({
+            ...base(threadId, turnId),
+            type: "turn.retrying",
+            attempt,
+            delayMs,
+            reason: verdict.reason,
+          });
+          // This app-server never exits by itself. Retire the failed attempt
+          // and silence its late handlers before the replacement launches.
+          abandoned = true;
+          killCliTree(child);
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, Math.max(1, Math.round(delayMs * retryScale)));
+            timer.unref?.();
+          });
+          if (!stopRequested) {
+            void launchAttempt(attempt).catch(() => {});
+          } else {
+            settle(false, "interrupted");
+          }
+          return;
+        }
+        if (!state.settled) {
+          emit({
+            ...base(threadId, turnId),
+            type: "runtime.error",
+            message,
+            ...(needsAuth ? { setup: true } : {}),
+          });
+          settle(false, needsAuth ? "auth_required" : "rpc_error");
+        }
       }
-      const authenticated = await new Promise<boolean>((resolve) => {
-        execCli(config.cli, ["login", "status"], { timeout: 8000, env }, (err, stdout, stderr) =>
-          resolve(!err && /^logged in\b/im.test(`${stdout}\n${stderr ?? ""}`)),
-        );
-      });
-      // childEnv drops OPENAI_API_KEY on purpose — turns run on the ChatGPT login
-      return { state: "available", version, authenticated, billing: "subscription" };
     };
 
-    return {
-      instanceId,
-      driverKind: DRIVER_KIND,
-      displayName: input.displayName,
-      enabled: input.enabled,
-      get models() {
-        return models;
+    void launchAttempt(0).catch(() => {});
+    return { turnId };
+  };
+
+  const snapshot = async (): Promise<ProviderSnapshot> => {
+    const env = childEnv();
+    const version = await new Promise<string | null>((resolve) => {
+      execCli(config.cli, ["--version"], { timeout: 8000, env }, (err, stdout) =>
+        resolve(err ? null : stdout.trim()),
+      );
+    });
+    if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+    if (directProviderKeys.nvidia || directProviderKeys.openrouter) {
+      return { state: "available", version, authenticated: true, billing: "metered" };
+    }
+    const authenticated = await new Promise<boolean>((resolve) => {
+      execCli(config.cli, ["login", "status"], { timeout: 8000, env }, (err, stdout, stderr) =>
+        resolve(!err && /^logged in\b/im.test(`${stdout}\n${stderr ?? ""}`)),
+      );
+    });
+    // childEnv drops OPENAI_API_KEY on purpose — turns run on the ChatGPT login
+    return { state: "available", version, authenticated, billing: "subscription" };
+  };
+
+  return {
+    instanceId,
+    driverKind: DRIVER_KIND,
+    displayName: input.displayName,
+    enabled: input.enabled,
+    get models() {
+      return models;
+    },
+    refreshModels,
+    snapshot,
+    adapter: {
+      provider: DRIVER_KIND,
+      capabilities: {
+        sessionModelSwitch: "unsupported",
+        computerMcp: true,
+        localComputerMcp: true,
+        composioMcp: true,
+        agentsMcp: true,
+        phoneMcp: true,
+        images: true,
+        effortLevels: ["low", "medium", "high", "xhigh", "max"],
       },
-      refreshModels,
-      snapshot,
-      adapter: {
-        provider: DRIVER_KIND,
-        capabilities: {
-          sessionModelSwitch: "unsupported",
-          computerMcp: true,
-          // Codex app-server already mounts integrations.localComputer above.
-          // Advertise that implemented path so the router does not reject a
-          // Local destination before the CUA MCP server can be attached.
-          localComputerMcp: true,
-          composioMcp: true,
-          agentsMcp: true,
-          phoneMcp: true,
-          images: true,
-          effortLevels: ["low", "medium", "high", "xhigh", "max"],
-        },
-        sendTurn,
-        interruptTurn: async (threadId) => active.get(threadId)?.stop(),
-        respondToRequest: async (threadId, requestId, decision) => {
-          const turn = active.get(threadId);
-          const finish = turn?.asks.get(requestId);
-          if (!finish) return "unavailable"; // settled, timed out, or turn gone
-          finish(decision.behavior, decision.message, "user");
-          return decision.behavior === "allow" ? "allowed-once" : decision.behavior === "answer" ? "answered" : "rejected";
-        },
-        hasSession: (threadId) => active.has(threadId),
-        stopAll: async () => {
-          for (const { stop } of active.values()) stop();
-        },
-        onEvent: (listener) => {
-          listeners.add(listener);
-          return () => listeners.delete(listener);
-        },
+      sendTurn,
+      interruptTurn: async (threadId) => active.get(threadId)?.stop(),
+      respondToRequest: async (threadId, requestId, decision) => {
+        const turn = active.get(threadId);
+        const finish = turn?.asks.get(requestId);
+        if (!finish) return "unavailable"; // settled, timed out, or turn gone
+        finish(decision.behavior, decision.message, "user");
+        return decision.behavior === "allow" ? "allowed-once" : decision.behavior === "answer" ? "answered" : "rejected";
       },
-      dispose: async () => {
+      hasSession: (threadId) => active.has(threadId),
+      stopAll: async () => {
         for (const { stop } of active.values()) stop();
-        listeners.clear();
       },
-    };
-  },
+      onEvent: (listener) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    },
+    dispose: async () => {
+      for (const { stop } of active.values()) stop();
+      listeners.clear();
+    },
+  };
+},
 };

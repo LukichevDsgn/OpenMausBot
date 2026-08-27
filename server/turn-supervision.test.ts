@@ -66,6 +66,26 @@ describe("TurnSupervision", () => {
     expect(unknown[0]).toMatchObject({ intent: "cancel", reason: expect.stringContaining("explicit cancellation") });
   });
 
+  it("lets a same-deadline provider terminal settle before the UNKNOWN fallback", async () => {
+    vi.useFakeTimers();
+    const unknown: UnknownTurn[] = [];
+    const supervision = new TurnSupervision({ graceMs: 5_000, onUnknown: (turn) => unknown.push(turn) });
+    let terminal: ReturnType<TurnSupervision["observeTerminal"]> | undefined;
+
+    expect(supervision.begin("bot", "thread")).toBe(true);
+    expect(supervision.bind("bot", "thread", "provider-turn-cancel")).toBe(true);
+    await supervision.requestStop("bot", "thread", "cancel", () => {
+      setTimeout(() => {
+        terminal = supervision.observeTerminal("bot", "thread", "provider-turn-cancel");
+      }, 5_000);
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(terminal).toMatchObject({ accepted: true, intent: "cancel" });
+    expect(unknown).toEqual([]);
+    expect(supervision.has("bot", "thread")).toBe(false);
+  });
+
   it("applies the exact non-unit legacy grace fallback", async () => {
     vi.useFakeTimers();
     vi.stubEnv("OMB_TURN_STOP_GRACE_MS", "250");

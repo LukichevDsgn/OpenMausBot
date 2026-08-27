@@ -93,7 +93,7 @@ name = "OK"
 });
 
 describe("GrokAgentDriver catalog", () => {
-  it("loads the config catalog when the instance is created", async () => {
+  it("loads the config catalog on explicit picker refresh", async () => {
     const home = scratchConfig(`[model.local-glm]\nname = "GLM local"\n`);
     const instance = await GrokAgentDriver.create({
       instanceId: "grok-catalog",
@@ -103,8 +103,10 @@ describe("GrokAgentDriver catalog", () => {
       config: GrokAgentDriver.defaultConfig(),
     });
     try {
-      expect(instance.models.options.some((o) => o.id === "local-glm" && o.label === "GLM local")).toBe(true);
       expect(instance.refreshModels).toEqual(expect.any(Function));
+      expect(instance.models.options.some((o) => o.id === "local-glm")).toBe(false);
+      await instance.refreshModels?.();
+      expect(instance.models.options.some((o) => o.id === "local-glm" && o.label === "GLM local")).toBe(true);
     } finally {
       await instance.dispose();
     }

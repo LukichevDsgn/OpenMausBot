@@ -26,6 +26,10 @@ const SSH_ALIAS = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 export const DEFAULT_ROOM_TURN_TIMEOUT_MINUTES = 5;
 export const MIN_ROOM_TURN_TIMEOUT_MINUTES = 1;
 export const MAX_ROOM_TURN_TIMEOUT_MINUTES = 1_440;
+export const DEFAULT_LOCAL_VM_MODE = "shared" as const;
+export const DEFAULT_LOCAL_VM_MAX_INSTANCES = 2;
+export const MIN_LOCAL_VM_MAX_INSTANCES = 1;
+export const MAX_LOCAL_VM_MAX_INSTANCES = 4;
 
 export function isValidSshAlias(value: unknown): value is string {
   return typeof value === "string" && SSH_ALIAS.test(value);
@@ -57,6 +61,19 @@ const roomConfigSchema = z.object({
     .min(MIN_ROOM_TURN_TIMEOUT_MINUTES)
     .max(MAX_ROOM_TURN_TIMEOUT_MINUTES),
 });
+const localVmConfigSchema = z.object({
+  mode: z.enum(["shared", "per-bot"]).optional(),
+  maxInstances: z
+    .number()
+    .int()
+    .min(MIN_LOCAL_VM_MAX_INSTANCES)
+    .max(MAX_LOCAL_VM_MAX_INSTANCES)
+    .optional(),
+});
+const featureConfigSchema = z.object({
+  /** Experimental desktop workflow recorder. Hidden unless explicitly enabled. */
+  skillRecorder: z.boolean().optional(),
+});
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
   displayName: optionalText,
@@ -71,20 +88,27 @@ const appConfigSchema = z.object({
   xai: z.object({ key: optionalText, url: optionalText }).optional(),
   nvidia: z.object({ apiKey: optionalText }).optional(),
   openrouter: z.object({ apiKey: optionalText }).optional(),
+  openaiCompat: z.object({ key: optionalText, url: optionalText }).optional(),
   /** Project key used for Sessions, catalog and agent tools. userId/sessionId
    * are non-secret local identifiers used to reuse one Composio Session. */
   composio: z.object({ apiKey: optionalText, userId: optionalText, sessionId: optionalText }).optional(),
   box: z.object({ token: optionalText }).optional(),
   vps: vpsConfigSchema.optional(),
-  /** OpenCode Go key; persisted write-only and passed only to its child. */
+  /** Optional OpenCode key; persisted write-only and passed only to its child. */
   opencodeGo: z.object({ apiKey: optionalText }).optional(),
   /** OpenAI-compatible endpoints managed by the OpenCode ACP harness. */
   customEndpoints: customEndpointMapSchema.optional(),
-  /** Voice credentials and the selected voice id. */
-  tts: z.object({ key: optionalText, voice: optionalText }).optional(),
+  /** Voice credentials and the selected voice id. `provider` picks the
+   * engine: "elevenlabs" (default; needs a key) or "system" (the Mac's
+   * built-in voices, no key). */
+  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["elevenlabs", "system"]).optional() }).optional(),
+  /** OpenAI key used only by the in-process avatar image generator. */
+  imageGen: z.object({ key: optionalText }).optional(),
   /** Non-secret profile details shown in the sidebar. */
   profile: z.object({ name: optionalText, email: optionalText }).optional(),
   rooms: roomConfigSchema.optional(),
+  localVm: localVmConfigSchema.optional(),
+  features: featureConfigSchema.optional(),
   instances: instanceConfigMapSchema.optional(),
 });
 const appConfigPatchSchema = appConfigSchema.omit({ instances: true });
@@ -94,15 +118,22 @@ export interface AppConfig {
   xai?: { key?: string; url?: string };
   nvidia?: { apiKey?: string };
   openrouter?: { apiKey?: string };
+  openaiCompat?: { key?: string; url?: string };
   composio?: { apiKey?: string; userId?: string; sessionId?: string };
   box?: { token?: string };
   /** A named host from the user's SSH config. Authentication stays with SSH. */
   vps?: { sshAlias?: string };
   opencodeGo?: { apiKey?: string };
   customEndpoints?: Record<string, CustomEndpoint>;
-  tts?: { key?: string; voice?: string };
+  tts?: { key?: string; voice?: string; provider?: "elevenlabs" | "system" };
+  imageGen?: { key?: string };
   profile?: { name?: string; email?: string };
   rooms?: { turnTimeoutMinutes: number };
+  /** Shared preserves the historical singleton. Per-bot gives every bot a
+   * separate container, durable workspace, viewer and lease. */
+  localVm?: { mode?: "shared" | "per-bot"; maxInstances?: number };
+  /** Opt-in product experiments. Every flag defaults to disabled. */
+  features?: { skillRecorder?: boolean };
   instances?: InstanceConfigMap;
 }
 export type ConfigPatch = z.output<typeof appConfigPatchSchema>;
@@ -173,6 +204,18 @@ export function roomTurnTimeoutMinutes(cfg: AppConfig): number {
   return cfg.rooms?.turnTimeoutMinutes ?? DEFAULT_ROOM_TURN_TIMEOUT_MINUTES;
 }
 
+export function localVmMode(cfg: AppConfig): "shared" | "per-bot" {
+  return cfg.localVm?.mode ?? DEFAULT_LOCAL_VM_MODE;
+}
+
+export function localVmMaxInstances(cfg: AppConfig): number {
+  return cfg.localVm?.maxInstances ?? DEFAULT_LOCAL_VM_MAX_INSTANCES;
+}
+
+export function skillRecorderEnabled(cfg: AppConfig): boolean {
+  return cfg.features?.skillRecorder === true;
+}
+
 // OMB_DATA_DIR isolates test/soak rigs from the user's real fleet.
 export const DATA_DIR = process.env.OMB_DATA_DIR ?? join(homedir(), ".openmausbot");
 const LEGACY_DATA_DIR = join(homedir(), ".opengrokbot");
@@ -227,6 +270,9 @@ export function loadConfig(
   if (process.env.NVIDIA_API_KEY !== undefined) cfg.nvidia.apiKey = process.env.NVIDIA_API_KEY;
   cfg.openrouter = { ...cfg.openrouter };
   if (process.env.OPENROUTER_API_KEY !== undefined) cfg.openrouter.apiKey = process.env.OPENROUTER_API_KEY;
+  cfg.openaiCompat = { ...cfg.openaiCompat };
+  if (process.env.OPENAI_COMPAT_API_KEY !== undefined) cfg.openaiCompat.key = process.env.OPENAI_COMPAT_API_KEY;
+  if (process.env.OPENAI_COMPAT_URL !== undefined) cfg.openaiCompat.url = process.env.OPENAI_COMPAT_URL;
   cfg.composio = { ...cfg.composio };
   if (process.env.COMPOSIO_API_KEY !== undefined) cfg.composio.apiKey = process.env.COMPOSIO_API_KEY;
   cfg.box = { ...cfg.box };
@@ -235,6 +281,8 @@ export function loadConfig(
   if (process.env.OPENCODE_API_KEY !== undefined) cfg.opencodeGo.apiKey = process.env.OPENCODE_API_KEY;
   cfg.tts = { ...cfg.tts };
   if (process.env.OMB_TTS_KEY !== undefined) cfg.tts.key = process.env.OMB_TTS_KEY;
+  cfg.imageGen = { ...cfg.imageGen };
+  if (process.env.OMB_OPENAI_IMAGE_KEY !== undefined) cfg.imageGen.key = process.env.OMB_OPENAI_IMAGE_KEY;
   return cfg;
 }
 
@@ -250,15 +298,21 @@ export function syncCredentialEnv(patch: Partial<AppConfig>): void {
     [patch.xai?.key, "XAI_API_KEY"],
     [patch.nvidia?.apiKey, "NVIDIA_API_KEY"],
     [patch.openrouter?.apiKey, "OPENROUTER_API_KEY"],
+    [patch.openaiCompat?.key, "OPENAI_COMPAT_API_KEY"],
     [patch.composio?.apiKey, "COMPOSIO_API_KEY"],
     [patch.box?.token, "BOX_TOKEN"],
     [patch.opencodeGo?.apiKey, "OPENCODE_API_KEY"],
     [patch.tts?.key, "OMB_TTS_KEY"],
+    [patch.imageGen?.key, "OMB_OPENAI_IMAGE_KEY"],
   ];
   for (const [value, name] of secrets) {
     if (value === undefined) continue;
     if (value) process.env[name] = value;
     else delete process.env[name];
+  }
+  if (patch.openaiCompat?.url !== undefined) {
+    if (patch.openaiCompat.url) process.env["OPENAI_COMPAT_URL"] = patch.openaiCompat.url;
+    else delete process.env["OPENAI_COMPAT_URL"];
   }
 }
 
@@ -471,9 +525,12 @@ export const WORKSPACE_CREDENTIAL_ENV = [
   "OPENROUTER_API_KEY",
   "OPENMAUSBOT_NVIDIA_API_KEY",
   "OPENMAUSBOT_OPENROUTER_API_KEY",
+  "OPENAI_COMPAT_API_KEY",
+  "OPENAI_COMPAT_URL",
   "BOX_TOKEN",
   "OPENCODE_API_KEY",
   "OMB_TTS_KEY",
+  "OMB_OPENAI_IMAGE_KEY",
   "COMPOSIO_API_KEY",
   "OMB_COMPOSIO_BROKER_TOKEN",
   // Ambient desktop/tool credentials observed in the parent environment.
@@ -491,6 +548,25 @@ export function stripWorkspaceCredentialEnv(env: Record<string, string | undefin
   for (const key of WORKSPACE_CREDENTIAL_ENV) delete env[key];
 }
 
+/** Env names a provider CLI might read as its own billing identity. A spawned
+ * engine keeps only what its driver explicitly allows: a foreign key riding
+ * along in `...process.env` must not flip a subscription CLI onto
+ * pay-as-you-go billing the user never granted. */
+export const PROVIDER_CREDENTIAL_ENV = [
+  "ANTHROPIC_API_KEY",
+  "FACTORY_API_KEY",
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "KIMI_API_KEY",
+  "MOONSHOT_API_KEY",
+  "MINIMAX_API_KEY",
+  "OPENAI_API_KEY",
+  "OPENCODE_API_KEY",
+  "XAI_API_KEY",
+  "CURSOR_API_KEY",
+  "CURSOR_AUTH_TOKEN",
+] as const;
+
 /** Merge a partial config into ~/.openmausbot/config.json (secrets never
  * echoed back — callers report configured-or-not booleans only). */
 export function saveConfig(patch: Partial<AppConfig>): void {
@@ -506,7 +582,7 @@ export function saveConfig(patch: Partial<AppConfig>): void {
     /* first write */
   }
   const checkedPatch = appConfigSchema.partial().parse(patch);
-  for (const key of ["xai", "nvidia", "openrouter", "composio", "box", "opencodeGo", "tts", "profile", "rooms"] as const) {
+  for (const key of ["xai", "nvidia", "openrouter", "openaiCompat", "composio", "box", "opencodeGo", "tts", "imageGen", "profile", "rooms", "localVm", "features"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
@@ -613,7 +689,7 @@ interface InstanceCliUpdate {
  * withInstanceCli() so the inject rule and the strip rule cannot drift apart.
  * Each secret goes only to the driver that actually reads it: the API-key
  * Grok driver reads XAI_API_KEY, the Computer driver reads BOX_TOKEN, and
- * OpenCode Go reads OPENCODE_API_KEY. Every other engine brings its own
+ * OpenCode reads OPENCODE_API_KEY. Every other engine brings its own
  * login, so handing it a key it never uses would only put that key in the
  * environment of an unrelated child process. */
 function injectedEnvironment(cfg: AppConfig, driver: string): Map<string, string> {
@@ -621,6 +697,10 @@ function injectedEnvironment(cfg: AppConfig, driver: string): Map<string, string
   if (driver === "grok" && cfg.xai?.key) environment.set("XAI_API_KEY", cfg.xai.key);
   if (driver === "codex" && cfg.nvidia?.apiKey) environment.set("OPENMAUSBOT_NVIDIA_API_KEY", cfg.nvidia.apiKey);
   if (driver === "codex" && cfg.openrouter?.apiKey) environment.set("OPENMAUSBOT_OPENROUTER_API_KEY", cfg.openrouter.apiKey);
+  if (driver === "openai-compat" && cfg.openaiCompat?.key)
+    environment.set("OPENAI_COMPAT_API_KEY", cfg.openaiCompat.key);
+  if (driver === "openai-compat" && cfg.openaiCompat?.url)
+    environment.set("OPENAI_COMPAT_URL", cfg.openaiCompat.url);
   if (driver === "boxAgent" && cfg.box?.token) environment.set("BOX_TOKEN", cfg.box.token);
   if (driver === "opencodeGo" && cfg.opencodeGo?.apiKey) environment.set("OPENCODE_API_KEY", cfg.opencodeGo.apiKey);
   if (driver === "opencodeGo") {
@@ -661,18 +741,22 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     antigravity: { driver: "antigravityAgent" },
     opencodeGo: { driver: "opencodeGo" },
     computer: { driver: "boxAgent" },
+    openaiCompat: { driver: "openai-compat" },
     qwen: { driver: "qwenAgent" },
     hermes: { driver: "hermesAgent" },
+    pi: { driver: "piAgent" },
   };
   const CUSTOM_ONLY = {
     qwen: { driver: "qwenAgent" },
     hermes: { driver: "hermesAgent" },
+    pi: { driver: "piAgent" },
   } as const;
   // New default-fleet engines that existing product configs would otherwise
   // never see. Custom-only engines stay in CUSTOM_ONLY so a one-off test map
   // is not expanded, matching the claude/grok/codex product-fleet probe.
   const PRODUCT_FLEET_ADDITIONS = {
     cursor: { driver: "cursorAgent" },
+    openaiCompat: { driver: "openai-compat" },
     ...CUSTOM_ONLY,
   } as const;
   const configured = cfg.instances && Object.keys(cfg.instances).length ? cfg.instances : null;
@@ -696,7 +780,11 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
   if (configured && hasCustomEndpointKey && !Object.hasOwn(map, "opencodeGo")) {
     map.opencodeGo = { driver: "opencodeGo" };
   }
-  for (const entry of Object.values(map)) {
+  for (const [id, sourceEntry] of Object.entries(map)) {
+    // Build a transient entry so credential and workspace defaults never
+    // mutate the persisted instance configuration.
+    const entry = { ...sourceEntry };
+    map[id] = entry;
     const environment = { ...entry.environment };
     for (const [key, value] of injectedEnvironment(cfg, entry.driver)) environment[key] = value;
     entry.environment = environment;
@@ -706,6 +794,21 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
         : {};
       raw.customEndpoints = customEndpointMetadata(effectiveCustomEndpoints(cfg));
       entry.config = raw;
+    }
+    // The driver URL is configuration, not a credential. Environment is
+    // intentionally not consulted by ProviderRegistry when it decodes a
+    // driver's config, so carry the workspace default into the transient
+    // instance map while preserving a per-instance override.
+    if (entry.driver === "openai-compat" && cfg.openaiCompat?.url) {
+      const raw = entry.config;
+      if (raw === undefined) {
+        entry.config = { url: cfg.openaiCompat.url };
+      } else if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
+        const current = raw as Record<string, unknown>;
+        if (typeof current.url !== "string" || !current.url.trim()) {
+          entry.config = { ...current, url: cfg.openaiCompat.url };
+        }
+      }
     }
   }
   return map;

@@ -14,6 +14,7 @@ import { newId, type CloudBackend, type ModelSelection, type ThreadId } from "./
 import { pickBotName } from "./names.ts";
 import { redactSecretsInText } from "./redact.ts";
 import type { RuntimePolicyOverrides } from "./bot-runtime-policy.ts";
+import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
 
 export type MausColor =
   | "green"
@@ -66,13 +67,28 @@ export interface ConnectorCardData {
   resumed?: boolean;
 }
 
+export interface SecretRequestCardData {
+  /** Fixed allowlisted credential id; never an arbitrary config path. */
+  target: import("../shared/credential-request.ts").CredentialTargetId;
+  label: string;
+  description: string;
+  placeholder: string;
+  helpUrl: string;
+  requestKey: string;
+  provided?: boolean;
+  dismissed?: boolean;
+  resumed?: boolean;
+  error?: string;
+}
+
 export interface Message {
   id: string;
   role: "bot" | "user";
-  kind: "text" | "options" | "activity" | "screen" | "connector";
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
   card?: OptionCardData;
   connector?: ConnectorCardData;
+  secret?: SecretRequestCardData;
   /** activity messages: tool name + outcome. `spoken` is the same chip as
    * a phrase a voice can read ("reading a file") — computed once here so
    * call mode never has to re-derive it from the raw tool name, and absent
@@ -80,6 +96,10 @@ export interface Message {
   /** `setup` marks an error the user fixes by installing or configuring
    * something — the UI offers setup instead of a retry that cannot work. */
   tool?: { name: string; ok?: boolean; spoken?: string; setup?: boolean };
+  /** user messages sent INTO a running turn (capabilities.queueing): the
+   * model saw it mid-turn, so the transcript marks it — a reader should
+   * know the reply above it may already account for this line */
+  steered?: boolean;
   /** screen messages: a frame of the bot's computer (base64 image) */
   png?: string;
   mime?: string;
@@ -87,6 +107,9 @@ export interface Message {
   /** the message this one follows; null = thread root. Edited messages
    * share a parentId with the version they replace — that's a fork. */
   parentId?: string | null;
+  /** Optional flat reply reference. Unlike parentId this never changes the
+   * conversation branch; it only quotes one earlier text message inline. */
+  replyToId?: string;
   /** group threads: which member said this (sender attribution). */
   from?: { botId: string; name: string; color: string };
   /** emoji reactions; by = "user" or a member botId. */
@@ -99,6 +122,9 @@ export interface Message {
    * them; a true stranded by a restart is inert because the client only
    * shows the affordance while the bot is busy. */
   queued?: boolean;
+  /** steer-queue entry this drained user line came from. The client pending
+   * chip matches on this id, not on equal text. Absent on ordinary sends. */
+  queueId?: string;
 }
 
 export type GroupDefaultResponder =
@@ -135,6 +161,14 @@ export interface GroupRecord {
   /** the one message pinned to the top of this room's transcript. A pin id
    * that no longer resolves (edited away, deleted) simply renders nothing. */
   pinnedMessageId?: string;
+  /** sidebar section heading this room is filed under; shares the bots'
+   * namespace so one heading can hold a project's room and its people */
+  section?: string;
+  /** New user-created rooms start with setup pending. Null timestamps are
+   * intentional: records from before room setup has existed omit both keys
+   * and remain immediately usable. */
+  setupCompletedAt?: number | null;
+  setupSkippedAt?: number | null;
 }
 
 /** One task = one conversation with its own context.
@@ -243,6 +277,14 @@ function redactBotAuthored<T extends Omit<Message, "id" | "at"> & { at?: number 
       error: out.connector.error ? redactSecretsInText(out.connector.error) : undefined,
     };
   }
+  if (out.secret) {
+    out.secret = {
+      ...out.secret,
+      label: redactSecretsInText(out.secret.label),
+      description: redactSecretsInText(out.secret.description),
+      error: out.secret.error ? redactSecretsInText(out.secret.error) : undefined,
+    };
+  }
   return out;
 }
 
@@ -290,6 +332,10 @@ export interface BotRecord {
   notifications: boolean;
   color: MausColor;
   mascotExpression?: MausExpression | null;
+  /** App-owned attachment served as this bot's custom profile image. */
+  avatarUrl?: string;
+  /** Mascot, or the crop applied to avatarUrl. */
+  avatarCrop?: BotAvatarCrop;
   unread: boolean;
   modelSelection: ModelSelection;
   /** provider-native continuation per instance (e.g. claude session id) */
@@ -299,6 +345,9 @@ export interface BotRecord {
   computer?: "cloud" | "vm" | "local" | "off";
   /** Which cloud computer backs `computer: "cloud"`; absent means Box. */
   cloudBackend?: CloudBackend;
+  /** Auto mode may prepare/start this bot's managed VPS container. Off by
+   * default because starting remote infrastructure is an external action. */
+  autoStartVps?: boolean;
   /** where NEW tasks run their shell tools; each task pins its own copy
    * on its first turn (TaskRecord.cwd). Absent = the home folder. */
   cwd?: string;
@@ -330,8 +379,8 @@ export interface BotRecord {
   /** the one message pinned to the top of this bot's active thread; a pin
    * that no longer resolves (branch switched away, deleted) renders nothing */
   pinnedMessageId?: string;
-  /** The single workspace-wide coordinator. The store enforces that at
-   * most one bot owns this role, even if an older/corrupt file says more. */
+  /** The coordinator for this bot's sidebar section. The store enforces
+   * at most one Chief per section (including the unsectioned area). */
   chiefOfStaff?: boolean;
   /** Pause for human approval before this bot talks to a peer (ask_bot,
    * delegate_bot). Off by default: a chief-of-staff-style bot is most
@@ -352,6 +401,12 @@ export interface BotRecord {
   /** Explicit per-bot runtime controls. The server fills effective defaults
    * on the wire; bots.json keeps only fields the user supplied. */
   runtimePolicy?: RuntimePolicyOverrides;
+  /** Public, package-authored playbooks installed for this bot. They carry
+   * process guidance only—never executable code, credentials, or grants. */
+  playbooks?: InstalledPlaybook[];
+  /** Listing provenance and connector intent retained for package details
+   * and future re-export. It never means the apps are authorized. */
+  installedPackage?: InstalledPackageMetadata;
   /** Derived from `activity` — kept so the 200+ readers across the app and
    * tests keep working unchanged. Write through setActivity(), never here. */
   busy?: boolean;
@@ -360,6 +415,21 @@ export interface BotRecord {
    * Transient like busy: reset to idle on load. */
   activity?: BotActivity;
   createdAt: number;
+}
+
+export interface InstalledPlaybook {
+  key: string;
+  name: string;
+  summary: string;
+  triggers: string[];
+  instructions: string;
+}
+
+export interface InstalledPackageMetadata {
+  id: string;
+  name: string;
+  release: string;
+  requiredApps: Array<{ slug: string; label: string; reason: string; optional?: boolean }>;
 }
 
 const BOTS_FILE = join(DATA_DIR, "bots.json");
@@ -403,6 +473,9 @@ function defaultRoutingKey(name: string): string | undefined {
   const match = name.trim().match(/^Gemini Worker ([12])$/i);
   return match ? `worker-${match[1]}` : undefined;
 }
+/** Sections are persisted as display labels, so exact trimmed labels are
+ * their identity. Missing/blank means the unsectioned (General) team. */
+export const sectionKey = (section?: string | null): string => section?.trim() || "";
 
 /** Resolve @mentions in a message against a bot roster: `@` must start a
  * word, the name must end on a word boundary (so "@New Bottle" never matches
@@ -510,7 +583,7 @@ export class Store {
     // busy never survives a restart — no turn does either. Rooms saved
     // before default responders existed adopt their first member as lead.
     let botsMigrated = false;
-    const chiefSections = new Set<string>();
+    const chiefSectionsSeen = new Set<string>();
     let groupsMigrated = false;
     for (const b of this.bots) {
       for (const task of b.tasks ?? []) {
@@ -563,12 +636,25 @@ export class Store {
           botsMigrated = true;
         }
       }
+      if (b.autoStartVps !== undefined && b.autoStartVps !== true && b.autoStartVps !== false) {
+        delete b.autoStartVps;
+        botsMigrated = true;
+      }
+      const avatar = botAvatarProfile(b);
+      if (b.avatarUrl !== undefined && avatar.avatarUrl !== b.avatarUrl) {
+        delete b.avatarUrl;
+        botsMigrated = true;
+      }
+      if (b.avatarCrop !== undefined && avatar.avatarCrop !== b.avatarCrop) {
+        delete b.avatarCrop;
+        botsMigrated = true;
+      }
     }
     for (const b of this.bots) {
       if (!b.chiefOfStaff) continue;
-      const section = b.section || "";
-      if (!chiefSections.has(section)) {
-        chiefSections.add(section);
+      const key = sectionKey(b.section);
+      if (!chiefSectionsSeen.has(key)) {
+        chiefSectionsSeen.add(key);
         if (b.hidden) {
           b.hidden = false;
           botsMigrated = true;
@@ -665,7 +751,7 @@ export class Store {
     return this.groups.find((g) => g.threadId === threadId);
   }
 
-  createGroup(name: string, memberIds: string[], dm = false): GroupRecord {
+  createGroup(name: string, memberIds: string[], dm = false, section?: string): GroupRecord {
     const group: GroupRecord = {
       id: newId(),
       threadId: newId(),
@@ -677,6 +763,8 @@ export class Store {
       createdAt: Date.now(),
       dm: dm || undefined,
       busyBotId: null,
+      section,
+      ...(dm ? {} : { setupCompletedAt: null, setupSkippedAt: null }),
     };
     this.groups.unshift(group);
     this.saveGroups();
@@ -691,7 +779,7 @@ export class Store {
     );
   }
 
-  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd">>): GroupRecord | null {
+  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd" | "section" | "setupCompletedAt" | "setupSkippedAt">>): GroupRecord | null {
     const group = this.group(id);
     if (!group) return null;
     Object.assign(group, patch);
@@ -789,7 +877,21 @@ export class Store {
       }
     }
     this.emit({ type: "message", threadId, message: full });
+    // The first-run quiz is not a live ask. Talking past it hides it so the
+    // transcript is just the greeting plus what they said. Cards with a
+    // requestId are permission/question prompts and stay until answered.
+    if (full.role === "user" && full.kind === "text") this.dismissOnboardingCard(threadId);
     return full;
+  }
+
+  /** Hide the first-run quiz on this thread, if it is still open. */
+  dismissOnboardingCard(threadId: string): Message | null {
+    const t = this.thread(threadId);
+    const card = t.messages.find(
+      (message) => message.kind === "options" && message.card && !message.card.requestId && !message.card.dismissed,
+    );
+    if (!card?.card) return null;
+    return this.patchMessage(threadId, card.id, { card: { ...card.card, dismissed: true } });
   }
 
   /** Screen frames are ~100-500KB of base64 each; keeping every frame of a
@@ -826,6 +928,7 @@ export class Store {
       kind: "text",
       text,
       parentId: source.parentId ?? null,
+      replyToId: source.replyToId,
     };
     t.messages.push(full);
     t.activeLeafId = full.id;
@@ -892,7 +995,7 @@ export class Store {
 
   createBot(
     profile: Partial<
-      Pick<BotRecord, "name" | "title" | "description" | "color" | "mascotExpression" | "modelSelection" | "routingKey">
+      Pick<BotRecord, "name" | "title" | "description" | "color" | "mascotExpression" | "modelSelection" | "routingKey" | "section">
     > = {},
     opts: {
       /** false = no greeting/onboarding seed. Imported bots must not open
@@ -903,6 +1006,7 @@ export class Store {
     const name = profile.name?.trim() || pickBotName(this.bots.map((b) => b.name));
     const requestedRoutingKey = profile.routingKey?.trim() || defaultRoutingKey(name);
     const routingKey = requestedRoutingKey && !this.botByRoutingKey(requestedRoutingKey) ? requestedRoutingKey : undefined;
+    const section = sectionKey(profile.section);
     const bot: BotRecord = {
       id: newId(),
       ...(routingKey ? { routingKey } : {}),
@@ -918,6 +1022,7 @@ export class Store {
       resumeCursors: {},
       createdAt: Date.now(),
     };
+    if (section) bot.section = section;
     bot.tasks = [{ threadId: bot.threadId, title: UNTITLED_TASK, createdAt: bot.createdAt, resumeCursors: {} }];
     this.bots.unshift(bot);
     this.saveBots();
@@ -979,17 +1084,18 @@ export class Store {
   /** Elect one Chief of Staff per project section (or clear that section's role).
    * The changed records are returned so the server can update every open
    * window, including the bot that just handed the role over. */
-  setChiefOfStaff(id: string | null, explicitSection?: string): BotRecord[] | null {
-    if (id && !this.bot(id)) return null;
-    const section = id ? (this.bot(id)?.section || "") : (explicitSection || "");
+  setChiefOfStaff(id: string | null, section?: string | null): BotRecord[] | null {
+    const selected = id ? this.bot(id) : null;
+    if (id && !selected) return null;
+    const targetSection = sectionKey(selected?.section ?? section);
     const changed: BotRecord[] = [];
     for (const bot of this.bots) {
-      if ((bot.section || "") !== section) continue;
+      if (sectionKey(bot.section) !== targetSection) continue;
       const next = bot.id === id;
       if (Boolean(bot.chiefOfStaff) === next && !(next && bot.hidden)) continue;
       if (next) {
         bot.chiefOfStaff = true;
-        // The workspace's main contact must stay reachable in the sidebar.
+        // A section's main contact must stay reachable in the sidebar.
         bot.hidden = false;
       } else {
         bot.chiefOfStaff = false;

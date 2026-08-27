@@ -87,6 +87,14 @@ export type RuntimeEvent = RuntimeEventBase &
     | { type: "session.exited"; reason?: string }
     | { type: "turn.started" }
     | {
+        type: "turn.retrying";
+        /** 1-based: the retry about to be launched (1 = first relaunch). */
+        attempt: number;
+        delayMs: number;
+        /** Why this failure was judged retry-worthy (classifyError's reason). */
+        reason: string;
+      }
+    | {
         type: "turn.completed";
         ok: boolean;
         stopReason?: string | null;
@@ -232,6 +240,12 @@ export interface ProviderAdapter {
      * the driver cannot set effort, so the app never offers the control —
      * same rule as computerMcp: never show a knob the driver cannot turn. */
     effortLevels?: readonly EffortLevel[];
+    /** True when the driver keeps a live session across turns and can take
+     * a user message MID-TURN (delivered before the model's next call —
+     * "steer"). The composer stays open during a turn on such an engine;
+     * others keep the queue-one-and-wait behaviour. Same rule as the other
+     * flags: never show a control the driver cannot honour. */
+    queueing?: boolean;
     /** True only when local MCP calls can reach the human approval channel.
      * Full-auto/bypass provider instances must leave this false. */
     localComputerMcp?: boolean;
@@ -248,6 +262,10 @@ export interface ProviderAdapter {
     requestId: string,
     decision: { behavior: "allow" | "deny" | "answer"; message?: string },
   ): Promise<RequestOutcome>;
+  /** Deliver a user message into the RUNNING turn on this thread. Resolves
+   * false when there is no live turn to steer (the caller then sends it as
+   * a normal turn). Only drivers with `capabilities.queueing` implement it. */
+  steer?(threadId: ThreadId, text: string): Promise<boolean>;
   hasSession(threadId: ThreadId): boolean;
   stopAll(): Promise<void>;
   onEvent(listener: RuntimeEventListener): () => void;
@@ -296,7 +314,16 @@ export interface EngineInstall {
 // a rejection to an unavailable shadow snapshot.
 export interface ModelCatalog {
   default: string;
-  options: Array<{ id: string; label: string; custom?: boolean; loaded?: boolean }>;
+  options: Array<{
+    id: string;
+    label: string;
+    custom?: boolean;
+    loaded?: boolean;
+    /** total context window in tokens, when the driver knows it — sizes
+     * the model-facing rebuild (server/context-rebuild.ts). Unknown falls
+     * back to a pattern table over the model id, then a conservative default. */
+    contextWindow?: number;
+  }>;
 }
 
 export interface DriverCreateInput<Config> {

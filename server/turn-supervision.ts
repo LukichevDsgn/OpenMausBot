@@ -132,12 +132,6 @@ export class TurnSupervision {
     // Explicit user cancellation is the stronger visible intent when it
     // races a timeout. It still needs provider evidence or UNKNOWN fallback.
     if (!entry.intent || intent === "cancel") entry.intent = intent;
-    if (!entry.stopTimer) {
-      entry.stopTimer = setTimeout(() => {
-        this.expire(entry, entry.intent ?? intent, this.defaultUnknownReason(entry.intent ?? intent));
-      }, entry.graceMs);
-      entry.stopTimer.unref?.();
-    }
     if (!entry.interruptIssued) {
       entry.interruptIssued = true;
       try {
@@ -150,6 +144,17 @@ export class TurnSupervision {
         // The timer remains authoritative. A synchronous failure proves only
         // that the request failed, not that the provider stopped.
       }
+    }
+    // Initiate the provider interrupt before registering the same-deadline
+    // UNKNOWN fallback. Adapters such as ACP use their own captured grace to
+    // emit a canonical cancelled terminal; when both deadlines are equal,
+    // that evidence must settle first and release the adapter's active turn
+    // before queued attended work is admitted.
+    if (!entry.stopTimer && this.active.get(entry.key) === entry) {
+      entry.stopTimer = setTimeout(() => {
+        this.expire(entry, entry.intent ?? intent, this.defaultUnknownReason(entry.intent ?? intent));
+      }, entry.graceMs);
+      entry.stopTimer.unref?.();
     }
     return true;
   }

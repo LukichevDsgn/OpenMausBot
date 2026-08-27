@@ -112,6 +112,17 @@ struct ChatListView: View {
             }
             .toolbar(.hidden, for: .navigationBar)
             .navigationDestination(for: Chat.self) { ChatView(chat: $0) }
+            .onChange(of: session.notificationChat) { _, chat in
+                guard let chat else { return }
+                path.append(chat)
+                session.consumeNotificationChat()
+            }
+            .task {
+                if let chat = session.notificationChat {
+                    path.append(chat)
+                    session.consumeNotificationChat()
+                }
+            }
 #if DEBUG
             // `-store-preview -open-first`: land on the first chat, for the
             // screenshot harness and for looking at the chat screen without
@@ -153,17 +164,15 @@ struct ChatListView: View {
 
     // MARK: - Header
 
-    /// You (the computer you are paired with) on the left, settings on the
-    /// right, and where you are in between. Glass tiles, like the system's.
+    /// The paired computer's profile on the left, one settings action on the
+    /// right, and where you are in between. The avatar is identity, not a
+    /// second hidden route to the same screen.
     private var header: some View {
         HStack(alignment: .center) {
-            NavigationLink { SettingsView() } label: {
-                ProfileAvatar(name: session.connection?.name ?? "You", size: 30)
-                    .frame(width: 44, height: 44)
-            }
-            .buttonStyle(.plain)
-            .glassCapsule()
-            .accessibilityLabel("Settings")
+            ProfileAvatar(name: session.connection?.name ?? "You", size: 30)
+                .frame(width: 44, height: 44)
+                .glassCapsule(interactive: false)
+                .accessibilityLabel("Connected to \(session.connection?.name ?? "your computer")")
 
             Spacer(minLength: 8)
 
@@ -335,13 +344,13 @@ struct GroupTile: View {
             ZStack {
                 if let room {
                     Circle().fill(Color.secondary.opacity(0.14))
-                    let colors = memberColors(room)
-                    if let first = colors.first {
-                        MausAvatar(color: first, size: 34, state: .happy, animated: false)
+                    let bots = memberBots(room)
+                    if let first = bots.first {
+                        BotAvatarView(bot: first, size: 34, state: .happy, animated: false)
                             .offset(x: -9, y: -6)
                     }
-                    if colors.count > 1 {
-                        MausAvatar(color: colors[1], size: 30, state: .happy, animated: false)
+                    if bots.count > 1 {
+                        BotAvatarView(bot: bots[1], size: 30, state: .happy, animated: false)
                             .padding(2)
                             .background(Circle().fill(Color(uiColor: .systemBackground)))
                             .offset(x: 11, y: 9)
@@ -374,8 +383,8 @@ struct GroupTile: View {
         .contentShape(Rectangle())
     }
 
-    private func memberColors(_ room: Room) -> [String] {
-        room.memberIds.compactMap { session.state.bot($0)?.color }
+    private func memberBots(_ room: Room) -> [Bot] {
+        room.memberIds.compactMap { session.state.bot($0) }
     }
 }
 
@@ -401,7 +410,7 @@ struct ChatRow: View {
             .frame(maxHeight: .infinity)
 
             HStack(alignment: .top, spacing: 14) {
-                MausAvatar(color: chat.color, size: 52, state: state)
+                ChatAvatarView(chat: chat, size: 52, state: state, animated: state.showsActivity)
                     .padding(.top, 12)
 
                 VStack(alignment: .leading, spacing: 4) {

@@ -17,7 +17,10 @@ const allowed = (method: string, path: string) => ask(method, path) === null;
 describe("credentials", () => {
   it("lets an unpaired device pair, and do nothing else", () => {
     expect(ask("POST", "/api/pair", false)).toBeNull();
-    expect(ask("GET", "/api/bots", false)?.status).toBe(401);
+    expect(ask("GET", "/api/bots", false)).toEqual({
+      status: 401,
+      error: "pair this device from Phone settings in OpenMausBot on your computer",
+    });
   });
 
   it("lets anyone curl liveness — it is the unauthenticated smoke test", () => {
@@ -36,6 +39,7 @@ describe("what the app may do", () => {
     ["GET", "/api/config"],
     ["GET", "/api/events"],
     ["GET", "/api/instances"],
+    ["GET", "/api/companion/endpoints"],
     ["GET", "/api/bots"],
     ["POST", "/api/bots"],
     ["POST", "/api/bots/bot_123/messages"],
@@ -48,6 +52,8 @@ describe("what the app may do", () => {
     ["POST", "/api/bots/bot_123/tasks/th_1"],
     ["PATCH", "/api/bots/bot_123/tasks/th_1"],
     ["DELETE", "/api/bots/bot_123/tasks/th_1"],
+    ["PATCH", "/api/bots/bot_123/profile"],
+    ["POST", "/api/bots/bot_123/avatar/generate"],
     ["POST", "/api/bots/bot_123/computer/join"],
     ["POST", "/api/groups/room-1/messages"],
     ["POST", "/api/groups/room-1/read"],
@@ -57,6 +63,19 @@ describe("what the app may do", () => {
     ["GET", "/api/threads/th_1/export"],
     ["POST", "/api/threads/th_1/respond"],
     ["GET", "/api/search"],
+    ["POST", "/api/attachments"],
+    ["GET", "/api/attachments/avatar-123.webp"],
+    ["GET", "/api/tts/voices"],
+    ["POST", "/api/tts/speak"],
+    ["GET", "/api/routines"],
+    ["POST", "/api/routines"],
+    ["PATCH", "/api/routines/routine_1"],
+    ["DELETE", "/api/routines/routine_1"],
+    ["POST", "/api/routines/routine_1/run"],
+    ["GET", "/api/connectors/catalog"],
+    ["GET", "/api/connectors/connected"],
+    ["GET", "/api/connectors"],
+    ["POST", "/api/connectors/slack/authorize"],
   ];
 
   for (const [method, path] of calls) {
@@ -74,15 +93,44 @@ describe("what it may not", () => {
       ["POST", "/api/local-computer/start"],
       ["POST", "/api/webhooks"],
       ["POST", "/api/webhooks/wh_1/rotate"],
-      ["GET", "/api/connectors"],
       ["DELETE", "/api/connectors/gmail"],
-      ["GET", "/api/routines"],
       ["POST", "/api/teams/import"],
     ] as Array<[string, string]>) {
       const denial = ask(method, path);
       expect(denial?.status, `${method} ${path}`).toBe(403);
       expect(denial?.error, `${method} ${path}`).toMatch(/on your computer/);
     }
+    expect(ask("GET", "/api/devices")).toEqual({
+      status: 403,
+      error: "Phone settings are managed on your computer",
+    });
+    expect(ask("GET", "/api/companion")).toEqual({
+      status: 403,
+      error: "Phone settings are managed on your computer",
+    });
+  });
+
+  it("keeps endpoint refresh authenticated and exact-method only", () => {
+    expect(ask("GET", "/api/companion/endpoints", false)?.status).toBe(401);
+    expect(ask("GET", "/api/companion/endpoints")).toBeNull();
+    expect(ask("POST", "/api/companion/endpoints")?.status).toBe(403);
+    expect(ask("GET", "/api/companion/endpoints/extra")?.status).toBe(403);
+  });
+
+  it("describes only refused routine operations as computer-only", () => {
+    for (const [method, path] of [
+      ["GET", "/api/routines/routine_1"],
+      ["PUT", "/api/routines/routine_1"],
+      ["POST", "/api/routines/routine_1/cancel"],
+    ] as Array<[string, string]>) {
+      const denial = ask(method, path);
+      expect(denial, `${method} ${path}`).toEqual({
+        status: 403,
+        error: "this routine operation is only available on your computer",
+      });
+    }
+    expect(ask("GET", "/api/routines")).toBeNull();
+    expect(ask("POST", "/api/routines/routine_1/run")).toBeNull();
   });
 
   it("denies the peer-agent endpoints exist at all", () => {
@@ -112,6 +160,15 @@ describe("what it may not", () => {
     expect(allowed("POST", "/api/threads/th_1/messages")).toBe(false);
     expect(allowed("GET", "/api/groups/room-1")).toBe(false);
     expect(allowed("PATCH", "/api/bots/bot_123")).toBe(false);
+    expect(allowed("PATCH", "/api/bots/bot_123/profile/execution-policy")).toBe(false);
+    expect(allowed("PUT", "/api/config")).toBe(false);
+    expect(allowed("GET", "/api/attachments/../config.json")).toBe(false);
+    expect(allowed("POST", "/api/routine-runs/run_1/cancel")).toBe(false);
+    expect(allowed("DELETE", "/api/connectors/slack")).toBe(false);
+    expect(allowed("GET", "/api/connectors/connected/all")).toBe(false);
+    // revocation is a Mac-only affordance: the phone can list and add
+    // accounts but the account DELETE route is deliberately not allowed
+    expect(allowed("DELETE", "/api/connectors/slack/accounts/ca_123")).toBe(false);
     expect(allowed("PATCH", "/api/groups/room-1")).toBe(false);
   });
 

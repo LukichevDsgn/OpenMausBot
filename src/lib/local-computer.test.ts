@@ -4,6 +4,8 @@ import {
   autoSelectsLocalComputer,
   instanceSupportsLocalComputer,
   linuxAutoDescription,
+  localComputerDisabledReason,
+  localComputerSelectable,
 } from "./local-computer";
 
 describe("local computer UI eligibility", () => {
@@ -24,6 +26,30 @@ describe("local computer UI eligibility", () => {
         bot,
       ),
     ).toBe(false);
+    expect(
+      instanceSupportsLocalComputer(
+        [{ ...instances[0], capabilities: { computerMcp: true } }] as InstanceInfo[],
+        bot,
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps This computer selectable on macOS before CUA is granted", () => {
+    const capabilities = {
+      host: { platform: "darwin" as const },
+      localComputer: { available: false },
+    } as DesktopCapabilities;
+    expect(localComputerSelectable({ capabilities, providerSupportsLocal: true })).toBe(true);
+    expect(localComputerSelectable({ capabilities, providerSupportsLocal: false })).toBe(false);
+    expect(
+      localComputerSelectable({
+        capabilities: {
+          host: { platform: "linux" as const },
+          localComputer: { available: false },
+        } as DesktopCapabilities,
+        providerSupportsLocal: true,
+      }),
+    ).toBe(false);
   });
 
   it("states that Linux Auto never selects this computer", () => {
@@ -36,6 +62,23 @@ describe("local computer UI eligibility", () => {
         localSelectable: true,
       }),
     ).toBe(false);
+  });
+
+  it("explains the Wayland seat-safety block and names the supported session", () => {
+    const capabilities = {
+      host: { platform: "linux" as const },
+      localComputer: {
+        available: false,
+        enabled: false,
+        reasonCode: "linux-wayland-seat-safety-blocked",
+      },
+    } as DesktopCapabilities;
+
+    expect(
+      localComputerDisabledReason({ capabilities, providerSupportsLocal: true }),
+    ).toBe(
+      "Local computer control is not available on Wayland yet. Sign out and choose Ubuntu on Xorg to use This computer.",
+    );
   });
 
   it("preserves the ready local fallback on supported non-Linux hosts", () => {

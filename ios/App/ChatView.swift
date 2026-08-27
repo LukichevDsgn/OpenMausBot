@@ -14,18 +14,23 @@ import CompanionCore
 // isn't. The App target is iOS; CompanionCore is where the portable half
 // lives.
 import UIKit
+import AVFoundation
 
 struct ChatView: View {
     let chat: Chat
     @EnvironmentObject private var session: Session
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
     @State private var draft = ""
     @State private var showingTasks = false
     @State private var showingComputer = false
     @State private var showingPlus = false
+    @State private var showingProfile = false
+    @State private var showCommandHUD = false
     @State private var shareFile: ShareFile?
     @FocusState private var composerFocused: Bool
+    @StateObject private var dictation = SpeechDictation()
     /// The opening beat: the island grows with the bot's face in it, then
     /// shrinks away as the face settles into the header. `facePhase` is 1
     /// with the face in the island, 0 with it home in the header.
@@ -37,10 +42,6 @@ struct ChatView: View {
     /// one per chat and it has no message id to borrow.
     static let liveBubbleId = "companion.live"
 
-    private var messages: [Message] {
-        session.state.visibleTranscript(forThread: chat.threadId)
-    }
-
     /// The live chat record, so busy/unread stay current as frames land.
     private var current: Chat {
         switch chat {
@@ -48,6 +49,15 @@ struct ChatView: View {
         case let .room(room):
             return session.state.rooms.first { $0.id == room.id }.map(Chat.room) ?? chat
         }
+    }
+
+    /// A bot receives a new thread when its task changes. Navigation keeps
+    /// the original Chat value, so every transcript lookup must follow the
+    /// live record instead of the snapshot that opened this screen.
+    private var threadId: String { current.threadId }
+
+    private var messages: [Message] {
+        session.state.visibleTranscript(forThread: threadId)
     }
 
     /// Unread elsewhere — what the back pill's badge counts, like Messages.
@@ -81,14 +91,14 @@ struct ChatView: View {
                         // room for the floating face when scrolled to the top
                         Color.clear.frame(height: 72)
 
-                        if session.state.hasMore[chat.threadId] == true {
+                        if session.state.hasMore[threadId] == true {
                             Button("Load earlier messages") {
                                 // keep the reader where they were: after older
                                 // messages are prepended, sit back on the one
                                 // that used to be at the top
                                 let anchor = transcript.first?.id
                                 Task {
-                                    await session.loadOlder(threadId: chat.threadId)
+                                    await session.loadOlder(threadId: threadId)
                                     if let anchor { proxy.scrollTo(anchor, anchor: .top) }
                                 }
                             }
@@ -123,15 +133,19 @@ struct ChatView: View {
                         // one arrives — the store clears it on the same frame
                         // that appends the message, so there is never a beat
                         // where both are on screen.
-                        if let live = session.state.streaming[chat.threadId], !live.isEmpty {
+                        if let live = session.state.streaming[threadId], !live.isEmpty {
                             StreamingBubble(text: live, reasoning: nil, color: current.color)
                                 .id(Self.liveBubbleId)
-                        } else if let thinking = session.state.reasoning[chat.threadId], !thinking.isEmpty {
+                        } else if let thinking = session.state.reasoning[threadId], !thinking.isEmpty {
                             // Only while there is no answer yet. Once tokens
                             // of the reply exist, the reasoning is behind us
                             // and showing both is just noise.
                             StreamingBubble(text: nil, reasoning: thinking, color: current.color)
                                 .id(Self.liveBubbleId)
+                        } else if current.busy {
+                            TypingIndicatorView(tintColor: MausPalette.color(current.color))
+                                .id(Self.liveBubbleId)
+                                .accessibilityLabel("\(current.name) is working")
                         }
                     }
                     .padding(.horizontal, 16)
@@ -166,7 +180,7 @@ struct ChatView: View {
                                 Color.clear
                             }
                         }
-                        MausAvatar(color: current.color, size: faceSize, state: MausState.forChat(current, in: session.state), comets: islandExpanded)
+                        ChatAvatarView(chat: current, size: faceSize, state: MausState.forChat(current, in: session.state), animated: MausState.forChat(current, in: session.state).showsActivity || islandExpanded, comets: islandExpanded)
                             .offset(y: faceCentre - faceSize / 2)
                             .allowsHitTesting(false)
                     }
@@ -196,7 +210,7 @@ struct ChatView: View {
                 // the string so this fires once per delta batch, and without
                 // animation — animating every token turns a smooth stream
                 // into a stutter, because each scroll interrupts the last.
-                .onChange(of: session.state.streaming[chat.threadId]?.count ?? 0) { _, length in
+                .onChange(of: session.state.streaming[threadId]?.count ?? 0) { _, length in
                     guard length > 0 else { return }
                     proxy.scrollTo(Self.liveBubbleId, anchor: .bottom)
                 }
@@ -215,6 +229,7 @@ struct ChatView: View {
                     session.consumeFocus(messageId)
                 }
             }
+            .id(threadId)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             composer
@@ -226,12 +241,15 @@ struct ChatView: View {
         .navigationDestination(isPresented: $showingComputer) {
             if case let .bot(bot) = current { ComputerView(bot: bot) }
         }
-        .task {
+        .task(id: threadId) {
             // opening a chat is what marks it read, exactly as on the desktop
             if current.unread { await session.markRead(current) }
 #if DEBUG
             // `-open-plus`: the + sheet up, for the screenshot harness
             if ProcessInfo.processInfo.arguments.contains("-open-plus") { showingPlus = true }
+            // Profile parity screenshots without automating a tap through the
+            // animated island/header transition.
+            if ProcessInfo.processInfo.arguments.contains("-open-profile") { showingProfile = true }
 #endif
         }
         .onChange(of: current.unread) { _, unread in
@@ -240,8 +258,42 @@ struct ChatView: View {
             // bit here rather than leaving a badge on an open conversation.
             if unread { Task { await session.markRead(current) } }
         }
+        .onDisappear { dictation.stop() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { dictation.stop() }
+        }
+        .onChange(of: showingComputer) { _, shown in
+            if shown { dictation.stop() }
+        }
+        .onChange(of: showingTasks) { _, shown in
+            if shown { dictation.stop() }
+        }
+        .onChange(of: showingProfile) { _, shown in
+            if shown { dictation.stop() }
+        }
+        .onChange(of: showingPlus) { _, shown in
+            if shown { dictation.stop() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)) { note in
+            let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey]
+            let value = (raw as? NSNumber)?.uintValue ?? (raw as? UInt)
+            if value == AVAudioSession.InterruptionType.began.rawValue {
+                dictation.stop()
+            }
+        }
+        .onChange(of: dictation.transcript) { _, spoken in
+            // Always join against the text frozen at capture start. A newer
+            // partial then replaces the older partial instead of duplicating it.
+            draft = Dictation.draft(base: dictation.base, transcript: spoken)
+        }
+        .onChange(of: dictation.isListening) { _, listening in
+            if listening { composerFocused = false }
+        }
         .sheet(isPresented: $showingTasks) {
             if case let .bot(bot) = current { TaskManagerView(bot: bot) }
+        }
+        .sheet(isPresented: $showingProfile) {
+            if case let .bot(bot) = current { AgentProfileView(bot: bot) }
         }
         .sheet(item: $shareFile) { file in
             ActivityShareSheet(items: [file.url])
@@ -312,11 +364,27 @@ struct ChatView: View {
         VStack(spacing: 6) {
             // Always here, following the island's face while that one is
             // the source: when the island lets go, this one flies home.
-            // the face itself is drawn by the island layer above, so it can
-            // travel; this is its seat
-            Color.clear.frame(width: 60, height: 60)
-            Menu {
-                chatActions
+            // The face itself is drawn by the island layer above so there is
+            // still only one animated avatar. This transparent seat becomes
+            // its independent profile button once the opening transition has
+            // settled.
+            if case .bot = current {
+                Button { showingProfile = true } label: {
+                    Color.clear
+                        .frame(width: 60, height: 60)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .allowsHitTesting(!islandVisible)
+                .accessibilityHidden(islandVisible)
+                .accessibilityLabel("Open \(current.name) profile")
+                .accessibilityHint("Edits this agent's identity, avatar, notifications, and voice")
+            } else {
+                Color.clear.frame(width: 60, height: 60)
+            }
+            Button {
+                if case .bot = current { showingProfile = true }
+                else { showingPlus = true }
             } label: {
                 HStack(spacing: 6) {
                     Text(current.name)
@@ -329,7 +397,7 @@ struct ChatView: View {
                             .foregroundStyle(Color.secondary)
                             .lineLimit(1)
                     }
-                    Image(systemName: "chevron.right")
+                    Image(systemName: current.isBot ? "person.crop.circle" : "ellipsis")
                         .font(.system(size: 11, weight: .bold))
                         .foregroundStyle(Color.secondary)
                 }
@@ -340,42 +408,9 @@ struct ChatView: View {
             }
             .buttonStyle(.plain)
             .glassCapsule()
+            .accessibilityLabel(current.isBot ? "Open \(current.name) profile" : "Open \(current.name) chat options")
         }
         .padding(.top, -4)
-    }
-
-    /// Everything the name pill and the composer's + can do. One list, two
-    /// doors — the pill for "about this chat", the + for "do something".
-    @ViewBuilder
-    private var chatActions: some View {
-        if case let .bot(bot) = current {
-            Button("New task", systemImage: "plus.square.on.square") {
-                Task { await session.createTask(for: bot, title: nil) }
-            }
-            .disabled(bot.busy == true)
-            Button("Tasks", systemImage: "square.stack") { showingTasks = true }
-            Button("Watch computer", systemImage: "display") { showingComputer = true }
-        }
-        Button("Share as Markdown", systemImage: "doc.plaintext") {
-            Task {
-                if let url = await session.export(threadId: current.threadId, format: "markdown") {
-                    shareFile = ShareFile(url: url)
-                }
-            }
-        }
-        Button("Share as JSON", systemImage: "curlybraces") {
-            Task {
-                if let url = await session.export(threadId: current.threadId, format: "json") {
-                    shareFile = ShareFile(url: url)
-                }
-            }
-        }
-        if current.busy, case let .bot(bot) = current {
-            Divider()
-            Button("Interrupt", systemImage: "stop.fill", role: .destructive) {
-                Task { await session.interrupt(bot: bot) }
-            }
-        }
     }
 
     // MARK: - The + sheet
@@ -470,6 +505,16 @@ struct ChatView: View {
                 }
             }
         })
+        out.append(PlusAction(
+            id: "share-json", systemImage: "curlybraces", title: "Share as JSON",
+            subtitle: "Structured transcript data"
+        ) {
+            Task {
+                if let url = await session.export(threadId: current.threadId, format: "json") {
+                    shareFile = ShareFile(url: url)
+                }
+            }
+        })
         if current.busy, case let .bot(bot) = current {
             out.append(PlusAction(
                 id: "stop", systemImage: "stop.fill", title: "Interrupt",
@@ -502,75 +547,164 @@ struct ChatView: View {
         !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private func submit() {
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+    private var hasPendingApproval: Bool {
+        messages.contains { $0.card?.isPending == true }
+    }
+
+    private func submit(_ explicitText: String? = nil) {
+        // This also cancels an in-flight permission prompt before it can
+        // open the microphone after the message has already been sent.
+        dictation.stop()
+        let text = (explicitText ?? draft).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         draft = ""
+        showCommandHUD = false
+        SoundEffects.playSent()
+        Haptics.impact(.medium)
         Task { await session.send(text, to: current) }
     }
 
     // MARK: - Composer
 
-    /// A round + and a glass pill with the send button inside it.
+    /// A round + and a glass pill with dictation and send inside it.
     private var composer: some View {
-        GlassGroup(spacing: 10) {
-            HStack(alignment: .bottom, spacing: 10) {
-                Button {
-                    composerFocused = false
-                    withAnimation(.snappy(duration: 0.28)) { showingPlus.toggle() }
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 20, weight: .medium))
-                        .foregroundStyle(showingPlus ? Color(uiColor: .systemBackground) : Color.primary)
-                        .rotationEffect(.degrees(showingPlus ? 45 : 0))
-                        .frame(width: 44, height: 44)
-                        .background(Circle().fill(showingPlus ? Color.primary : Color.clear))
-                        .contentShape(Circle())
+        VStack(spacing: 6) {
+            if let error = dictation.error {
+                Text(error)
+                    .font(.system(size: 13))
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 4)
+            }
+
+            if showCommandHUD {
+                CommandSkillHUDView(
+                    text: $draft,
+                    isVisible: $showCommandHUD,
+                    commands: current.isBot
+                        ? CommandSkillHUDView.defaultCommands
+                        : CommandSkillHUDView.defaultCommands.filter { $0.id != "computer" && $0.id != "tasks" },
+                    accentColor: MausPalette.color(current.color)
+                ) { command in
+                    switch command.id {
+                    case "computer":
+                        draft = ""
+                        showingComputer = true
+                    case "tasks":
+                        draft = ""
+                        showingTasks = true
+                    default: submit(command.command)
+                    }
                 }
-                .buttonStyle(.plain)
-                .glassCapsule()
-                .accessibilityLabel(showingPlus ? "Close" : "More")
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            } else if draft.isEmpty && !current.busy && !hasPendingApproval {
+                PredictiveActionChipsView(accentColor: MausPalette.color(current.color)) { chip in
+                    submit(chip.prompt)
+                }
+                .transition(.opacity)
+            }
 
-                HStack(alignment: .bottom, spacing: 6) {
-                    TextField("Ask \(current.name)", text: $draft, axis: .vertical)
-                        .lineLimit(1...5)
-                        .font(.system(size: 17))
-                        .padding(.leading, 16)
-                        .padding(.vertical, 11)
-                        .focused($composerFocused)
-                        .submitLabel(.send)
-                        // Return sends, Shift+Return breaks the line — the shape
-                        // every chat app has. `.ignored` hands the keypress back to
-                        // the text field, which is what inserts the newline; there is
-                        // no way to type one otherwise once Return is claimed.
-                        .onKeyPress(.return, phases: .down) { press in
-                            guard !press.modifiers.contains(.shift) else { return .ignored }
-                            submit()
-                            return .handled
-                        }
-                        // software keyboards have no Shift+Return, so their Return
-                        // key is a send — which is what `.submitLabel(.send)` promises
-                        .onSubmit(submit)
-
+            GlassGroup(spacing: 10) {
+                HStack(alignment: .bottom, spacing: 10) {
                     Button {
-                        submit()
+                        dictation.stop()
+                        composerFocused = false
+                        withAnimation(.snappy(duration: 0.28)) { showingPlus.toggle() }
                     } label: {
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 15, weight: .bold))
-                            .foregroundStyle(canSend ? Color.white : Color.secondary)
-                            .frame(width: 32, height: 32)
-                            .background(
-                                Circle().fill(canSend ? BubbleColor.mine : Color.secondary.opacity(0.18))
-                            )
+                        Image(systemName: "plus")
+                            .font(.system(size: 20, weight: .medium))
+                            .foregroundStyle(showingPlus ? Color(uiColor: .systemBackground) : Color.primary)
+                            .rotationEffect(.degrees(showingPlus ? 45 : 0))
+                            .frame(width: 44, height: 44)
+                            .background(Circle().fill(showingPlus ? Color.primary : Color.clear))
+                            .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
-                    .disabled(!canSend)
-                    .padding(.trailing, 6)
-                    .padding(.bottom, 6)
-                    .animation(.easeOut(duration: 0.15), value: canSend)
+                    .glassCapsule()
+                    .accessibilityLabel(showingPlus ? "Close" : "More")
+
+                    HStack(alignment: .bottom, spacing: 6) {
+                        Button {
+                            dictation.stop()
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                                showCommandHUD.toggle()
+                            }
+                            Haptics.selection()
+                        } label: {
+                            Image(systemName: "command")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundStyle(showCommandHUD ? Color.primary : Color.secondary)
+                                .frame(width: 30, height: 32)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Slash commands")
+                        .padding(.leading, 6)
+                        .padding(.bottom, 6)
+
+                        TextField(
+                            dictation.isListening ? "Listening…" : "Ask \(current.name)",
+                            text: $draft,
+                            axis: .vertical
+                        )
+                            .lineLimit(1...5)
+                            .font(.system(size: 17))
+                            .padding(.vertical, 11)
+                            .focused($composerFocused)
+                            .submitLabel(.send)
+                            // Partial transcripts rebuild from a frozen base;
+                            // prevent competing edits without dimming the text.
+                            .allowsHitTesting(!dictation.isListening && !dictation.isStarting)
+                            .onChange(of: draft) { _, value in
+                                withAnimation(.easeInOut(duration: 0.15)) {
+                                    showCommandHUD = value.hasPrefix("/")
+                                }
+                            }
+                            .onKeyPress(.return, phases: .down) { press in
+                                guard !press.modifiers.contains(.shift) else { return .ignored }
+                                submit()
+                                return .handled
+                            }
+                            .onSubmit { submit() }
+
+                        Button {
+                            composerFocused = false
+                            dictation.toggle(capturing: draft)
+                        } label: {
+                            Image(systemName: dictation.isListening ? "mic.fill" : "mic")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(dictation.isListening ? Color.red : Color.primary)
+                                .frame(width: 32, height: 32)
+                                .background(
+                                    Circle().fill(
+                                        dictation.isListening
+                                            ? Color.red.opacity(0.2)
+                                            : Color.secondary.opacity(0.12)
+                                    )
+                                )
+                                .symbolEffect(.pulse, isActive: dictation.isListening)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.bottom, 6)
+                        .accessibilityLabel(dictation.isListening ? "Stop dictation" : "Start dictation")
+
+                        Button { submit() } label: {
+                            Image(systemName: "arrow.up")
+                                .font(.system(size: 15, weight: .bold))
+                                .foregroundStyle(canSend ? Color.white : Color.secondary)
+                                .frame(width: 32, height: 32)
+                                .background(
+                                    Circle().fill(canSend ? BubbleColor.mine : Color.secondary.opacity(0.18))
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!canSend)
+                        .padding(.trailing, 6)
+                        .padding(.bottom, 6)
+                        .animation(.easeOut(duration: 0.15), value: canSend)
+                    }
+                    .frame(minHeight: 44)
+                    .glassCapsule(interactive: false)
                 }
-                .frame(minHeight: 44)
-                .glassCapsule(interactive: false)
             }
         }
         .padding(.horizontal, 12)
@@ -713,8 +847,81 @@ struct TextBubble: View {
     let chat: Chat
     var tailed = true
 
+    private var parsedDiff: (filename: String, diff: String)? {
+        guard message.role != .user, let source = message.text else { return nil }
+        let text = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        let diff: String
+        if text.hasPrefix("```diff"), text.hasSuffix("```") {
+            diff = String(text.dropFirst("```diff".count).dropLast(3))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if text.hasPrefix("diff --git ") {
+            diff = text
+        } else {
+            return nil
+        }
+        let firstLine = diff.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? ""
+        let filename = firstLine.split(separator: " ").last.map(String.init)?
+            .replacingOccurrences(of: "b/", with: "") ?? "Git patch"
+        return (filename, diff)
+    }
+
+    private var parsedTable: (headers: [String], rows: [[String]])? {
+        guard message.role != .user, let source = message.text else { return nil }
+        let lines = source.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        guard lines.count >= 3, lines.allSatisfy({ $0.hasPrefix("|") && $0.hasSuffix("|") }) else {
+            return nil
+        }
+        let headers = Self.tableCells(lines[0])
+        let separators = Self.tableCells(lines[1])
+        guard !headers.isEmpty, separators.count == headers.count,
+              separators.allSatisfy(Self.isTableSeparator) else { return nil }
+        let rows = lines.dropFirst(2).map(Self.tableCells)
+        guard rows.allSatisfy({ $0.count == headers.count }) else { return nil }
+        return (headers, rows)
+    }
+
+    private static func tableCells(_ line: String) -> [String] {
+        var body = line
+        if body.first == "|" { body.removeFirst() }
+        if body.last == "|" { body.removeLast() }
+
+        var cells: [String] = []
+        var cell = ""
+        var escaped = false
+        for character in body {
+            if escaped {
+                if character == "|" {
+                    cell.append(character)
+                } else {
+                    cell.append("\\")
+                    cell.append(character)
+                }
+                escaped = false
+            } else if character == "\\" {
+                escaped = true
+            } else if character == "|" {
+                cells.append(cell.trimmingCharacters(in: .whitespaces))
+                cell = ""
+            } else {
+                cell.append(character)
+            }
+        }
+        if escaped { cell.append("\\") }
+        cells.append(cell.trimmingCharacters(in: .whitespaces))
+        return cells
+    }
+
+    private static func isTableSeparator(_ cell: String) -> Bool {
+        let compact = cell.replacingOccurrences(of: " ", with: "")
+        let core = compact.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+        return core.count >= 3 && core.allSatisfy { $0 == "-" }
+    }
+
     var body: some View {
         let mine = message.role == .user
+        let customCard = parsedDiff != nil || parsedTable != nil
         // rooms attribute each line to the member who said it
         let speaker = message.from
         // No face beside the bubble: the bot's face is in the header, and in
@@ -731,7 +938,11 @@ struct TextBubble: View {
                 // Bots get markdown, you do not — the same split the desktop
                 // makes. Markdown you did not intend is worse than markdown
                 // you did: a message about `**` should show the asterisks.
-                if mine {
+                if let diff = parsedDiff {
+                    GitPRDiffCardView(filename: diff.filename, diffText: diff.diff)
+                } else if let table = parsedTable {
+                    SQLResultTableView(columns: table.headers, rows: table.rows)
+                } else if mine {
                     Text(message.text ?? "")
                         .font(.system(size: 17))
                         .foregroundStyle(BubbleColor.mineText)
@@ -744,14 +955,18 @@ struct TextBubble: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .padding(.horizontal, 15)
-            .padding(.vertical, 11)
+            .padding(.horizontal, customCard ? 0 : 15)
+            .padding(.vertical, customCard ? 0 : 11)
             .background(
-                SpeechBubble(tail: tailed ? (mine ? .trailing : .leading) : .none)
-                    .fill(mine ? BubbleColor.mine : BubbleColor.theirs)
+                Group {
+                    if !customCard {
+                        SpeechBubble(tail: tailed ? (mine ? .trailing : .leading) : .none)
+                            .fill(mine ? BubbleColor.mine : BubbleColor.theirs)
+                    }
+                }
             )
             // leave room for the tail below, so the next row does not sit on it
-            .padding(.bottom, tailed ? SpeechBubble.tailDrop() : 0)
+            .padding(.bottom, !customCard && tailed ? SpeechBubble.tailDrop() : 0)
 
             if !mine { Spacer(minLength: 44) }
         }
@@ -765,14 +980,11 @@ struct ActivityChip: View {
 
     var body: some View {
         if let tool {
-            Label {
-                Text(tool.name).lineLimit(1)
-            } icon: {
-                Image(systemName: tool.ok == false ? "exclamationmark.triangle" : "wrench.and.screwdriver")
-            }
-            .font(.system(size: 13))
-            .foregroundStyle(tool.ok == false ? Color.red : Color.secondary)
-            .padding(.leading, 4)
+            SkillExecutionReceiptView(
+                skillName: tool.name,
+                status: tool.ok.map { $0 ? "success" : "error" } ?? "running"
+            )
+            .padding(.leading, 2)
         }
     }
 }
@@ -804,9 +1016,7 @@ struct CardView: View {
 
     /// One definition of "the refusal", shared by the button tint and the
     /// choice above so the two cannot drift apart.
-    private static func isRefusal(_ option: String) -> Bool {
-        option.caseInsensitiveCompare("Deny") == .orderedSame
-    }
+    private static func isRefusal(_ option: String) -> Bool { OptionCard.isRefusal(option) }
 
     private var tint: Color { MausPalette.color(chat.color) }
 
@@ -842,7 +1052,7 @@ struct CardView: View {
                             Button {
                                 answering = true
                                 Task {
-                                    await session.answer(threadId: chat.threadId, card: card, choice: option)
+                                    await session.answer(chat: chat, card: card, choice: option)
                                     answering = false
                                 }
                             } label: {
@@ -871,7 +1081,12 @@ struct CardView: View {
                             answering = true
                             Task {
                                 await session.alwaysAllow(bot: bot, card: card)
-                                await session.answer(threadId: chat.threadId, card: card, choice: allow)
+                                await session.answer(
+                                    chat: chat,
+                                    card: card,
+                                    choice: allow,
+                                    rememberingPermission: false
+                                )
                                 answering = false
                             }
                         }
@@ -960,17 +1175,12 @@ struct StreamingBubble: View {
         HStack(alignment: .bottom, spacing: 0) {
             VStack(alignment: .leading, spacing: 4) {
                 if let reasoning, !reasoning.isEmpty, text?.isEmpty != false {
-                    // Quieter and smaller than an answer, because it is not
-                    // one. Tail-limited: reasoning runs to thousands of words
-                    // and the part worth seeing is always the end.
-                    //
-                    // Plain text, unlike the answer: the tail cut lands
-                    // wherever it lands, and rendering markdown that starts
-                    // mid-syntax invents structure the model did not write.
-                    Text(String(reasoning.suffix(400)))
-                        .font(.system(size: 14))
-                        .foregroundStyle(Color.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    AgentThoughtChamberView(
+                        reasoning: String(reasoning.suffix(2_000)),
+                        botName: "Bot",
+                        mascotColor: MausPalette.color(color),
+                        isStreaming: true
+                    )
                 }
                 if let text, !text.isEmpty {
                     // Same renderer as the settled bubble, for the same
