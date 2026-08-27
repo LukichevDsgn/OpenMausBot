@@ -5,10 +5,13 @@ import { join } from "node:path";
 
 import {
   decideBundledSkills,
+  enabledProviderCapabilityIds,
   effectiveSkillIds,
   effectiveSkillToolIds,
   filterSkillGrantState,
   parseSkillManifest,
+  selectExactSkill,
+  skillCatalog,
   skillInstructionsFor,
   validateSkillGrantPatch,
   type BundledSkill,
@@ -31,6 +34,19 @@ const phone: BundledSkill = {
 };
 
 describe("bundled skill library", () => {
+  it("derives every true provider capability deterministically and ignores metadata", () => {
+    expect(enabledProviderCapabilityIds({
+      phoneMcp: true,
+      agentsMcp: true,
+      computerMcp: false,
+      futureBooleanFlag: true,
+      images: undefined,
+      sessionModelSwitch: "in-session",
+      effortLevels: ["high"],
+      truthyMetadata: "true",
+    })).toEqual(["agentsMcp", "futureBooleanFlag", "phoneMcp"]);
+  });
+
   it("selects a skill only when both its trigger and capability are present", () => {
     const rendered = skillInstructionsFor("Open Uber on my Android", ["phoneMcp"], [phone]);
     expect(rendered).toContain("Use phone tools");
@@ -91,6 +107,35 @@ describe("bundled skill library", () => {
     expect(() => parseSkillManifest({ ...phone.manifest, tools: undefined }, "/skills/phone-harness")).toThrow(/invalid tools/);
   });
 
+  it("keeps ordinary text manual-only and exact-selects at most one skill", () => {
+    expect(selectExactSkill(undefined, ["phoneMcp"], [phone])).toEqual({
+      selectedSkills: [],
+      mountedSkillToolIds: [],
+      decisions: [],
+    });
+    expect(selectExactSkill("phone-harness", ["phoneMcp"], [phone])).toMatchObject({
+      selectedSkills: [phone],
+      mountedSkillToolIds: ["phone"],
+      decisions: [{ skillId: "phone-harness", reason: "selected" }],
+    });
+    expect(selectExactSkill("missing", ["phoneMcp"], [phone])).toMatchObject({
+      selectedSkills: [],
+      decisions: [{ skillId: "missing", reason: "unknown" }],
+    });
+  });
+
+  it("returns exact hidden-grant, capability, and tool refusal reasons", () => {
+    expect(selectExactSkill("phone-harness", ["phoneMcp"], [phone], { skillGrants: [] }).decisions[0]?.reason)
+      .toBe("skill-denied");
+    expect(selectExactSkill("phone-harness", [], [phone]).decisions[0]?.reason).toBe("capability-missing");
+    expect(selectExactSkill("phone-harness", ["phoneMcp"], [phone], {
+      skillGrants: ["phone-harness"],
+      skillToolGrants: [],
+    }).decisions[0]?.reason).toBe("tool-denied");
+    const generic = { ...phone, manifest: { ...phone.manifest, id: "generic", requiredCapabilities: [], tools: [] } };
+    expect(selectExactSkill("generic", [], [generic]).decisions[0]?.reason).toBe("selected");
+  });
+
   it("loads a recorded skill without letting a broken sibling disable it", () => {
     const root = mkdtempSync(join(tmpdir(), "openmausbot-skills-"));
     const valid = join(root, "file-expense");
@@ -105,7 +150,11 @@ describe("bundled skill library", () => {
     writeFileSync(join(broken, "manifest.json"), "not json");
     writeFileSync(join(broken, "SKILL.md"), "broken");
 
-    expect(loadUserSkills(root).map((skill) => skill.manifest.id)).toEqual(["file-expense"]);
+    const loaded = loadUserSkills(root);
+    expect(loaded.map((skill) => skill.manifest.id)).toEqual(["file-expense"]);
+    expect(skillCatalog(loaded)).toEqual([
+      expect.objectContaining({ id: "file-expense", origin: "recorded", status: "available" }),
+    ]);
   });
 
   it("does not let a user skill shadow a bundled skill id", () => {

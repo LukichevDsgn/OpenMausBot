@@ -1,6 +1,6 @@
 import { ChevronDown, ChevronLeft, Crown, FolderOpen, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import { api, runtimePolicySignature, useStore, type Bot, type RuntimePolicy, type SkillCatalogEntry } from "@/state/store";
+import { api, runtimePolicySignature, useStore, type Bot, type RuntimePolicy } from "@/state/store";
 import { stateForBot } from "@/lib/mascot";
 import { CloudBackendPicker } from "./CloudBackendPicker";
 import { ModelPicker } from "./ModelPicker";
@@ -309,153 +309,6 @@ function MemoryCard({ bot }: { bot: Bot }) {
         </div>
       )}
 
-      {error && <div className="mt-2 text-[12px] text-danger">{error}</div>}
-    </div>
-  );
-}
-
-function sortedIds(ids: Iterable<string>): string[] {
-  return [...new Set(ids)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-}
-
-function defaultSkillIds(catalog: readonly SkillCatalogEntry[]): string[] {
-  return sortedIds(catalog.filter((skill) => skill.defaultEnabled).map((skill) => skill.id));
-}
-
-function effectiveSkillIds(bot: Bot, catalog: readonly SkillCatalogEntry[]): string[] {
-  const known = new Set(catalog.map((skill) => skill.id));
-  return sortedIds(
-    (bot.skillGrants === undefined ? defaultSkillIds(catalog) : bot.skillGrants)
-      .filter((id) => known.has(id)),
-  );
-}
-
-function effectiveToolIds(bot: Bot, catalog: readonly SkillCatalogEntry[], skillIds: readonly string[]): string[] {
-  const known = new Set(catalog.flatMap((skill) => skill.tools));
-  const defaultTools = catalog
-    .filter((skill) => skillIds.includes(skill.id))
-    .flatMap((skill) => skill.tools);
-  return sortedIds(
-    (bot.skillToolGrants === undefined ? defaultTools : bot.skillToolGrants)
-      .filter((id) => known.has(id)),
-  );
-}
-
-function SkillToggle({
-  checked,
-  label,
-  onClick,
-}: {
-  checked: boolean;
-  label: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      onClick={onClick}
-      className={cn("relative h-[24px] w-[40px] shrink-0 rounded-full transition-colors", checked ? "bg-accent" : "bg-raised")}
-    >
-      <span className={cn("absolute top-[3px] size-[18px] rounded-full bg-white transition-all", checked ? "left-[19px]" : "left-[3px]")} />
-    </button>
-  );
-}
-
-/** Per-bot grants are persisted explicitly. The effective defaults are only
- * the initial view; every user change writes arrays, including []. */
-function SkillsCard({ bot, catalog }: { bot: Bot; catalog: readonly SkillCatalogEntry[] }) {
-  const { dispatch } = useStore();
-  const [skillIds, setSkillIds] = useState<string[]>([]);
-  const [toolIds, setToolIds] = useState<string[]>([]);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const nextSkills = effectiveSkillIds(bot, catalog);
-    setSkillIds(nextSkills);
-    setToolIds(effectiveToolIds(bot, catalog, nextSkills));
-  }, [bot.id, bot.skillGrants, bot.skillToolGrants, catalog]);
-
-  if (!catalog.length) return null;
-
-  const save = async (nextSkills: string[], nextTools: string[]) => {
-    setSkillIds(nextSkills);
-    setToolIds(nextTools);
-    setSaving(true);
-    setError(null);
-    try {
-      const result: { bot: Bot } = await api(`/api/bots/${bot.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({ skillGrants: nextSkills, skillToolGrants: nextTools }),
-      });
-      dispatch({ type: "botPatched", bot: result.bot });
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <div className="rounded-xl bg-card p-4">
-      <div className="text-[15px] font-medium text-ink">Skills</div>
-      <div className="mt-0.5 text-[13px] leading-relaxed text-ink-secondary">
-        Choose which bundled skills and their tools this bot may use. Changes apply on the next turn.
-      </div>
-      <div className="mt-3 space-y-3">
-        {catalog.map((skill) => {
-          const skillEnabled = skillIds.includes(skill.id);
-          return (
-            <div key={skill.id} className="rounded-lg border border-hairline/40 bg-inset p-3">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="text-[13.5px] font-medium text-ink">{skill.name}</div>
-                  <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">{skill.description}</div>
-                </div>
-                <SkillToggle
-                  checked={skillEnabled}
-                  label={`Allow ${skill.name}`}
-                  onClick={() => void save(
-                    skillEnabled
-                      ? skillIds.filter((id) => id !== skill.id)
-                      : sortedIds([...skillIds, skill.id]),
-                    toolIds,
-                  )}
-                />
-              </div>
-              {skill.tools.length > 0 && (
-                <div className="mt-3 border-t border-hairline/30 pt-2.5">
-                  <div className="mb-1.5 text-[11.5px] uppercase tracking-wide text-ink-secondary">Tools</div>
-                  <div className="space-y-1.5">
-                    {skill.tools.map((toolId) => {
-                      const toolEnabled = toolIds.includes(toolId);
-                      return (
-                        <div key={toolId} className="flex items-center justify-between gap-3">
-                          <span className="font-mono text-[12px] text-ink">{toolId}</span>
-                          <SkillToggle
-                            checked={toolEnabled}
-                            label={`Allow ${toolId} for ${skill.name}`}
-                            onClick={() => void save(
-                              skillIds,
-                              toolEnabled
-                                ? toolIds.filter((id) => id !== toolId)
-                                : sortedIds([...toolIds, toolId]),
-                            )}
-                          />
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-      {saving && <div className="mt-2 text-[12px] text-ink-secondary">Saving…</div>}
       {error && <div className="mt-2 text-[12px] text-danger">{error}</div>}
     </div>
   );
@@ -939,7 +792,6 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             </button>
           </div>
 
-          <SkillsCard key={bot.id} bot={bot} catalog={state.skills} />
           <RuntimeControlsCard key={`runtime-${bot.id}`} bot={bot} />
 
           <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4">

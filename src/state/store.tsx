@@ -404,6 +404,7 @@ export type AppSettingsSection =
   | "general"
   | "connections"
   | "engines"
+  | "skills"
   | "companion"
   | "computer"
   | "usage";
@@ -417,6 +418,12 @@ export interface SkillCatalogEntry {
   triggerTerms: string[];
   requiredCapabilities: string[];
   tools: string[];
+  origin: "built-in" | "recorded" | "imported";
+  status: "available";
+  source?: string;
+  importedAt?: string;
+  warnings: string[];
+  skippedFiles: string[];
 }
 
 export interface AppState {
@@ -506,7 +513,7 @@ export type Action =
   | { type: "groupPatched"; group: Partial<Group> & { id: string } }
   | { type: "groupDeleted"; groupId: string }
   | { type: "createGroup"; memberIds: string[]; name?: string; section?: string }
-  | { type: "sendGroup"; groupId: string; text: string; replyToId?: string }
+  | { type: "sendGroup"; groupId: string; text: string; replyToId?: string; skillId?: string; onAccepted?: () => void }
   | {
       type: "patchGroup";
       groupId: string;
@@ -519,7 +526,7 @@ export type Action =
   | { type: "skillsCatalog"; skills: SkillCatalogEntry[] }
   | { type: "configStatus"; config: ConfigStatus }
   | { type: "select"; id: string }
-  | { type: "send"; botId: string; text: string; replyToId?: string }
+  | { type: "send"; botId: string; text: string; replyToId?: string; skillId?: string; onAccepted?: () => void }
   | { type: "pendingQueued"; threadId: string; queueId: string; text: string }
   | { type: "consumePendingQueued"; threadId: string; queueId: string }
   | { type: "editMessage"; botId: string; messageId: string; text: string }
@@ -1340,9 +1347,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           if (quizBeforeSend) persistCard(action.botId, quizBeforeSend.id, { dismissed: true });
           void api(`/api/bots/${action.botId}/messages`, {
             method: "POST",
-            body: JSON.stringify({ text: action.text, replyToId: action.replyToId }),
+            body: JSON.stringify({ text: action.text, replyToId: action.replyToId, skillId: action.skillId }),
           })
             .then((body) => {
+              action.onAccepted?.();
               if (
                 body?.queued &&
                 typeof body.threadId === "string" &&
@@ -1511,8 +1519,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         case "sendGroup":
           api(`/api/groups/${action.groupId}/messages`, {
             method: "POST",
-            body: JSON.stringify({ text: action.text, replyToId: action.replyToId }),
-          }).catch(showError);
+            body: JSON.stringify({ text: action.text, replyToId: action.replyToId, skillId: action.skillId }),
+          }).then(() => action.onAccepted?.()).catch(showError);
           break;
         case "patchGroup":
           api(`/api/groups/${action.groupId}`, {

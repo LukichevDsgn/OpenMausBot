@@ -18,7 +18,7 @@ function row(botId: string, surface: "direct" | "room" = "direct") {
     surface,
     selectedSkillIds: botId === "bot-1" ? ["phone-harness"] : [],
     mountedSkillToolIds: botId === "bot-1" ? ["phone"] : [],
-    decisions: [{ skillId: "phone-harness", reason: botId === "bot-1" ? "selected" as const : "trigger-mismatch" as const }],
+    decisions: [{ skillId: "phone-harness", reason: botId === "bot-1" ? "selected" as const : "unknown" as const }],
   };
 }
 
@@ -32,7 +32,7 @@ describe("SkillAuditLog", () => {
 
     expect(audit.read()).toHaveLength(2);
     expect(audit.read({ botId: "bot-2", surface: "room", limit: 1 })).toMatchObject([
-      { botId: "bot-2", surface: "room", selectedSkillIds: [] },
+      { botId: "bot-2", surface: "room", selectedSkillIds: [], decisions: [{ reason: "unknown" }] },
     ]);
     expect(readFileSync(audit.path, "utf8")).not.toContain("raw prompt");
     expect(JSON.stringify(audit.read())).not.toContain("raw prompt");

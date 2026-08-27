@@ -32,7 +32,7 @@ interface QueueEntry {
    * happen on a DIFFERENT thread (a room turn) — drain matches on "this
    * queue's bot is idle now", which needs the bot, not the settling thread. */
   botId: string;
-  items: Array<{ messageId: string; text: string; prompt: string; replyToId?: string }>;
+  items: Array<{ messageId: string; text: string; prompt: string; replyToId?: string; skillId?: string }>;
 }
 
 const queues = new Map<string, QueueEntry>(); // threadId → waiting sends
@@ -41,12 +41,18 @@ const queues = new Map<string, QueueEntry>(); // threadId → waiting sends
 export function queueSteeredMessage(
   bot: BotRecord,
   text: string,
-  options: { prompt?: string; replyToId?: string } = {},
+  options: { prompt?: string; replyToId?: string; skillId?: string } = {},
 ): { id: string } {
   const threadId = bot.threadId;
   const id = newId();
   const entry = queues.get(threadId) ?? { botId: bot.id, items: [] };
-  entry.items.push({ messageId: id, text, prompt: options.prompt ?? text, replyToId: options.replyToId });
+  entry.items.push({
+    messageId: id,
+    text,
+    prompt: options.prompt ?? text,
+    replyToId: options.replyToId,
+    skillId: options.skillId,
+  });
   queues.set(threadId, entry);
   return { id };
 }
@@ -66,10 +72,11 @@ export function drainSteeredMessages(
     prompt: string,
     userMessage: Message,
     excludeIds: string[],
+    skillId?: string,
   ) => void | Promise<void>,
 ): void {
   // deleting only the entry being visited is safe under Map iteration
-  for (const [threadId, entry] of queues) {
+  for (const [threadId, entry] of [...queues]) {
     const bot = store.bot(entry.botId);
     if (!bot) {
       // the bot was deleted while messages waited — nothing left to steer
@@ -77,11 +84,17 @@ export function drainSteeredMessages(
       continue;
     }
     if (bot.busy) continue; // still working — the next settle tries again
-    // committed to draining: the entry leaves the map before anything runs,
-    // so a settle racing another settle can never fire the same queue twice
-    queues.delete(threadId);
+    // Batch only consecutive sends with the same manual selection. Ordinary
+    // unskilled bursts keep the legacy one-turn behavior, while two different
+    // explicit skills can never be mounted into the same provider turn.
+    const firstSkillId = entry.items[0]?.skillId;
+    const boundary = entry.items.findIndex((item) => item.skillId !== firstSkillId);
+    const items = boundary === -1 ? entry.items : entry.items.slice(0, boundary);
+    const remaining = boundary === -1 ? [] : entry.items.slice(boundary);
+    if (remaining.length) queues.set(threadId, { ...entry, items: remaining });
+    else queues.delete(threadId);
     const appended: Message[] = [];
-    for (const item of entry.items) {
+    for (const item of items) {
       // queueId is the pending-chip identity from the 202; append still
       // assigns a fresh transcript id so replay/exclude keep using message.id.
       appended.push(
@@ -96,13 +109,14 @@ export function drainSteeredMessages(
     }
     const last = appended.at(-1);
     if (!last) continue;
-    const prompt = entry.items.map((item) => item.prompt).join("\n");
+    const prompt = items.map((item) => item.prompt).join("\n");
     void run(
       entry.botId,
       threadId,
       prompt,
       last,
       appended.map((message) => message.id),
+      firstSkillId,
     );
   }
 }

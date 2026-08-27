@@ -1,6 +1,6 @@
 import { track } from "@/lib/analytics";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, X } from "lucide-react";
+import { ArrowUp, BookOpen, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, X } from "lucide-react";
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
 import { cn } from "@/lib/cn";
 import { useComposerDraft } from "@/lib/drafts";
@@ -23,6 +23,8 @@ import { groupComposerHint, roomRespondersForComposer } from "@/lib/group-routin
 import { PendingApprovalActions, PendingApprovalPanel, pendingApprovals } from "./PendingApproval";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { ReplyQuote } from "./ReplyQuote";
+import { SkillsDialog } from "./SkillsDialog";
+import { clearAcceptedSkill, selectedSkillById, skillsCommandQuery } from "@/lib/skills";
 
 /** The active @mention query at the caret: the text between an `@` that
  * starts a word and the caret. null = no mention being typed. */
@@ -180,6 +182,10 @@ export function Composer({
   const [text, setText, attachments, setAttachments] = useComposerDraft(
     group ? `group:${group.id}` : `bot:${bot?.id ?? ""}`,
   );
+  const [skillsOpen, setSkillsOpen] = useState(false);
+  const [skillsQuery, setSkillsQuery] = useState("");
+  const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
+  const selectedSkill = selectedSkillById(state.skills, selectedSkillId);
   const addAttachments = useCallback(
     (next: Attachment[]) => setAttachments((prev) => [...prev, ...next]),
     [setAttachments],
@@ -259,6 +265,16 @@ export function Composer({
     el.style.height = `${el.scrollHeight}px`;
   }, [text]);
 
+  useEffect(() => {
+    if (locked) return;
+    const commandQuery = skillsCommandQuery(text);
+    if (commandQuery === null) return;
+    setSkillsQuery(commandQuery);
+    setSkillsOpen(true);
+    setText("");
+    setCaret(0);
+  }, [locked, setText, text]);
+
   const pickMention = (peer: MentionChoice) => {
     if (!mention) return;
     const after = text.slice(caret);
@@ -278,7 +294,7 @@ export function Composer({
   // the moment the room settles. 1:1 mid-turn sends still POST (the harness
   // queue), but stay off the transcript until drain — the chip here is the
   // pending row so they cannot become the active leaf mid-turn.
-  const [queued, setQueued] = useState<{ text: string; replyToId?: string } | null>(null);
+  const [queued, setQueued] = useState<{ text: string; replyToId?: string; skillId?: string } | null>(null);
   const pendingChip = group
     ? queued?.text
     : bot
@@ -324,18 +340,20 @@ export function Composer({
     }
     const t = composeMessage(text, attachments);
     if (!t) return;
+    const sentSkillId = selectedSkill?.id;
+    const onAccepted = () => setSelectedSkillId((current) => clearAcceptedSkill(current, sentSkillId));
     if (busy && group) {
-      setQueued({ text: t, replyToId: replyTo?.id });
+      setQueued({ text: t, replyToId: replyTo?.id, skillId: sentSkillId });
       setText("");
       setAttachments([]);
       onClearReply?.();
       return;
     }
     if (group) {
-      dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id });
+      dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id, skillId: sentSkillId, onAccepted });
       track("message_sent", { room: true });
     } else if (bot) {
-      dispatch({ type: "send", botId: bot.id, text: t, replyToId: replyTo?.id });
+      dispatch({ type: "send", botId: bot.id, text: t, replyToId: replyTo?.id, skillId: sentSkillId, onAccepted });
       track("message_sent", { driver: bot.modelSelection?.instanceId, queued: busy && !canSteer });
     }
     setText("");
@@ -350,7 +368,15 @@ export function Composer({
         setQueued(null);
         return;
       }
-      dispatch({ type: "sendGroup", groupId: group.id, text: queued.text, replyToId: queued.replyToId });
+      const queuedSkillId = queued.skillId;
+      dispatch({
+        type: "sendGroup",
+        groupId: group.id,
+        text: queued.text,
+        replyToId: queued.replyToId,
+        skillId: queuedSkillId,
+        onAccepted: () => setSelectedSkillId((current) => clearAcceptedSkill(current, queuedSkillId)),
+      });
       track("message_sent", { room: true, queued: true });
     }
     setQueued(null);
@@ -484,6 +510,18 @@ export function Composer({
             />
           </div>
         )}
+        {selectedSkill ? (
+          <div className="mb-2 flex items-center gap-2 px-1">
+            <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-accent/25 bg-accent/10 px-2.5 py-1 text-[12px] text-ink">
+              <BookOpen size={12} className="shrink-0 text-accent" aria-hidden="true" />
+              <span className="truncate">{selectedSkill.name}</span>
+              <button type="button" onClick={() => setSelectedSkillId(null)} aria-label={`Remove ${selectedSkill.name} from the next message`} className="rounded-full p-0.5 text-ink-secondary hover:bg-control hover:text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">
+                <X size={11} />
+              </button>
+            </span>
+            <span className="text-[11.5px] text-ink-secondary">Next message only</span>
+          </div>
+        ) : null}
         <ComposerAttachments
           items={attachments}
           onAdd={addAttachments}
@@ -515,6 +553,21 @@ export function Composer({
                 className="flex size-8 shrink-0 items-center justify-center rounded-full text-ink-secondary hover:bg-control hover:text-ink"
               >
                 <Paperclip size={17} />
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setSkillsQuery("");
+                  setSkillsOpen(true);
+                }}
+                aria-label="Choose a skill for the next message"
+                title="Skills (/skills)"
+                className={cn(
+                  "flex size-8 shrink-0 items-center justify-center rounded-full hover:bg-control hover:text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent",
+                  selectedSkill ? "text-accent" : "text-ink-secondary",
+                )}
+              >
+                <BookOpen size={17} />
               </button>
               {autoBot && <PermissionModeSelector bot={autoBot} onSetAuto={setAuto} />}
             </div>
@@ -676,6 +729,18 @@ export function Composer({
             });
           }
           setAutoWarn(false);
+        }}
+      />
+      <SkillsDialog
+        open={skillsOpen}
+        skills={state.skills}
+        selectedId={selectedSkillId}
+        initialQuery={skillsQuery}
+        onClose={() => setSkillsOpen(false)}
+        onSelect={(skill) => {
+          setSelectedSkillId(skill.id);
+          setSkillsOpen(false);
+          requestAnimationFrame(() => inputRef.current?.focus());
         }}
       />
     </div>

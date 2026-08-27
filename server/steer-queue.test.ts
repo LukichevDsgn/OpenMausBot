@@ -133,6 +133,25 @@ describe("steer-queue module", () => {
     expect(run.mock.calls[0][2]).toBe("Reply context\nThat part");
   });
 
+  it("preserves one scalar skill id and separates different selected skills", () => {
+    const bot = fakeBot("bot-skills", "thread-skills", true);
+    const store = fakeStore([bot]);
+    queueSteeredMessage(bot, "first skilled send", { skillId: "skill-a" });
+    queueSteeredMessage(bot, "second skilled send", { skillId: "skill-b" });
+    bot.busy = false;
+    const run = vi.fn();
+
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][5]).toBe("skill-a");
+    expect(_queuedCount("thread-skills")).toBe(1);
+
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[1][5]).toBe("skill-b");
+    expect(_queuedCount("thread-skills")).toBe(0);
+  });
+
   it("fires nothing when nothing is queued", () => {
     const run = vi.fn();
     drainSteeredMessages(fakeStore([fakeBot("bot-c", "thread-c", false)]), run);

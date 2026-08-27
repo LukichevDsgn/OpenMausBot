@@ -769,3 +769,115 @@ The accepted lead evidence for 2026-08-27 is:
 - phone-harness manifest and `SKILL.md` hashes remain
   `A6610623D393324BC1A7BFEC6B0D2FC6333580859E25F0E3FA4C2469C4BD1B46` and
   `11CD48E61571DF82A4B6A2A369F2F84BDFE7179F1D6A928E9A1091982C23BD56`.
+
+## Custom v23 app-wide Skills acceptance and promotion
+
+Custom v23 was accepted and promoted on 2026-08-27. This is a maintenance
+baseline after the completed seven-stage roadmap, not a new product stage.
+The historical custom v22 evidence above remains the evidence for that earlier
+baseline.
+
+The accepted Skills contract is one app-wide workflow over the existing
+`server/skill-library.ts` and `skills/phone-harness` substrate:
+
+- Settings has one searchable library for bundled, recorded, and globally
+  imported skills. A global import is installed once. Full-batch preflight
+  rejects invalid, reserved, existing, and intra-batch duplicate IDs before
+  the first write.
+- Composer button, `/skills`, and `/skills <query>` open the same searchable
+  selector. Direct chats and rooms carry at most one scalar `skillId` for the
+  next accepted send or queue entry, display a removable selection pill, and
+  clear it only after admission.
+- Selection is strictly manual by default. Ordinary text and historical
+  `triggerTerms` do not select a skill. There is no multiple or implicit room
+  selection.
+- Generic skills are provider-neutral. Declared capabilities are checked from
+  all runtime flags whose values are literally `true`; declared skill tools
+  remain subject to hidden authoritative per-bot grants, and only the selected
+  skill's granted tools are exposed.
+- Unknown, skill-denied, capability-missing, and tool-denied admission failures
+  have stable refusal reasons. Manual success and refusal audit records do not
+  contain prompts or secrets.
+- Legacy per-bot imported data, enable flags, and
+  `/api/bots/:id/skills*` routes remain compatible. Retired managed
+  `.claude/.agents/.grok` discovery directories are removed rather than
+  recreated, and legacy skill prompts are not injected into dispatch, so there
+  is no second runtime registry.
+
+The exact accepted 17-file source scope is:
+
+- `server/index.test.ts`;
+- `server/index.ts`;
+- `server/skill-audit.test.ts`;
+- `server/skill-library.test.ts`;
+- `server/skill-library.ts`;
+- `server/skills.test.ts`;
+- `server/skills.ts`;
+- `server/steer-queue.test.ts`;
+- `server/steer-queue.ts`;
+- `src/components/Composer.tsx`;
+- `src/components/SettingsModal.tsx`;
+- `src/components/SettingsPanel.tsx`;
+- `src/components/SkillsDialog.tsx`;
+- `src/components/SkillsSection.tsx`;
+- `src/lib/skills.test.ts`;
+- `src/lib/skills.ts`;
+- `src/state/store.tsx`.
+
+Accepted fake/local verification evidence:
+
+- focused six-file Skills matrix: 6 files passed, 131 tests passed, 1 existing
+  Windows platform skip;
+- `server/index.test.ts`: 94 passed, 1 existing Windows platform skip;
+- import-atomicity matrix: 107 passed, 1 existing platform skip, including
+  `server/skills.test.ts` at 13/13;
+- server and full TypeScript `--noEmit`: passed;
+- full `pnpm test`: Vitest 198 files passed and 12 skipped, with 2174 tests
+  passed and 92 skipped; broker 7/7, updater 22/22, desktop viewer 5/5,
+  package-link 2/2, save-file 7 passed with 3 platform skips, and packaged
+  server smoke passed with all 9 proxy paths inside its packaged directory;
+- `pnpm check:contrast`: 21 pairs checked, no new failures, 3 carried
+  exceptions;
+- tracked and untracked whitespace checks and exact scope checks: passed.
+
+Repository-wide `pnpm lint` reports 1901 pre-existing anti-slop diagnostics
+across the integrated baseline and is recorded as non-gating for this release;
+the new standalone Skills UI/library files pass their focused oxlint check.
+
+Independent visual browser/DOM proof against v23 confirmed Settings to Skills,
+the searchable library and import metadata, the composer `Choose a skill`
+dialog, filtering to and selecting exactly `Phone Harness`, the removable
+next-message pill, `/skills`, and `/skills phone`. No provider message or
+import was sent during that proof.
+
+Fresh Windows packaging completed through `pnpm package:prepare` and
+`electron-builder --win dir --publish never`. Packaged-server smoke ran against
+the staged `resources/server` without reachable `node_modules` and kept all 9
+proxy paths inside the packaged tree. Packaged UI/server markers proved the
+Skills library, `/skills`, exact manual selector, capability mapping, atomic
+import, and stable refusal paths. Accepted SHA-256 values are:
+
+- `OpenMausBot.exe`:
+  `4368CCE59E02E32DFFC1D2C218AF3AE8F0386661938E50E938F133EA0BA15B12`;
+- `resources/app.asar`:
+  `31803E0894D3B868ED2DAB945F6FC3F24069B2C8EAE9AB3C114518409F2BA63D`;
+- `resources/server/index.js`:
+  `6F96BFE655602466F06D2E644C2BFDCAC3700A7E57A9964FBAD77175799AEFD3`;
+- `resources/skills/phone-harness/manifest.json`:
+  `A6610623D393324BC1A7BFEC6B0D2FC6333580859E25F0E3FA4C2469C4BD1B46`;
+- `resources/skills/phone-harness/SKILL.md`:
+  `11CD48E61571DF82A4B6A2A369F2F84BDFE7179F1D6A928E9A1091982C23BD56`.
+
+Promotion moved the verified staging directory, without copying or rebuilding,
+to `D:\Codex\OpenMausBot-custom\release-codex-local-v23`. Both the Desktop
+and Start Menu shortcuts have COM-read-back target, working directory, and icon
+paths under that final root. The staging and custom v22 release directories are
+absent; custom v22 was removed only after final-root and shortcut proof.
+
+The accepted running snapshot has 8 OpenMausBot/cloudflared processes, all
+under the final v23 root and none outside it. The local listener at
+`127.0.0.1:8799` returned HTTP 200 with
+`{"app":"openmausbot","pid":25836,"static":true}` and its listener owner
+matched that packaged server PID. Unsigned Windows publisher authenticity
+remains deferred external trust work requiring separate certificate and
+credential authority; no signing credentials were requested or used.

@@ -2111,187 +2111,6 @@ describe("harness HTTP API", () => {
     }
   });
 
-  it("selects granted skills from the current trigger and audits direct plus room decisions", async () => {
-    const catalog = await api("GET", "/api/skills/catalog");
-    expect(catalog.status).toBe(200);
-    expect(catalog.body.skills).toEqual([
-      expect.objectContaining({ id: "phone-harness", tools: ["phone"], defaultEnabled: true }),
-    ]);
-
-    const runDirectCase = async (input: {
-      text: string;
-      grants?: { skillGrants: string[]; skillToolGrants: string[] };
-      selectedSkillIds: string[];
-      mountedSkillToolIds: string[];
-      reason: string;
-    }) => {
-      const created = await api("POST", "/api/bots", {});
-      const botId = created.body.bot.id;
-      const threadId = created.body.bot.threadId;
-      try {
-        const patched = await api("PATCH", `/api/bots/${botId}`, {
-          modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
-          ...(input.grants ?? {}),
-        });
-        expect(patched.status).toBe(200);
-
-        rmSync(fakeClaudeDump, { force: true });
-        const sent = await api("POST", `/api/bots/${botId}/messages`, { text: input.text });
-        expect(sent.status).toBe(202);
-        await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
-        const dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
-        const systemArgs = dump.argv.join("\n");
-        const servers = dump.mcpConfig?.mcpServers ?? {};
-        expect(Boolean(servers.phone)).toBe(input.mountedSkillToolIds.includes("phone"));
-        expect(systemArgs.includes('<openmaus-skill id="phone-harness"')).toBe(
-          input.selectedSkillIds.includes("phone-harness"),
-        );
-
-        expect((await api("POST", `/api/bots/${botId}/interrupt`)).status).toBe(200);
-        await expect.poll(async () => {
-          const state = (await api("GET", "/api/bots")).body;
-          const bot = state.bots.find((candidate: { id: string }) => candidate.id === botId);
-          const task = bot?.tasks?.find((candidate: { threadId: string }) => candidate.threadId === threadId);
-          return {
-            busy: bot?.busy,
-            activity: bot?.activity,
-            terminal: Boolean(task?.lifecycle?.terminalReceipt),
-          };
-        }, { timeout: 5_000 }).toEqual({ busy: false, activity: "idle", terminal: true });
-
-        const settled = (await api("GET", "/api/bots")).body.bots
-          .find((candidate: { id: string }) => candidate.id === botId);
-        const task = settled.tasks.find((candidate: { threadId: string }) => candidate.threadId === threadId);
-        const receipt = structuredClone(task.lifecycle.terminalReceipt);
-        expect(receipt).toBeTruthy();
-        expect((await api("POST", `/api/bots/${botId}/interrupt`)).status).toBe(200);
-        const afterDuplicate = (await api("GET", "/api/bots")).body.bots
-          .find((candidate: { id: string }) => candidate.id === botId);
-        const afterTask = afterDuplicate.tasks.find((candidate: { threadId: string }) => candidate.threadId === threadId);
-        expect(afterDuplicate).toMatchObject({ busy: false, activity: "idle" });
-        expect(afterTask.lifecycle.terminalReceipt).toEqual(receipt);
-
-        const audit = await api("GET", `/api/skills/audit?botId=${botId}&threadId=${threadId}&surface=direct&limit=5`);
-        expect(audit.status).toBe(200);
-        expect(audit.body.rows).toHaveLength(1);
-        expect(audit.body.rows[0]).toMatchObject({
-          botId,
-          threadId,
-          surface: "direct",
-          selectedSkillIds: input.selectedSkillIds,
-          mountedSkillToolIds: input.mountedSkillToolIds,
-          decisions: [{ skillId: "phone-harness", reason: input.reason }],
-        });
-        expect(audit.body.rows[0]).not.toHaveProperty("prompt");
-        expect(JSON.stringify(audit.body.rows[0])).not.toContain(input.text);
-        return dump;
-      } finally {
-        const state = (await api("GET", "/api/bots")).body;
-        if (state.bots.find((candidate: { id: string }) => candidate.id === botId)?.busy) {
-          await api("POST", `/api/bots/${botId}/interrupt`);
-          await expect.poll(async () => {
-            const current = (await api("GET", "/api/bots")).body;
-            return current.bots.find((candidate: { id: string }) => candidate.id === botId)?.busy;
-          }, { timeout: 5_000 }).toBe(false);
-        }
-        await api("DELETE", `/api/bots/${botId}`);
-      }
-    };
-
-    await runDirectCase({
-      text: "Use my Android phone to inspect the mobile app",
-      selectedSkillIds: ["phone-harness"],
-      mountedSkillToolIds: ["phone"],
-      reason: "selected",
-    });
-    const denied = await api("POST", "/api/bots", {});
-    expect((await api("PATCH", `/api/bots/${denied.body.bot.id}`, { skillGrants: ["not-a-real-skill"] })).status).toBe(400);
-    await api("DELETE", `/api/bots/${denied.body.bot.id}`);
-    await runDirectCase({
-      text: "Use my Android phone to inspect the mobile app",
-      grants: { skillGrants: [], skillToolGrants: [] },
-      selectedSkillIds: [],
-      mountedSkillToolIds: [],
-      reason: "skill-denied",
-    });
-    await runDirectCase({
-      text: "Use my Android phone to inspect the mobile app",
-      grants: { skillGrants: ["phone-harness"], skillToolGrants: [] },
-      selectedSkillIds: [],
-      mountedSkillToolIds: [],
-      reason: "tool-denied",
-    });
-    await runDirectCase({
-      text: "Tell me how to organize a small garden",
-      selectedSkillIds: [],
-      mountedSkillToolIds: [],
-      reason: "trigger-mismatch",
-    });
-
-    const roomBot = await api("POST", "/api/bots", {});
-    const roomBotId = roomBot.body.bot.id;
-    const room = await api("POST", "/api/groups", { name: "Skill trigger history", memberIds: [roomBotId] });
-    const roomId = room.body.group.id;
-    const roomThreadId = room.body.group.threadId;
-    try {
-      expect((await api("PATCH", `/api/groups/${roomId}/setup`, {
-        action: "skip",
-      })).status).toBe(200);
-      expect((await api("PATCH", `/api/bots/${roomBotId}`, {
-        modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
-      })).status).toBe(200);
-      rmSync(fakeClaudeDump, { force: true });
-      expect((await api("POST", `/api/groups/${roomId}/messages`, { text: "Android phone: check the mobile app" })).status).toBe(202);
-      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
-      const firstDump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
-      expect(firstDump.mcpConfig.mcpServers.phone).toBeTruthy();
-      expect(firstDump.argv.join("\n")).toContain('<openmaus-skill id="phone-harness"');
-
-      expect((await api("POST", `/api/groups/${roomId}/interrupt`)).status).toBe(200);
-      await expect.poll(async () => {
-        const state = (await api("GET", "/api/bots")).body;
-        return {
-          busy: state.bots.find((candidate: { id: string }) => candidate.id === roomBotId)?.busy,
-          roomBusyBotId: state.groups.find((candidate: { id: string }) => candidate.id === roomId)?.busyBotId,
-        };
-      }, { timeout: 5_000 }).toEqual({ busy: false, roomBusyBotId: null });
-
-      rmSync(fakeClaudeDump, { force: true });
-      expect((await api("POST", `/api/groups/${roomId}/messages`, { text: "Tell me about gardening instead" })).status).toBe(202);
-      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
-      const secondDump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
-      expect(JSON.stringify(secondDump.prompt)).toContain("Android phone");
-      expect(secondDump.mcpConfig.mcpServers.phone).toBeUndefined();
-      expect(secondDump.argv.join("\n")).not.toContain('<openmaus-skill id="phone-harness"');
-
-      expect((await api("POST", `/api/groups/${roomId}/interrupt`)).status).toBe(200);
-      await expect.poll(async () => {
-        const state = (await api("GET", "/api/bots")).body;
-        return {
-          busy: state.bots.find((candidate: { id: string }) => candidate.id === roomBotId)?.busy,
-          roomBusyBotId: state.groups.find((candidate: { id: string }) => candidate.id === roomId)?.busyBotId,
-        };
-      }, { timeout: 5_000 }).toEqual({ busy: false, roomBusyBotId: null });
-
-      const audit = await api("GET", `/api/skills/audit?threadId=${roomThreadId}&surface=room&limit=5`);
-      expect(audit.status).toBe(200);
-      expect(audit.body.rows).toHaveLength(2);
-      expect(audit.body.rows.map((row: { selectedSkillIds: string[] }) => row.selectedSkillIds)).toEqual([
-        ["phone-harness"],
-        [],
-      ]);
-      expect(audit.body.rows[1].decisions).toEqual([{ skillId: "phone-harness", reason: "trigger-mismatch" }]);
-      expect(JSON.stringify(audit.body.rows)).not.toContain("Android phone: check the mobile app");
-    } finally {
-      const state = (await api("GET", "/api/bots")).body;
-      if (state.bots.find((candidate: { id: string }) => candidate.id === roomBotId)?.busy) {
-        await api("POST", `/api/bots/${roomBotId}/interrupt`);
-      }
-      await api("DELETE", `/api/groups/${roomId}`);
-      await api("DELETE", `/api/bots/${roomBotId}`);
-    }
-  });
-
   it("validates the non-secret VPS alias and keeps old bots on Box by default", async () => {
     const before = await api("GET", "/api/bots");
     const bot = before.body.bots[0];
@@ -2451,6 +2270,128 @@ describe("harness HTTP API", () => {
     expect(removed.status).toBe(200);
     expect(removed.body.endpoints).toEqual([]);
     expect(JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8")).customEndpoints).toEqual({});
+  });
+
+  it("manual-selects one exact skill for direct and room sends with hidden authoritative grants", async () => {
+    const catalog = await api("GET", "/api/skills/catalog");
+    expect(catalog.status).toBe(200);
+    expect(catalog.body.skills).toEqual([
+      expect.objectContaining({ id: "phone-harness", origin: "built-in", status: "available", tools: ["phone"] }),
+    ]);
+
+    const created = await api("POST", "/api/bots", {});
+    const botId = created.body.bot.id;
+    const threadId = created.body.bot.threadId;
+    expect(await api("GET", `/api/bots/${botId}/skills`)).toMatchObject({ status: 200, body: { skills: [] } });
+    const settleDirect = async () => {
+      expect((await api("POST", `/api/bots/${botId}/interrupt`)).status).toBe(200);
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots")).body;
+        return state.bots.find((candidate: { id: string }) => candidate.id === botId)?.busy;
+      }, { timeout: 5_000 }).toBe(false);
+    };
+    try {
+      const patched = await api("PATCH", `/api/bots/${botId}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+      });
+      expect(patched.status).toBe(200);
+      expect(patched.body.bot).not.toHaveProperty("skillGrants");
+      expect(patched.body.bot).not.toHaveProperty("skillToolGrants");
+
+      rmSync(fakeClaudeDump, { force: true });
+      const ordinary = await api("POST", `/api/bots/${botId}/messages`, {
+        text: "Use my Android phone, but no skill was selected",
+      });
+      expect(ordinary.status).toBe(202);
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+      let dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+      expect(dump.mcpConfig?.mcpServers?.phone).toBeUndefined();
+      expect(dump.argv.join("\n")).not.toContain('<openmaus-skill id="phone-harness"');
+      await settleDirect();
+
+      rmSync(fakeClaudeDump, { force: true });
+      const manual = await api("POST", `/api/bots/${botId}/messages`, {
+        text: "Inspect the mobile app",
+        skillId: "phone-harness",
+      });
+      expect(manual.status).toBe(202);
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+      dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+      expect(dump.mcpConfig?.mcpServers?.phone).toBeTruthy();
+      expect(dump.argv.join("\n")).toContain('<openmaus-skill id="phone-harness"');
+      await settleDirect();
+
+      expect((await api("PATCH", `/api/bots/${botId}`, { skillGrants: [], skillToolGrants: [] })).status).toBe(200);
+      const denied = await api("POST", `/api/bots/${botId}/messages`, { text: "Denied", skillId: "phone-harness" });
+      expect(denied).toMatchObject({ status: 409, body: { skillReason: "skill-denied" } });
+
+      expect((await api("PATCH", `/api/bots/${botId}`, {
+        skillGrants: ["phone-harness"],
+        skillToolGrants: [],
+      })).status).toBe(200);
+      const toolDenied = await api("POST", `/api/bots/${botId}/messages`, { text: "Tool denied", skillId: "phone-harness" });
+      expect(toolDenied).toMatchObject({ status: 409, body: { skillReason: "tool-denied" } });
+      const unknown = await api("POST", `/api/bots/${botId}/messages`, { text: "Unknown", skillId: "not-real" });
+      expect(unknown).toMatchObject({ status: 409, body: { skillReason: "unknown" } });
+
+      const audit = await api("GET", `/api/skills/audit?botId=${botId}&threadId=${threadId}&surface=direct&limit=10`);
+      expect(audit.body.rows.map((row: any) => row.decisions[0]?.reason)).toEqual([
+        "selected",
+        "skill-denied",
+        "tool-denied",
+        "unknown",
+      ]);
+      expect(JSON.stringify(audit.body.rows)).not.toContain("Inspect the mobile app");
+    } finally {
+      const state = (await api("GET", "/api/bots")).body;
+      if (state.bots.find((candidate: { id: string }) => candidate.id === botId)?.busy) await settleDirect();
+      await api("DELETE", `/api/bots/${botId}`);
+    }
+
+    const roomBot = await api("POST", "/api/bots", {});
+    const roomBotId = roomBot.body.bot.id;
+    const room = await api("POST", "/api/groups", { name: "Manual skills", memberIds: [roomBotId] });
+    const roomId = room.body.group.id;
+    try {
+      await api("PATCH", `/api/groups/${roomId}/setup`, { action: "skip" });
+      await api("PATCH", `/api/bots/${roomBotId}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+      });
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/groups/${roomId}/messages`, {
+        text: "Android text alone stays manual-only",
+      })).status).toBe(202);
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+      let dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+      expect(dump.mcpConfig?.mcpServers?.phone).toBeUndefined();
+      expect((await api("POST", `/api/groups/${roomId}/interrupt`)).status).toBe(200);
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots")).body;
+        return state.bots.find((candidate: { id: string }) => candidate.id === roomBotId)?.busy;
+      }, { timeout: 5_000 }).toBe(false);
+
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/groups/${roomId}/messages`, {
+        text: "Use the chosen phone skill",
+        skillId: "phone-harness",
+      })).status).toBe(202);
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+      dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+      expect(dump.mcpConfig?.mcpServers?.phone).toBeTruthy();
+      expect(dump.argv.join("\n")).toContain('<openmaus-skill id="phone-harness"');
+      const roomAudit = await api("GET", `/api/skills/audit?threadId=${room.body.group.threadId}&surface=room&limit=5`);
+      expect(roomAudit.body.rows).toEqual([
+        expect.objectContaining({ selectedSkillIds: ["phone-harness"], decisions: [{ skillId: "phone-harness", reason: "selected" }] }),
+      ]);
+      expect(JSON.stringify(roomAudit.body.rows)).not.toContain("Use the chosen phone skill");
+    } finally {
+      const state = (await api("GET", "/api/bots")).body;
+      if (state.bots.find((candidate: { id: string }) => candidate.id === roomBotId)?.busy) {
+        await api("POST", `/api/groups/${roomId}/interrupt`);
+      }
+      await api("DELETE", `/api/groups/${roomId}`);
+      await api("DELETE", `/api/bots/${roomBotId}`);
+    }
   });
   it("stores the avatar image key as configured-only status", async () => {
     try {

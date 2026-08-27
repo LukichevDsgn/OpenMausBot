@@ -284,3 +284,39 @@ baseline, exact-commit integration, tests, a staging package, and verified
 swap. There is no automatic merge, and the official installer never runs over
 the custom build. This is maintenance of the completed seven-stage roadmap,
 not a new Stage 8.
+
+## 2026-08-27: accepted custom v23 app-wide Skills and promotion boundary
+
+Accept custom v23 as the current maintenance baseline. Its Skills workflow is
+one app-wide extension of `server/skill-library.ts`, not a parallel registry or
+an OpenCode migration. The unified Settings catalog covers bundled, recorded,
+and globally imported skills; imports use full-batch preflight before writing.
+Composer button and `/skills` provide one exact manual selection for the next
+accepted direct or room send. Ordinary text never auto-selects a skill.
+
+Hidden per-bot skill and tool grants remain authoritative. Runtime admission
+checks all literal-`true` provider capability flags and declared tool grants,
+exposes only the selected skill's granted tools, and records stable
+prompt-free success or refusal audit metadata. Generic skills remain
+provider-neutral. Legacy per-bot data, enable flags, and routes remain
+compatible, while retired native discovery links and legacy dispatch prompt
+injection remain disabled so they cannot bypass manual admission.
+
+The exact accepted source scope is the 17 paths recorded in
+`CURRENT_STATE.md`. Focused, full fake/local, TypeScript, contrast,
+whitespace/scope, packaged-server, artifact-marker, and independent visual
+browser checks are accepted there with their exact counts and hashes.
+Repository-wide lint's 1901 integrated-baseline anti-slop diagnostics are a
+pre-existing non-gating residual; focused oxlint for the new standalone Skills
+files is green.
+
+The verified staging directory was moved to
+`release-codex-local-v23`, both user shortcuts were verified against that final
+root, and the old staging and custom v22 release directories were removed.
+The accepted runtime has only final-root OpenMausBot/cloudflared processes and
+HTTP 200 health on `127.0.0.1:8799`. Historical custom v22 evidence remains
+historical and is not rewritten by this decision.
+
+Unsigned Windows publisher authenticity remains deferred external trust work.
+It still requires separate authority for a certificate and credentials; none
+are requested or used by this acceptance.

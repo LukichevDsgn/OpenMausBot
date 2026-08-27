@@ -153,11 +153,12 @@ import {
 } from "./section-context.ts";
 import {
   installSkill,
+  installGlobalSkillBatch,
   listSkills,
   readSkillFile,
   removeSkill,
   setSkillEnabled,
-  skillsSystemPrompt,
+  syncSkillLinks,
 } from "./skills.ts";
 import { fetchSkillFromSource } from "./skill-fetch.ts";
 import { readCuaConnection } from "./local-computer.ts";
@@ -177,13 +178,14 @@ import { memberTurnSelection } from "./member-turn.ts";
 import { WebhookManager } from "./webhooks.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import {
-  decideBundledSkills,
-  filterSkillGrantState,
   loadBundledSkills,
+  enabledProviderCapabilityIds,
   renderSkillInstructions,
+  selectExactSkill,
   skillCatalog,
   validateSkillGrantPatch,
   type SkillSelection,
+  type SkillSelectionReason,
 } from "./skill-library.ts";
 import { SkillAuditLog } from "./skill-audit.ts";
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
@@ -211,7 +213,8 @@ const registry = new ProviderRegistry(BUILT_IN_DRIVERS);
 await registry.load(instanceConfigs(cfg));
 const bundledSkills = loadBundledSkills();
 const skillAudit = new SkillAuditLog();
-const availableSkills = () => mergeSkills(bundledSkills, loadUserSkills(join(DATA_DIR, "skills")));
+const globalSkillsRoot = join(DATA_DIR, "skills");
+const availableSkills = () => mergeSkills(bundledSkills, loadUserSkills(globalSkillsRoot));
 
 // Electron's utility-process parent port is private to the desktop main
 // process. It lets a slow first-time managed Composio registration arrive
@@ -287,11 +290,11 @@ function phoneIntegration() {
 
 function skillSelectionFor(
   bot: NonNullable<ReturnType<typeof store.bot>>,
-  triggerText: string,
+  skillId: string | undefined,
   capabilities: Iterable<string>,
 ): SkillSelection {
-  return decideBundledSkills(
-    triggerText,
+  return selectExactSkill(
+    skillId,
     capabilities,
     availableSkills(),
     { skillGrants: bot.skillGrants, skillToolGrants: bot.skillToolGrants },
@@ -368,7 +371,6 @@ function askBotAndWait(targetBotId: string, message: string, depth: number, from
     startTurn(targetBotId, message, {
       commsDepth: depth + 1,
       unattended: isUnattended(fromBotId),
-      skillTrigger: null,
     }).catch((err) =>
       finish(`(couldn't start that bot: ${err instanceof Error ? err.message : String(err)})`),
     );
@@ -391,6 +393,7 @@ let bootSelection = { instanceId: "", model: "" };
 const store = new Store(() => bootSelection);
 bootSelection = await defaultSelection();
 store.seedIfEmpty();
+for (const bot of store.bots) syncSkillLinks(bot.id);
 
 /** A bot as a client may see it: no provider session bookkeeping.
  *
@@ -402,13 +405,18 @@ store.seedIfEmpty();
 const wireTask = ({ resumeCursors, lastInstanceId, ...task }: TaskRecord) => task;
 
 const wireBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => {
-  const { resumeCursors, tasks, runtimePolicy: _runtimePolicy, ...rest } = bot;
-  const visibleSkillGrants = filterSkillGrantState(bot, bundledSkills);
+  const {
+    resumeCursors,
+    tasks,
+    runtimePolicy: _runtimePolicy,
+    skillGrants: _skillGrants,
+    skillToolGrants: _skillToolGrants,
+    ...rest
+  } = bot;
   return {
     ...rest,
     avatarUrl: rest.avatarUrl ?? null,
     runtimePolicy: effectiveBotRuntimePolicy(bot.runtimePolicy),
-    ...visibleSkillGrants,
     ...(tasks ? { tasks: tasks.map(wireTask) } : {}),
   };
 };
@@ -1374,7 +1382,6 @@ function dispatchDelegationReturn(result: DelegationReturn): void {
     threadId: result.sourceThreadId,
     connectorContinuation: true,
     unattended: isUnattended(source.id),
-    skillTrigger: null,
     onDispatchError: (message) => {
       store.appendMessage(result.sourceThreadId, {
         role: "bot",
@@ -1637,7 +1644,6 @@ const runDelegatedTurn: Parameters<typeof drainDelegations>[3] = (toBotId, text,
       commsDepth,
       threadId: activeTargetThreadId,
       unattended: isUnattended(store.botByThread(sourceThreadId)?.id),
-      skillTrigger: null,
       // startTurn schedules provider/integration setup after marking the bot
       // busy. Those asynchronous setup failures do not emit turn.completed,
       // so clear the watch and report them through this callback too.
@@ -1678,13 +1684,13 @@ bus.subscribe((event: RuntimeEvent) => {
 });
 
 function drainQueuedSends() {
-  drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds) =>
+  drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds, skillId) =>
     // A plain attended turn — no automationSource, no unattended, no comms
     // depth: exactly what typing the same words into an idle bot would run.
     // Drain just appended the held lines; userMessage keeps startTurn
     // from duplicating the last one, and excludeIds drops every drained
     // line from the transcript-replay so they are not also in `prompt`.
-    startTurn(botId, prompt, { threadId, userMessage, excludeMessageIds: excludeIds }).catch((err) => {
+    startTurn(botId, prompt, { threadId, userMessage, excludeMessageIds: excludeIds, skillId }).catch((err) => {
       store.appendMessage(threadId, {
         role: "bot",
         kind: "activity",
@@ -1829,9 +1835,8 @@ async function startTurn(
      * The prompt is control-plane context: it reaches the provider without
      * masquerading as another message authored by the user. */
     connectorContinuation?: boolean;
-    /** The only text eligible to trigger a bundled skill. null disables skill
-     * selection for internal, webhook, and delegated turns. */
-    skillTrigger?: string | null;
+    /** One exact app-wide skill manually chosen for this send. */
+    skillId?: string;
     cardContinuation?: boolean;
     /** Earlier text message this user turn is replying to. */
     replyTo?: Message;
@@ -1897,6 +1902,13 @@ async function startTurn(
       { status: 409 },
     );
   }
+  const skillSelection = manualSkillAdmission(
+    bot,
+    threadId,
+    "direct",
+    opts?.skillId,
+    enabledProviderCapabilityIds(instance.adapter.capabilities),
+  );
 
   // an edit hands us its already-branched user message; a plain send appends
   let userMessage = opts?.userMessage;
@@ -1996,17 +2008,10 @@ async function startTurn(
     let providerLaunchAttempted = false;
     try {
       const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
-      const skillTrigger = opts?.skillTrigger === null ? "" : (opts?.skillTrigger ?? text);
-      const skillSelection = skillSelectionFor(
-        bot,
-        skillTrigger,
-        instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : [],
-      );
       const selectedSkills = skillSelection.selectedSkills;
       if (skillSelection.mountedSkillToolIds.includes("phone")) {
         integrations.phone = phoneIntegration();
       }
-      auditSkillSelection(bot.id, threadId, "direct", skillSelection);
       // the user's connected apps, but only to a driver that can mount
       // them — a key in the config says the connections exist, not that
       // this engine can reach them — and only to a bot the user has not
@@ -2275,7 +2280,7 @@ async function startTurn(
           (coordinationPrompt ? ` ${coordinationPrompt}` : "") +
           credentialPrompt +
           sectionContextSystemPrompt(bot.section) +
-          (privateWorkspace ? memorySystemPrompt(bot.id) + skillsSystemPrompt(bot.id) : "") +
+          (privateWorkspace ? memorySystemPrompt(bot.id) : "") +
           skillInstructions +
           packagePlaybooks +
           (opts?.automationSource === "webhook"
@@ -2358,7 +2363,7 @@ routines = new RoutineManager({
     return task;
   },
   startTurn: (botId, threadId, prompt, runOn, triggerSource, onDispatchError) =>
-    startTurn(botId, prompt, { threadId, runOn, automationSource: triggerSource, skillTrigger: null, onDispatchError }),
+    startTurn(botId, prompt, { threadId, runOn, automationSource: triggerSource, onDispatchError }),
   interruptTurn: async (botId, threadId, runOn) => {
     const bot = store.bot(botId);
     const instance = runOn === "cloud"
@@ -2466,15 +2471,15 @@ async function runGroupMemberTurn(
   // must not run Pixel twice (once chained, once as a direct responder)
   spoken: Set<string> = new Set(),
   connectorContinuation?: string,
-  skillTrigger?: string | ((message: string) => void),
   cardContinuation?: string,
   onDispatchError?: (message: string) => void,
+  manualSkillId?: string,
 ): Promise<boolean> {
   const group = store.group(groupId);
   const bot = store.bot(botId);
   if (!group || !bot) return false;
   spoken.add(botId);
-  const dispatchError = onDispatchError ?? (typeof skillTrigger === "function" ? skillTrigger : undefined);
+  const dispatchError = onDispatchError;
   const instance = registry.get(bot.modelSelection.instanceId);
   const userName = cfg.profile?.name?.trim() || "User";
   if (!instance) {
@@ -2509,11 +2514,26 @@ async function runGroupMemberTurn(
   const runtimeTiming = runtimePolicyTiming(bot.runtimePolicy);
   const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
   const continuationText = cardContinuation ?? connectorContinuation;
-  const skillSelection = skillSelectionFor(
-    bot,
-    typeof skillTrigger === "string" ? skillTrigger : connectorContinuation ?? "",
-    instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : [],
-  );
+  let skillSelection: SkillSelection;
+  try {
+    skillSelection = manualSkillAdmission(
+      bot,
+      group.threadId,
+      "room",
+      manualSkillId,
+      enabledProviderCapabilityIds(instance.adapter.capabilities),
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "skill selection refused";
+    store.appendMessage(group.threadId, {
+      role: "bot",
+      kind: "activity",
+      from: { botId: bot.id, name: bot.name, color: bot.color },
+      tool: { name: `error: ${message}`, ok: false },
+    });
+    dispatchError?.(message);
+    return true;
+  }
   const selectedSkills = skillSelection.selectedSkills;
   if (skillSelection.mountedSkillToolIds.includes("phone")) {
     integrations.phone = phoneIntegration();
@@ -2573,7 +2593,7 @@ async function runGroupMemberTurn(
   const roomSystem =
     system +
     sectionContextSystemPrompt(bot.section) +
-    (workspace ? `\n${memorySystemPrompt(bot.id).trim()}${skillsSystemPrompt(bot.id)}` : "") +
+    (workspace ? `\n${memorySystemPrompt(bot.id).trim()}` : "") +
     renderSkillInstructions(selectedSkills, { includeRoot: Boolean(workspace) }) +
     installedPlaybookInstructions(text, bot.playbooks);
 
@@ -2586,7 +2606,6 @@ async function runGroupMemberTurn(
     });
     return true;
   }
-  auditSkillSelection(bot.id, group.threadId, "room", skillSelection);
   store.setActivity(bot.id, "working");
   store.patchGroup(group.id, { busyBotId: bot.id }); // the store's change stream carries the frame
   groupSpeakers.set(group.threadId, { botId: bot.id, name: bot.name, color: bot.color });
@@ -2739,20 +2758,42 @@ async function runGroupMemberTurn(
   return true;
 }
 
-function startGroupTurn(groupId: string, text: string, replyTo?: Message) {
+function startGroupTurn(groupId: string, text: string, replyTo?: Message, skillId?: string) {
   const group = store.group(groupId);
   if (!group) throw Object.assign(new Error("no such group"), { status: 404 });
   if (roomSetupPending(group)) {
     throw Object.assign(new Error("finish room setup before sending the first message"), { status: 409 });
   }
-  store.appendMessage(group.threadId, { role: "user", kind: "text", text, replyToId: replyTo?.id });
-
   const members = group.memberIds
     .map((id) => store.bot(id))
     .filter((b): b is NonNullable<typeof b> => Boolean(b));
   const availableMembers = members.filter((member) => !member.hidden);
   const archived = members.filter((member) => member.hidden);
   const mentionedArchived = mentionedBots(text, archived.map(({ name }) => ({ name })))[0];
+  let responders = roomResponders(text, members, group.defaultResponder);
+  // bot⇄bot channels: chipping in without a tag addresses the last speaker
+  if (!responders.length && group.dm) {
+    const lastSpeakerId = [...store.messagesFor(group.threadId)]
+      .reverse()
+      .find((msg) => msg.kind === "text" && msg.from)?.from?.botId;
+    const last = availableMembers.find((b) => b.id === lastSpeakerId) ?? availableMembers[0];
+    responders = last ? [last] : [];
+  }
+  if (skillId) {
+    for (const responder of responders) {
+      const instance = registry.get(responder.modelSelection.instanceId);
+      if (!instance) continue;
+      manualSkillAdmission(
+        responder,
+        group.threadId,
+        "room",
+        skillId,
+        enabledProviderCapabilityIds(instance.adapter.capabilities),
+        { auditSuccess: false },
+      );
+    }
+  }
+  store.appendMessage(group.threadId, { role: "user", kind: "text", text, replyToId: replyTo?.id });
   if (mentionedArchived) {
     store.appendMessage(group.threadId, {
       role: "bot",
@@ -2762,15 +2803,6 @@ function startGroupTurn(groupId: string, text: string, replyTo?: Message) {
         ok: false,
       },
     });
-  }
-  let responders = roomResponders(text, members, group.defaultResponder);
-  // bot⇄bot channels: chipping in without a tag addresses the last speaker
-  if (!responders.length && group.dm) {
-    const lastSpeakerId = [...store.messagesFor(group.threadId)]
-      .reverse()
-      .find((msg) => msg.kind === "text" && msg.from)?.from?.botId;
-    const last = availableMembers.find((b) => b.id === lastSpeakerId) ?? availableMembers[0];
-    responders = last ? [last] : [];
   }
   if (!responders.length) {
     const defaultArchivedId = group.defaultResponder.kind === "member" ? group.defaultResponder.botId : undefined;
@@ -2806,7 +2838,7 @@ function startGroupTurn(groupId: string, text: string, replyTo?: Message) {
     const spoken = new Set<string>();
     for (const responder of responders) {
       if (spoken.has(responder.id)) continue;
-      if (!(await runGroupMemberTurn(groupId, responder.id, 0, spoken, undefined, text))) break;
+      if (!(await runGroupMemberTurn(groupId, responder.id, 0, spoken, undefined, undefined, undefined, skillId))) break;
     }
   });
   groupQueues.set(groupId, next.catch(() => {}));
@@ -2889,7 +2921,7 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
         pendingConnectorResumes.set(`${entry.threadId}:${entry.resumeKey}`, entry);
         return;
       }
-      await runGroupMemberTurn(current.group.id, entry.botId, 0, new Set(), prompt, prompt);
+      await runGroupMemberTurn(current.group.id, entry.botId, 0, new Set(), prompt);
     });
     groupQueues.set(owner.group.id, next.catch((error) => {
       markConnectorResumeFailed(entry.threadId, entry.resumeKey, error instanceof Error ? error.message : String(error));
@@ -2899,7 +2931,6 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
   void startTurn(entry.botId, prompt, {
     threadId: entry.threadId,
     connectorContinuation: true,
-    skillTrigger: prompt,
     cardContinuation: true,
     onDispatchError: (message) => markConnectorResumeFailed(entry.threadId, entry.resumeKey, message),
   }).catch((error) => {
@@ -2978,6 +3009,7 @@ function dispatchSecretResume(entry: SecretResumeEntry) {
         0,
         new Set(),
         prompt,
+        undefined,
         (message) => markSecretResumeFailed(entry.threadId, entry.messageId, message),
       );
     });
@@ -4556,7 +4588,8 @@ const server = createServer(async (req, res) => {
       const group = store.group(m[1]);
       if (!group) return json(res, 404, { error: "no such group" });
       const replyTo = resolveReplyTarget(group.threadId, body.replyToId);
-      startGroupTurn(group.id, text, replyTo);
+      const skillId = optionalSkillId(body.skillId);
+      startGroupTurn(group.id, text, replyTo, skillId);
       return json(res, 202, { ok: true });
     }
     m = path.match(/^\/api\/groups\/([\w-]+)\/interrupt$/);
@@ -4678,7 +4711,7 @@ const server = createServer(async (req, res) => {
       try {
         skillGrantPatch = validateSkillGrantPatch(
           { skillGrants: body.skillGrants, skillToolGrants: body.skillToolGrants },
-          bundledSkills,
+          availableSkills(),
         );
       } catch (error) {
         return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -5122,12 +5155,23 @@ const server = createServer(async (req, res) => {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
       const replyTo = resolveReplyTarget(bot.threadId, body.replyToId);
+      const skillId = optionalSkillId(body.skillId);
       // Claude can accept the message inside its live turn. If the write
       // loses a race with turn settlement, or the engine cannot steer, the
       // existing server-side queue records it atomically for the next turn.
       if (bot.busy) {
         const instance = registry.get(bot.modelSelection.instanceId);
-        if (instance?.adapter.capabilities.queueing && instance.adapter.steer) {
+        if (skillId) {
+          manualSkillAdmission(
+            bot,
+            bot.threadId,
+            "direct",
+            skillId,
+            instance ? enabledProviderCapabilityIds(instance.adapter.capabilities) : [],
+            { auditSuccess: false },
+          );
+        }
+        if (!skillId && instance?.adapter.capabilities.queueing && instance.adapter.steer) {
           const steered = await instance.adapter
             .steer(bot.threadId, promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"))
             .catch(() => false);
@@ -5146,10 +5190,11 @@ const server = createServer(async (req, res) => {
         const queued = queueSteeredMessage(bot, text, {
           replyToId: replyTo?.id,
           prompt: promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"),
+          skillId,
         });
         return json(res, 202, { ok: true, queued: true, queueId: queued.id, threadId: bot.threadId });
       }
-      await startTurn(bot.id, text, { replyTo });
+      await startTurn(bot.id, text, { replyTo, skillId });
       return json(res, 202, { ok: true });
     }
 
@@ -5482,7 +5527,34 @@ const server = createServer(async (req, res) => {
     // Bundled skill catalog and its support-only selection audit. These are
     // read-only surfaces; the catalog never grants a skill or a tool.
     if (method === "GET" && (path === "/api/skills" || path === "/api/skills/catalog")) {
-      return json(res, 200, { skills: skillCatalog(bundledSkills) });
+      return json(res, 200, { skills: skillCatalog(availableSkills()) });
+    }
+    if (method === "POST" && path === "/api/skills/import") {
+      const body = await readBody(req);
+      if (typeof body.source !== "string" || !body.source.trim()) {
+        return json(res, 400, { error: "A GitHub skill source is required" });
+      }
+      const fetched = await fetchSkillFromSource(body.source.trim());
+      if ("error" in fetched) return json(res, 400, fetched);
+      const reservedIds = bundledSkills.map((skill) => skill.manifest.id);
+      const imported = installGlobalSkillBatch(
+        globalSkillsRoot,
+        fetched.skills,
+        { reservedIds },
+      );
+      if ("error" in imported) {
+        return json(res, imported.kind === "collision" ? 409 : imported.kind === "invalid" ? 400 : 500, {
+          error: imported.error,
+        });
+      }
+      const { results } = imported;
+      if (!results.length) {
+        return json(res, 400, { error: "No importable skills were found", results });
+      }
+      return json(res, 201, {
+        results,
+        skills: skillCatalog(availableSkills()),
+      });
     }
     if (method === "GET" && path === "/api/skills/audit") {
       const rawLimit = url.searchParams.get("limit");
@@ -6113,7 +6185,11 @@ const server = createServer(async (req, res) => {
     return json(res, 404, { error: `no route: ${method} ${path}` });
   } catch (e) {
     const status = (e as any)?.status ?? 500;
-    return json(res, status, { error: e instanceof Error ? e.message : String(e) });
+    const skillReason = (e as { skillReason?: SkillSelectionReason })?.skillReason;
+    return json(res, status, {
+      error: e instanceof Error ? e.message : String(e),
+      ...(skillReason ? { skillReason } : {}),
+    });
   }
 });
 
@@ -6157,5 +6233,35 @@ async function shutdownServer() {
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     void shutdownServer();
+  });
+}
+
+function optionalSkillId(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string" || !value.trim() || value.length > 64) {
+    throw Object.assign(new Error("skillId must be one exact catalog id"), { status: 400 });
+  }
+  return value.trim();
+}
+
+function manualSkillAdmission(
+  bot: NonNullable<ReturnType<typeof store.bot>>,
+  threadId: string,
+  surface: "direct" | "room",
+  skillId: string | undefined,
+  capabilities: Iterable<string>,
+  options: { auditSuccess?: boolean } = {},
+): SkillSelection {
+  const selection = skillSelectionFor(bot, skillId, capabilities);
+  if (!skillId) return selection;
+  const reason = selection.decisions[0]?.reason ?? "unknown";
+  if (reason === "selected") {
+    if (options.auditSuccess !== false) auditSkillSelection(bot.id, threadId, surface, selection);
+    return selection;
+  }
+  auditSkillSelection(bot.id, threadId, surface, selection);
+  throw Object.assign(new Error(`skill selection refused: ${reason}`), {
+    status: 409,
+    skillReason: reason,
   });
 }

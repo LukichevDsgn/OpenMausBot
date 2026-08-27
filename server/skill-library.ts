@@ -21,6 +21,17 @@ export interface BundledSkill {
   manifest: SkillManifest;
   instructions: string;
   directory: string;
+  origin?: SkillOrigin;
+  metadata?: SkillCatalogMetadata;
+}
+
+export type SkillOrigin = "built-in" | "recorded" | "imported";
+
+export interface SkillCatalogMetadata {
+  source?: string;
+  importedAt?: string;
+  warnings?: string[];
+  skippedFiles?: string[];
 }
 
 export interface SkillGrantState {
@@ -32,6 +43,7 @@ export interface SkillGrantState {
 
 export type SkillSelectionReason =
   | "selected"
+  | "unknown"
   | "trigger-mismatch"
   | "skill-denied"
   | "capability-missing"
@@ -59,6 +71,23 @@ export interface SkillCatalogEntry {
   triggerTerms: string[];
   requiredCapabilities: string[];
   tools: string[];
+  origin: SkillOrigin;
+  status: "available";
+  source?: string;
+  importedAt?: string;
+  warnings: string[];
+  skippedFiles: string[];
+}
+
+/** Provider capability ids admitted to skill manifests. Only literal true
+ * flags count; string/array capability metadata is intentionally excluded.
+ * Sorting makes audit and tests stable while automatically covering future
+ * boolean flags added by provider adapters. */
+export function enabledProviderCapabilityIds(capabilities: Record<string, unknown>): string[] {
+  return Object.entries(capabilities)
+    .filter(([, value]) => value === true)
+    .map(([id]) => id)
+    .sort((a, b) => a.localeCompare(b));
 }
 
 const SAFE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -115,7 +144,10 @@ export function parseSkillManifest(value: unknown, directory: string): SkillMani
   };
 }
 
-function loadSkillDirectory(directory: string, options: { allowMissingTools?: boolean } = {}): BundledSkill | null {
+function loadSkillDirectory(
+  directory: string,
+  options: { allowMissingTools?: boolean; origin?: SkillOrigin } = {},
+): BundledSkill | null {
   const manifestPath = join(directory, "manifest.json");
   const skillPath = join(directory, "SKILL.md");
   if (!existsSync(manifestPath) || !existsSync(skillPath)) return null;
@@ -126,7 +158,18 @@ function loadSkillDirectory(directory: string, options: { allowMissingTools?: bo
   const manifest = parseSkillManifest(raw, directory);
   const instructions = readFileSync(skillPath, "utf8").trim();
   if (!instructions.startsWith("---")) throw new Error(`${skillPath} has no skill frontmatter`);
-  return { manifest, instructions, directory };
+  const origin = options.origin ?? (raw.origin === "imported" ? "imported" : "recorded");
+  const metadata: SkillCatalogMetadata = {
+    ...(typeof raw.source === "string" ? { source: raw.source } : {}),
+    ...(typeof raw.importedAt === "string" ? { importedAt: raw.importedAt } : {}),
+    warnings: Array.isArray(raw.warnings)
+      ? raw.warnings.filter((item: unknown): item is string => typeof item === "string")
+      : [],
+    skippedFiles: Array.isArray(raw.skippedFiles)
+      ? raw.skippedFiles.filter((item: unknown): item is string => typeof item === "string")
+      : [],
+  };
+  return { manifest, instructions, directory, origin, metadata };
 }
 
 export function loadBundledSkills(root = process.env.OMB_SKILLS_DIR || join(process.cwd(), "skills")): BundledSkill[] {
@@ -134,14 +177,14 @@ export function loadBundledSkills(root = process.env.OMB_SKILLS_DIR || join(proc
   const skills: BundledSkill[] = [];
   for (const name of readdirSync(root).sort()) {
     const directory = join(root, name);
-    const skill = loadSkillDirectory(directory);
+    const skill = loadSkillDirectory(directory, { origin: "built-in" });
     if (skill) skills.push(skill);
   }
   return skills;
 }
 
 export function skillCatalog(skills: readonly BundledSkill[]): SkillCatalogEntry[] {
-  return skills.map(({ manifest }) => ({
+  return skills.map(({ manifest, origin = "built-in", metadata }) => ({
     id: manifest.id,
     name: manifest.name,
     version: manifest.version,
@@ -150,6 +193,12 @@ export function skillCatalog(skills: readonly BundledSkill[]): SkillCatalogEntry
     triggerTerms: [...manifest.triggerTerms],
     requiredCapabilities: [...manifest.requiredCapabilities],
     tools: [...manifest.tools],
+    origin,
+    status: "available",
+    ...(metadata?.source ? { source: metadata.source } : {}),
+    ...(metadata?.importedAt ? { importedAt: metadata.importedAt } : {}),
+    warnings: [...(metadata?.warnings ?? [])],
+    skippedFiles: [...(metadata?.skippedFiles ?? [])],
   }));
 }
 
@@ -247,6 +296,43 @@ export function decideBundledSkills(
     mountedSkillToolIds: sortedUnique(selectedSkills.flatMap(({ manifest }) => manifest.tools)),
     decisions,
   };
+}
+
+/** Exact manual selection for one send. Trigger terms deliberately do not
+ * participate: ordinary text is manual-only, and an omitted id selects
+ * nothing. Grants and provider capabilities remain server-authoritative. */
+export function selectExactSkill(
+  skillId: string | undefined,
+  capabilities: Iterable<string>,
+  skills: readonly BundledSkill[],
+  grants: SkillGrantState = {},
+): SkillSelection {
+  if (!skillId) return { selectedSkills: [], mountedSkillToolIds: [], decisions: [] };
+  const skill = skills.find(({ manifest }) => manifest.id === skillId);
+  if (!skill) {
+    return {
+      selectedSkills: [],
+      mountedSkillToolIds: [],
+      decisions: [{ skillId, reason: "unknown", requiredCapabilities: [], declaredToolIds: [] }],
+    };
+  }
+  const { manifest } = skill;
+  const grantedSkills = new Set(effectiveSkillIds(skills, grants));
+  const grantedTools = new Set(effectiveSkillToolIds(skills, grants));
+  const available = new Set(capabilities);
+  let reason: SkillSelectionReason = "selected";
+  if (!grantedSkills.has(skillId)) reason = "skill-denied";
+  else if (!manifest.requiredCapabilities.every((capability) => available.has(capability))) reason = "capability-missing";
+  else if (!manifest.tools.every((tool) => grantedTools.has(tool))) reason = "tool-denied";
+  const decision: SkillDecision = {
+    skillId,
+    reason,
+    requiredCapabilities: [...manifest.requiredCapabilities],
+    declaredToolIds: [...manifest.tools],
+  };
+  return reason === "selected"
+    ? { selectedSkills: [skill], mountedSkillToolIds: [...manifest.tools], decisions: [decision] }
+    : { selectedSkills: [], mountedSkillToolIds: [], decisions: [decision] };
 }
 
 /** User-authored skills are hot-loaded on each turn so a just-recorded skill
