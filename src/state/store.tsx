@@ -1199,7 +1199,7 @@ export async function api(path: string, init?: RequestInit): Promise<any> {
  * the components that read this hook (the chat's streaming tail), while every
  * useStore consumer — sidebar, mascots, pickers, the settled transcript —
  * keeps its render tree untouched during a stream. */
-interface StreamState {
+export interface StreamState {
   /** in-flight assistant text per threadId */
   streaming: Record<string, string>;
   /** in-flight extended thinking per threadId (ephemeral) */
@@ -1212,14 +1212,52 @@ export function useStreaming() {
   return useContext(StreamContext);
 }
 
-const StoreContext = createContext<{
+export interface StoreContextValue {
   state: AppState;
   dispatch: React.Dispatch<Action>;
   /** Commit any debounced profile edits before an operation reads the bot. */
   flushBotPatches: (botId: string) => Promise<void>;
   /** Re-fetch engine availability — after an install, without a restart. */
   refreshInstances: () => Promise<void>;
-} | null>(null);
+}
+
+const StoreContext = createContext<StoreContextValue | null>(null);
+
+export function createStaticStoreValue(
+  state: AppState,
+  dispatch: React.Dispatch<Action>,
+): StoreContextValue {
+  return {
+    state,
+    dispatch,
+    flushBotPatches: async () => undefined,
+    refreshInstances: async () => undefined,
+  };
+}
+
+/**
+ * Side-effect-free context adapter for local Storybook and component tests.
+ * The caller owns the state and reducer dispatch; this provider never
+ * bootstraps, opens SSE, or calls the API.
+ */
+export function StaticStoreProvider({
+  state,
+  dispatch,
+  stream = EMPTY_STREAM,
+  children,
+}: {
+  state: AppState;
+  dispatch: React.Dispatch<Action>;
+  stream?: StreamState;
+  children: ReactNode;
+}) {
+  const value = createStaticStoreValue(state, dispatch);
+  return (
+    <StoreContext.Provider value={value}>
+      <StreamContext.Provider value={stream}>{children}</StreamContext.Provider>
+    </StoreContext.Provider>
+  );
+}
 
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [state, rawDispatch] = useReducer(reducer, initialState);
