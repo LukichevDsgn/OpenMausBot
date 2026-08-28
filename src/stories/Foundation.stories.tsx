@@ -128,7 +128,7 @@ export const SettingsPanelRuntimeControls: Story = {
     const bot = fixtureBots[0]!;
     return (
       <StorybookProvider state={fixtureStates.default}>
-        <div className="min-h-screen bg-app text-ink">
+        <div className="h-screen overflow-hidden bg-app text-ink">
           <SettingsPanel bot={bot} />
         </div>
       </StorybookProvider>
@@ -142,7 +142,7 @@ export const SettingsPanelChiefLocked: Story = {
     const bot = fixtureStates.chiefLocked.bots.find((entry) => entry.id === "chief")!;
     return (
       <StorybookProvider state={fixtureStates.chiefLocked}>
-        <div className="min-h-screen bg-app text-ink">
+        <div className="h-screen overflow-hidden bg-app text-ink">
           <SettingsPanel bot={bot} />
         </div>
       </StorybookProvider>
@@ -156,7 +156,7 @@ export const SettingsPanelLongContentNarrow: Story = {
     const bot = fixtureStates.longContent.bots.find((entry) => entry.id === "chief")!;
     return (
       <StorybookProvider state={fixtureStates.longContent}>
-        <div className="min-h-screen w-[360px] overflow-hidden bg-app text-ink">
+        <div className="h-screen w-[360px] overflow-hidden bg-app text-ink">
           <SettingsPanel bot={bot} />
         </div>
       </StorybookProvider>
