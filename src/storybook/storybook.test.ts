@@ -18,6 +18,7 @@ describe("static Storybook catalog", () => {
   it("keeps panel fake responses explicit and local", () => {
     expect(Object.keys(STORYBOOK_ALLOWED_FAKE_RESPONSES)).toEqual(expect.arrayContaining([
       "/api/team-map",
+      "/api/bots/chief/memory",
       "/api/bots/builder/local-computer",
       "/api/threads/chief-thread/events",
       "/api/threads/builder-thread/events",

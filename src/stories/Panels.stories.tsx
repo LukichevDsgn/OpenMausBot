@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useLayoutEffect, useState, type ReactNode } from "react";
+import { ChatView } from "@/components/ChatView";
 import { ComputerPanel } from "@/components/ComputerPanel";
 import { InspectorPanel } from "@/components/InspectorPanel";
 import { PhoneSetupFlowView } from "@/components/PhoneSetupFlow";
@@ -13,6 +14,7 @@ import { fixtureBots, fixturePhoneController, fixtureSkills, fixtureStates, fixt
 import { createStorybookFetchGuard, type StorybookFakeResponseMap } from "@/storybook/fetch-guard";
 import { StorybookProvider } from "@/storybook/StaticStorybookProvider";
 import type { AppState } from "@/state/store";
+import { SIDEBAR_DENSITY_KEY } from "@/lib/sidebar-preferences";
 
 const meta = {
   title: "Panels / Product surfaces",
@@ -47,6 +49,27 @@ function ScopedFetch({ allowed, children }: { allowed: StorybookFakeResponseMap;
   return ready ? children : null;
 }
 
+function SidebarIconOnlyStory() {
+  const [ready, setReady] = useState(false);
+  useLayoutEffect(() => {
+    const previous = localStorage.getItem(SIDEBAR_DENSITY_KEY);
+    localStorage.setItem(SIDEBAR_DENSITY_KEY, "icons");
+    setReady(true);
+    return () => {
+      if (previous === null) localStorage.removeItem(SIDEBAR_DENSITY_KEY);
+      else localStorage.setItem(SIDEBAR_DENSITY_KEY, previous);
+    };
+  }, []);
+  if (!ready) return null;
+  return (
+    <PanelStory state={fixtureStates.sidebarLongNames}>
+      <div className="h-screen w-[260px] overflow-hidden bg-app">
+        <Sidebar open onClose={() => undefined} />
+      </div>
+    </PanelStory>
+  );
+}
+
 export const SettingsModalDefault: Story = {
   render: () => <PanelStory><SettingsModal /></PanelStory>,
 };
@@ -74,6 +97,24 @@ export const SidebarError: Story = {
 export const SidebarLongNames: Story = {
   render: () => <PanelStory state={fixtureStates.sidebarLongNames}><Sidebar open onClose={() => undefined} /></PanelStory>,
   globals: { viewport: { value: "panel", isRotated: false } },
+};
+
+export const SidebarIconOnlyProjects: Story = {
+  render: () => <SidebarIconOnlyStory />,
+  globals: { viewport: { value: "panel", isRotated: false } },
+};
+
+export const ChatViewChiefCompactHeader: Story = {
+  render: () => (
+    <PanelStory>
+      <div className="flex h-screen justify-center overflow-hidden bg-app">
+        <div className="h-full w-[680px] overflow-hidden bg-app">
+          <ChatView bot={fixtureBots[0]!} />
+        </div>
+      </div>
+    </PanelStory>
+  ),
+  globals: { viewport: { value: "desktop", isRotated: false } },
 };
 
 export const ComputerPanelDisconnected: Story = {

@@ -1,6 +1,36 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, Copy } from "lucide-react";
 
+export function SettingsRow({
+  title,
+  description,
+  leading,
+  control,
+  children,
+  className,
+}: {
+  title: React.ReactNode;
+  description: React.ReactNode;
+  leading?: React.ReactNode;
+  control?: React.ReactNode;
+  children?: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <div className={className}>
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex min-w-0 flex-1 items-start gap-2.5">
+          {leading}
+          <div className="min-w-0 flex-1 text-[15px] font-medium text-ink">{title}</div>
+        </div>
+        {control && <div className="shrink-0">{control}</div>}
+      </div>
+      <div className="mt-1.5 text-[13px] leading-relaxed text-ink-secondary">{description}</div>
+      {children && <div className="mt-3">{children}</div>}
+    </div>
+  );
+}
+
 export function Card({
   title,
   subtitle,

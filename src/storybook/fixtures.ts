@@ -345,6 +345,7 @@ export const fixtureStates = {
 export const STORYBOOK_ALLOWED_FAKE_RESPONSES = {
   "/api/health": { body: JSON.stringify({ ok: true }) },
   "/api/team-map": { body: JSON.stringify(fixtureTeamMapResponses.populated) },
+  "/api/bots/chief/memory": { body: JSON.stringify({ text: "Keep handoffs bounded and leave a receipt.", truncated: false, topics: [{ name: "coordination.md", bytes: 248 }] }) },
   "/api/bots/builder/local-computer": { body: JSON.stringify({ mode: "per-bot", max_instances: 1, image: false, create_supported: false, container: "missing", imageMatches: false, managed: true, network: "unknown", security: "unknown", persistence: "durable", desktopReady: false, ready: false, problem: "Fixture: desktop is disconnected", viewer_url: "" }) },
   "/api/threads/chief-thread/events": { body: JSON.stringify(fixtureInspectorResponses.populated) },
   "/api/threads/builder-thread/events": { body: JSON.stringify(fixtureInspectorResponses.empty) },

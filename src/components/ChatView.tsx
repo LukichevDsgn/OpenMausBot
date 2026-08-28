@@ -1043,8 +1043,13 @@ export function ChatView({ bot }: { bot: Bot }) {
             inputClassName="max-w-[220px] rounded bg-inset px-1.5 py-0.5 text-[15px] font-semibold"
           />
           {bot.chiefOfStaff && (
-            <span className="flex items-center gap-1 rounded-full bg-accent/12 px-2 py-0.5 text-[11px] font-medium text-accent">
-              <Crown size={11} /> Chief of Staff
+            <span
+              className="flex items-center gap-1 rounded-full bg-accent/12 px-2 py-0.5 text-[11px] font-medium text-accent @max-4xl/chathead:size-7 @max-4xl/chathead:justify-center @max-4xl/chathead:gap-0 @max-4xl/chathead:rounded-full @max-4xl/chathead:bg-accent @max-4xl/chathead:px-0 @max-4xl/chathead:py-0 @max-4xl/chathead:text-white"
+              aria-label="Chief of Staff"
+              title="Chief of Staff"
+            >
+              <Crown size={11} className="@max-4xl/chathead:size-[14px]" aria-hidden="true" />
+              <span className="@max-4xl/chathead:hidden">Chief of Staff</span>
             </span>
           )}
           {bot.busy && <Loader2 size={14} className="animate-spin text-ink-secondary" />}

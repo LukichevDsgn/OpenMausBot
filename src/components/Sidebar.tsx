@@ -14,6 +14,7 @@ import {
   Crown,
   ExternalLink,
   FolderMinus,
+  FolderOpen,
   FolderPlus,
   Library,
   Loader2,
@@ -1392,10 +1393,11 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
                   onClick={() => {
                     setPlusOpen(false);
                     track("bot_created");
-                    dispatch({
-                      type: "newBot",
-                      ...(projectFilter !== "all" ? { section: projectFilter, cwd: projectFolders[projectFilter] } : {}),
-                    });
+                    if (projectFilter === "all") {
+                      dispatch({ type: "newBot" });
+                    } else {
+                      dispatch({ type: "newBot", section: projectFilter, cwd: projectFolders[projectFilter] });
+                    }
                   }}
                   className="flex w-full items-center gap-3 px-3.5 py-2 text-left text-[14px] text-ink hover:bg-raised/70"
                 >
@@ -1521,11 +1523,26 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
             const collapsed = Boolean(collapsedProjects[name]);
             return (
             <Fragment key={name}>
-              <button type="button" onClick={() => toggleProject(name)} className="mt-2 flex w-full items-center gap-2 px-3 py-1.5 text-left text-[10.5px] font-semibold uppercase tracking-wide text-ink-secondary hover:text-ink">
-                <ChevronDown size={12} className={cn("transition-transform", collapsed && "-rotate-90")} />
-                <span className="truncate">{name}</span>
-                <span className="ml-auto text-[10px] font-normal">{projectBots.length}</span>
-              </button>
+              {density === "icons" ? (
+                <button
+                  type="button"
+                  onClick={() => toggleProject(name)}
+                  aria-label={`${collapsed ? "Expand" : "Collapse"} project ${name}`}
+                  title={`${name} · ${projectBots.length} ${projectBots.length === 1 ? "bot" : "bots"}${collapsed ? " · collapsed" : ""}`}
+                  aria-expanded={!collapsed}
+                  className="mt-2 flex w-full items-center justify-center gap-1.5 rounded-lg border-t border-hairline/30 py-2 text-ink-secondary hover:bg-raised/70 hover:text-ink"
+                >
+                  <FolderOpen size={16} aria-hidden="true" />
+                  <span className="min-w-4 text-center text-[10px] font-medium tabular-nums">{projectBots.length}</span>
+                  <ChevronDown size={12} aria-hidden="true" className={cn("transition-transform", collapsed && "-rotate-90")} />
+                </button>
+              ) : (
+                <button type="button" onClick={() => toggleProject(name)} className="mt-2 flex w-full items-center gap-2 px-3 py-1.5 text-left text-[10.5px] font-semibold uppercase tracking-wide text-ink-secondary hover:text-ink">
+                  <ChevronDown size={12} className={cn("transition-transform", collapsed && "-rotate-90")} />
+                  <span className="truncate">{name}</span>
+                  <span className="ml-auto text-[10px] font-normal">{projectBots.length}</span>
+                </button>
+              )}
               {!collapsed && projectBots
                 .sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)))
                 .map((b) => (

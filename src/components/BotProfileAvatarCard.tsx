@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { Check, ImagePlus, Loader2, Sparkles, Trash2 } from "lucide-react";
+import { Check, ChevronDown, ImagePlus, Loader2, Sparkles, Trash2 } from "lucide-react";
 
 import { api, useStore, type Bot, type ConfigStatus } from "@/state/store";
 import { imageAttachmentFromFile } from "@/lib/composer-attachments";
@@ -46,6 +46,7 @@ export function BotProfileAvatarCard({
   const [imageKey, setImageKey] = useState("");
   const [savingKey, setSavingKey] = useState(false);
   const [direction, setDirection] = useState("");
+  const [generationOpen, setGenerationOpen] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const crop = bot.avatarCrop ?? "mascot";
@@ -250,82 +251,95 @@ export function BotProfileAvatarCard({
         )}
 
         <div className="mt-5 border-t border-hairline/40 pt-4">
-          <div className="flex items-center gap-2 text-[13px] font-medium text-ink">
-            <Sparkles size={14} className="text-accent" /> Generate with GPT Image 2
-          </div>
+          <button
+            type="button"
+            aria-expanded={generationOpen}
+            aria-controls="avatar-generation-controls"
+            onClick={() => setGenerationOpen((open) => !open)}
+            className="flex w-full items-center justify-between gap-3 rounded-lg px-1 py-1 text-left text-[13px] font-medium text-ink hover:bg-control/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
+          >
+            <span className="flex min-w-0 items-center gap-2">
+              <Sparkles size={14} className="shrink-0 text-accent" /> Generate with GPT Image 2
+            </span>
+            <ChevronDown size={16} aria-hidden="true" className={cn("shrink-0 text-ink-secondary transition-transform", generationOpen && "rotate-180")} />
+          </button>
           <div className="mt-1 text-[11.5px] leading-relaxed text-ink-secondary">
             Uses a low-quality square draft to keep cost down. OpenAI bills your API account.
           </div>
 
-          {!imageConfigured ? (
-            <div className="mt-3">
-              <div className="flex gap-2">
-                <input
-                  type="password"
-                  value={imageKey}
-                  onChange={(event) => setImageKey(event.target.value)}
-                  onKeyDown={(event) => event.key === "Enter" && void saveImageKey()}
-                  placeholder="Paste OpenAI image API key"
-                  aria-label="OpenAI image API key"
-                  autoComplete="off"
-                  className="min-w-0 flex-1 rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[12.5px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
-                />
-                <button
-                  type="button"
-                  onClick={() => void saveImageKey()}
-                  disabled={savingKey || !imageKey.trim()}
-                  className="flex w-[72px] items-center justify-center gap-1.5 rounded-lg bg-control text-[12.5px] text-ink hover:bg-raised-hover disabled:opacity-50"
-                >
-                  {savingKey ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} /> Save</>}
-                </button>
-              </div>
-              <div className="mt-1.5 text-[11px] text-ink-secondary">Stored in the operating system's encrypted credential store in the installed app.</div>
-            </div>
-          ) : (
-            <div className="mt-3">
-              <textarea
-                value={direction}
-                onChange={(event) => setDirection(event.target.value.slice(0, 400))}
-                maxLength={400}
-                placeholder={`Optional direction, e.g. “a calm navigator inspired by ${bot.title || bot.name}”`}
-                aria-label="Avatar generation direction"
-                className="min-h-[72px] w-full resize-none rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[12.5px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
-              />
-              <div className="mt-2 flex items-center justify-between gap-3">
-                <span className="text-[11px] tabular-nums text-ink-secondary">{direction.length}/400</span>
-                <button
-                  type="button"
-                  onClick={() => void generate()}
-                  disabled={generating || uploading}
-                  className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white hover:brightness-110 disabled:opacity-50"
-                >
-                  {generating ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
-                  {generating ? "Generating…" : "Generate avatar"}
-                </button>
-              </div>
-              <details className="mt-3 rounded-lg border border-hairline/40 bg-inset px-3 py-2">
-                <summary className="cursor-pointer text-[11.5px] text-ink-secondary">Replace OpenAI image key</summary>
-                <div className="mt-2 flex gap-2">
-                  <input
-                    type="password"
-                    value={imageKey}
-                    onChange={(event) => setImageKey(event.target.value)}
-                    onKeyDown={(event) => event.key === "Enter" && void saveImageKey()}
-                    placeholder="Paste replacement key"
-                    aria-label="Replacement OpenAI image API key"
-                    autoComplete="off"
-                    className="min-w-0 flex-1 rounded-lg border border-hairline/40 bg-card px-3 py-2 text-[12px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => void saveImageKey()}
-                    disabled={savingKey || !imageKey.trim()}
-                    className="flex w-[72px] items-center justify-center gap-1.5 rounded-lg bg-control text-[12px] text-ink hover:bg-raised-hover disabled:opacity-50"
-                  >
-                    {savingKey ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} /> Save</>}
-                  </button>
+          {generationOpen && (
+            <div id="avatar-generation-controls">
+              {!imageConfigured ? (
+                <div className="mt-3">
+                  <div className="flex gap-2">
+                    <input
+                      type="password"
+                      value={imageKey}
+                      onChange={(event) => setImageKey(event.target.value)}
+                      onKeyDown={(event) => event.key === "Enter" && void saveImageKey()}
+                      placeholder="Paste OpenAI image API key"
+                      aria-label="OpenAI image API key"
+                      autoComplete="off"
+                      className="min-w-0 flex-1 rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[12.5px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void saveImageKey()}
+                      disabled={savingKey || !imageKey.trim()}
+                      className="flex w-[72px] items-center justify-center gap-1.5 rounded-lg bg-control text-[12.5px] text-ink hover:bg-raised-hover disabled:opacity-50"
+                    >
+                      {savingKey ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} /> Save</>}
+                    </button>
+                  </div>
+                  <div className="mt-1.5 text-[11px] text-ink-secondary">Stored in the operating system's encrypted credential store in the installed app.</div>
                 </div>
-              </details>
+              ) : (
+                <div className="mt-3">
+                  <textarea
+                    value={direction}
+                    onChange={(event) => setDirection(event.target.value.slice(0, 400))}
+                    maxLength={400}
+                    placeholder={`Optional direction, e.g. “a calm navigator inspired by ${bot.title || bot.name}”`}
+                    aria-label="Avatar generation direction"
+                    className="min-h-[72px] w-full resize-y rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[12.5px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+                  />
+                  <div className="mt-2 flex items-center justify-between gap-3">
+                    <span className="text-[11px] tabular-nums text-ink-secondary">{direction.length}/400</span>
+                    <button
+                      type="button"
+                      onClick={() => void generate()}
+                      disabled={generating || uploading}
+                      className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white hover:brightness-110 disabled:opacity-50"
+                    >
+                      {generating ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
+                      {generating ? "Generating…" : "Generate avatar"}
+                    </button>
+                  </div>
+                  <details className="mt-3 rounded-lg border border-hairline/40 bg-inset px-3 py-2">
+                    <summary className="cursor-pointer text-[11.5px] text-ink-secondary">Replace OpenAI image key</summary>
+                    <div className="mt-2 flex gap-2">
+                      <input
+                        type="password"
+                        value={imageKey}
+                        onChange={(event) => setImageKey(event.target.value)}
+                        onKeyDown={(event) => event.key === "Enter" && void saveImageKey()}
+                        placeholder="Paste replacement key"
+                        aria-label="Replacement OpenAI image API key"
+                        autoComplete="off"
+                        className="min-w-0 flex-1 rounded-lg border border-hairline/40 bg-card px-3 py-2 text-[12px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void saveImageKey()}
+                        disabled={savingKey || !imageKey.trim()}
+                        className="flex w-[72px] items-center justify-center gap-1.5 rounded-lg bg-control text-[12px] text-ink hover:bg-raised-hover disabled:opacity-50"
+                      >
+                        {savingKey ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} /> Save</>}
+                      </button>
+                    </div>
+                  </details>
+                </div>
+              )}
             </div>
           )}
         </div>

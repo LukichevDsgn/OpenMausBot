@@ -15,6 +15,7 @@ import { instanceSupportsLocalComputer, localComputerDisabledReason, localComput
 import { BotProfileAvatarCard } from "./BotProfileAvatarCard";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
 import { VoiceSettings } from "./VoiceSettings";
+import { SettingsRow } from "./SettingsPrimitives";
 import { BOT_PROFILE_LIMITS } from "../../shared/bot-profile";
 
 function Field({
@@ -472,186 +473,166 @@ function RuntimeControlsCard({ bot }: { bot: Bot }) {
     : `${draft.cumulativeTokenPolicy.mode === "soft" ? "Soft" : "Hard"} · ${draft.cumulativeTokenPolicy.limit.toLocaleString()}`;
 
   return (
-    <div className="rounded-xl bg-card p-4">
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <div className="text-[15px] font-medium text-ink">Runtime controls</div>
-          <div className="mt-0.5 text-[13px] leading-relaxed text-ink-secondary">
-            Limits, recovery, and token budget for future turns.
-          </div>
-        </div>
+    <SettingsRow
+      className="rounded-xl bg-card p-4"
+      title="Runtime controls"
+      description="Limits, recovery, and token budget for future turns."
+      control={(
         <button
           type="button"
           aria-expanded={expanded}
+          aria-label={expanded ? "Collapse runtime controls" : "Expand runtime controls"}
+          title={expanded ? "Collapse runtime controls" : "Expand runtime controls"}
           onClick={() => setExpanded((current) => !current)}
-          className="flex shrink-0 items-center gap-1.5 rounded-full border border-hairline/40 bg-control/60 py-1 pl-2.5 pr-2 text-[13px] text-ink hover:bg-raised-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
+          className="flex size-8 items-center justify-center rounded-md text-ink-secondary hover:bg-raised-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
         >
-          {expanded ? "Hide" : "Configure"}
-          <ChevronDown size={14} aria-hidden="true" className={cn("text-ink-secondary transition-transform", expanded && "rotate-180")} />
+          <ChevronDown size={17} aria-hidden="true" className={cn("transition-transform", expanded && "rotate-180")} />
         </button>
-      </div>
-
-      <div className="mt-3 flex flex-wrap gap-1.5">
-        <span className="rounded-full bg-inset px-2 py-1 text-[11.5px] text-ink-secondary">
-          {draft.wallClockTimeoutMinutes === 0 ? "Turn cap off" : `${draft.wallClockTimeoutMinutes}m turn`}
-        </span>
-        <span className="rounded-full bg-inset px-2 py-1 text-[11.5px] text-ink-secondary">{draft.idleTimeoutMinutes}m idle</span>
-        <span className="rounded-full bg-inset px-2 py-1 text-[11.5px] text-ink-secondary">{draft.delegationConcurrency} delegates</span>
-        <span className="rounded-full bg-inset px-2 py-1 text-[11.5px] text-ink-secondary">{tokenSummary}</span>
-        {dirty && <span className="rounded-full bg-accent/10 px-2 py-1 text-[11.5px] text-accent">Unsaved</span>}
-      </div>
-
-      <div className="mt-3 flex items-center gap-3 rounded-lg border border-hairline/40 bg-inset px-3 py-2.5">
-        <span className={cn(
-          "flex size-7 shrink-0 items-center justify-center rounded-md",
-          chiefLocked ? "bg-control text-ink-secondary" : "bg-accent/10 text-accent",
-        )}>
-          {chiefLocked ? <Lock size={14} aria-hidden="true" /> : <LockOpen size={14} aria-hidden="true" />}
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="text-[13px] font-medium text-ink">Chief control</div>
-          <div className="text-[11.5px] leading-relaxed text-ink-secondary">
-            {chiefLocked ? "Locked · the Chief cannot adapt this bot's limits." : "Allowed · the Chief may adapt limits for future tasks."}
-          </div>
+      )}
+    >
+      <div className="space-y-3">
+        <div className="flex flex-wrap gap-1.5">
+          <span className="rounded-full bg-inset px-2 py-1 text-[11.5px] text-ink-secondary">
+            {draft.wallClockTimeoutMinutes === 0 ? "Turn cap off" : `${draft.wallClockTimeoutMinutes}m turn`}
+          </span>
+          <span className="rounded-full bg-inset px-2 py-1 text-[11.5px] text-ink-secondary">{draft.idleTimeoutMinutes}m idle</span>
+          <span className="rounded-full bg-inset px-2 py-1 text-[11.5px] text-ink-secondary">{draft.delegationConcurrency} delegates</span>
+          <span className="rounded-full bg-inset px-2 py-1 text-[11.5px] text-ink-secondary">{tokenSummary}</span>
+          {dirty && <span className="rounded-full bg-accent/10 px-2 py-1 text-[11.5px] text-accent">Unsaved</span>}
         </div>
-        <button
-          type="button"
-          role="switch"
-          aria-checked={!chiefLocked}
-          aria-label="Allow the Chief to adapt limits"
-          disabled={chiefLockSaving}
-          onClick={() => void toggleChiefControl()}
-          className={cn(
-            "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50",
-            chiefLocked ? "bg-control" : "bg-accent",
+
+        <SettingsRow
+          className="rounded-lg border border-hairline/40 bg-inset px-3 py-2.5"
+          title="Chief control"
+          description={chiefLocked ? "Locked · the Chief cannot adapt this bot's limits." : "Allowed · the Chief may adapt limits for future tasks."}
+          leading={(
+            <span className={cn(
+              "flex size-7 shrink-0 items-center justify-center rounded-md",
+              chiefLocked ? "bg-control text-ink-secondary" : "bg-accent/10 text-accent",
+            )}>
+              {chiefLocked ? <Lock size={14} aria-hidden="true" /> : <LockOpen size={14} aria-hidden="true" />}
+            </span>
           )}
-        >
-          <span className={cn(
-            "absolute top-[3px] size-5 rounded-full bg-white transition-all",
-            chiefLocked ? "left-[3px]" : "left-[21px]",
-          )} />
-        </button>
-      </div>
-      {chiefLockError && <div className="mt-2 text-[12px] text-danger">{chiefLockError}</div>}
+          control={(
+            <button
+              type="button"
+              role="switch"
+              aria-checked={!chiefLocked}
+              aria-label="Allow the Chief to adapt limits"
+              disabled={chiefLockSaving}
+              onClick={() => void toggleChiefControl()}
+              className={cn(
+                "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+                chiefLocked ? "bg-control" : "bg-accent",
+              )}
+            >
+              <span className={cn(
+                "absolute top-[3px] size-5 rounded-full bg-white transition-all",
+                chiefLocked ? "left-[3px]" : "left-[21px]",
+              )} />
+            </button>
+          )}
+        />
+        {chiefLockError && <div className="text-[12px] text-danger">{chiefLockError}</div>}
 
-      {expanded && (
-        <div className="mt-4 space-y-3">
-          <section className="rounded-xl border border-hairline/40 bg-inset p-3">
-            <div className="text-[11.5px] font-medium uppercase tracking-[0.08em] text-ink-secondary">Turn limits</div>
-            <div className="mt-3 grid grid-cols-2 gap-3">
-              <label className="block">
-                <span className="text-[13px] text-ink">Wall clock</span>
-                <span className="mt-0.5 block text-[11.5px] text-ink-secondary">Minutes · 0 disables · max 1,440</span>
-                <input className={cn(inputCls, "mt-1.5")} type="number" min={0} max={1_440} step={1} disabled={saving} value={numberInputValue(draft.wallClockTimeoutMinutes)} onChange={(event) => updateNumber("wallClockTimeoutMinutes", event.currentTarget.value)} />
-              </label>
-              <label className="block">
-                <span className="text-[13px] text-ink">Idle timeout</span>
-                <span className="mt-0.5 block text-[11.5px] text-ink-secondary">Minutes · 1–1,440</span>
-                <input className={cn(inputCls, "mt-1.5")} type="number" min={1} max={1_440} step={1} disabled={saving} value={numberInputValue(draft.idleTimeoutMinutes)} onChange={(event) => updateNumber("idleTimeoutMinutes", event.currentTarget.value)} />
-              </label>
-              <label className="block">
-                <span className="text-[13px] text-ink">Cancel grace</span>
-                <span className="mt-0.5 block text-[11.5px] text-ink-secondary">Seconds · 1–120</span>
-                <input className={cn(inputCls, "mt-1.5")} type="number" min={1} max={120} step={1} disabled={saving} value={numberInputValue(draft.cancellationGraceSeconds)} onChange={(event) => updateNumber("cancellationGraceSeconds", event.currentTarget.value)} />
-              </label>
-              <label className="block">
-                <span className="text-[13px] text-ink">Tool & agent steps</span>
-                <span className="mt-0.5 block text-[11.5px] text-ink-secondary">0 disables · 1–1,000</span>
-                <input className={cn(inputCls, "mt-1.5")} type="number" min={0} max={1_000} step={1} disabled={saving} value={numberInputValue(draft.maxToolAgentSteps)} onChange={(event) => updateNumber("maxToolAgentSteps", event.currentTarget.value)} />
-              </label>
-            </div>
-          </section>
-
-          <section className="rounded-xl border border-hairline/40 bg-inset p-3">
-            <div className="text-[11.5px] font-medium uppercase tracking-[0.08em] text-ink-secondary">Recovery & coordination</div>
-            <div className="mt-3 grid grid-cols-2 gap-3">
-              <label className="block">
-                <span className="text-[13px] text-ink">Retries</span>
-                <span className="mt-0.5 block text-[11.5px] text-ink-secondary">Automatic · 0–1</span>
-                <input className={cn(inputCls, "mt-1.5")} type="number" min={0} max={1} step={1} disabled={saving} value={numberInputValue(draft.retryCap)} onChange={(event) => updateNumber("retryCap", event.currentTarget.value)} />
-              </label>
-              <label className="block">
-                <span className="text-[13px] text-ink">Delegation</span>
-                <span className="mt-0.5 block text-[11.5px] text-ink-secondary">Concurrent agents · 1–4</span>
-                <input className={cn(inputCls, "mt-1.5")} type="number" min={1} max={4} step={1} disabled={saving} value={numberInputValue(draft.delegationConcurrency)} onChange={(event) => updateNumber("delegationConcurrency", event.currentTarget.value)} />
-              </label>
-              <label className="block">
-                <span className="text-[13px] text-ink">Handoff size</span>
-                <span className="mt-0.5 block text-[11.5px] text-ink-secondary">UTF-8 bytes · 1,024–12,000</span>
-                <input className={cn(inputCls, "mt-1.5")} type="number" min={1_024} max={12_000} step={1} disabled={saving} value={numberInputValue(draft.handoffByteCap)} onChange={(event) => updateNumber("handoffByteCap", event.currentTarget.value)} />
-              </label>
-              <div className="flex min-h-[72px] items-center justify-between gap-3 rounded-lg border border-hairline/40 bg-card px-3 py-2.5">
-                <div className="min-w-0">
-                  <div className="text-[13px] text-ink">Fresh session</div>
-                  <div className="mt-0.5 text-[11.5px] text-ink-secondary">Start each turn from bounded replay.</div>
-                </div>
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={draft.freshSessionEnforcement}
-                  aria-label="Fresh session each turn"
-                  disabled={saving}
-                  onClick={() => {
-                    setDraft((current) => ({ ...current, freshSessionEnforcement: !current.freshSessionEnforcement }));
-                    setStatus("clean");
-                    setError(null);
-                  }}
-                  className={cn(
-                    "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 disabled:cursor-not-allowed disabled:opacity-50",
-                    draft.freshSessionEnforcement ? "bg-accent" : "bg-control",
-                  )}
-                >
-                  <span className={cn("absolute top-[3px] size-5 rounded-full bg-white transition-all", draft.freshSessionEnforcement ? "left-[21px]" : "left-[3px]")} />
-                </button>
+        {expanded && (
+          <div className="space-y-3">
+            <section className="rounded-xl border border-hairline/40 bg-inset p-3">
+              <div className="text-[11.5px] font-medium uppercase tracking-[0.08em] text-ink-secondary">Turn limits</div>
+              <div className="mt-3 space-y-3">
+                <SettingsRow className="rounded-lg border border-hairline/30 bg-card p-3" title="Wall clock" description="Minutes · 0 disables · max 1,440">
+                  <input aria-label="Wall clock timeout" className={inputCls} type="number" min={0} max={1_440} step={1} disabled={saving} value={numberInputValue(draft.wallClockTimeoutMinutes)} onChange={(event) => updateNumber("wallClockTimeoutMinutes", event.currentTarget.value)} />
+                </SettingsRow>
+                <SettingsRow className="rounded-lg border border-hairline/30 bg-card p-3" title="Idle timeout" description="Minutes · 1–1,440">
+                  <input aria-label="Idle timeout" className={inputCls} type="number" min={1} max={1_440} step={1} disabled={saving} value={numberInputValue(draft.idleTimeoutMinutes)} onChange={(event) => updateNumber("idleTimeoutMinutes", event.currentTarget.value)} />
+                </SettingsRow>
+                <SettingsRow className="rounded-lg border border-hairline/30 bg-card p-3" title="Cancel grace" description="Seconds · 1–120">
+                  <input aria-label="Cancel grace" className={inputCls} type="number" min={1} max={120} step={1} disabled={saving} value={numberInputValue(draft.cancellationGraceSeconds)} onChange={(event) => updateNumber("cancellationGraceSeconds", event.currentTarget.value)} />
+                </SettingsRow>
+                <SettingsRow className="rounded-lg border border-hairline/30 bg-card p-3" title="Tool & agent steps" description="0 disables · 1–1,000">
+                  <input aria-label="Tool and agent steps" className={inputCls} type="number" min={0} max={1_000} step={1} disabled={saving} value={numberInputValue(draft.maxToolAgentSteps)} onChange={(event) => updateNumber("maxToolAgentSteps", event.currentTarget.value)} />
+                </SettingsRow>
               </div>
-            </div>
-          </section>
+            </section>
 
-          <section className="rounded-xl border border-hairline/40 bg-inset p-3">
-            <div className="text-[11.5px] font-medium uppercase tracking-[0.08em] text-ink-secondary">Token budget</div>
-            <div className="mt-3 flex flex-wrap items-end gap-3">
-              <div className="min-w-[160px] flex-1">
-                <div className="text-[13px] text-ink">Policy</div>
-                <div className="mt-0.5 text-[11.5px] text-ink-secondary">Disabled, warning, or hard cap</div>
-                <PillDropdown
-                  className="mt-1.5"
-                  value={draft.cumulativeTokenPolicy.mode}
-                  options={tokenOptions}
-                  disabled={saving}
-                  ariaLabel="Cumulative token policy"
-                  onChange={(mode) => updateToken({ mode })}
+            <section className="rounded-xl border border-hairline/40 bg-inset p-3">
+              <div className="text-[11.5px] font-medium uppercase tracking-[0.08em] text-ink-secondary">Recovery & coordination</div>
+              <div className="mt-3 space-y-3">
+                <SettingsRow className="rounded-lg border border-hairline/30 bg-card p-3" title="Retries" description="Automatic · 0–1">
+                  <input aria-label="Retries" className={inputCls} type="number" min={0} max={1} step={1} disabled={saving} value={numberInputValue(draft.retryCap)} onChange={(event) => updateNumber("retryCap", event.currentTarget.value)} />
+                </SettingsRow>
+                <SettingsRow className="rounded-lg border border-hairline/30 bg-card p-3" title="Delegation" description="Concurrent agents · 1–4">
+                  <input aria-label="Delegation concurrency" className={inputCls} type="number" min={1} max={4} step={1} disabled={saving} value={numberInputValue(draft.delegationConcurrency)} onChange={(event) => updateNumber("delegationConcurrency", event.currentTarget.value)} />
+                </SettingsRow>
+                <SettingsRow className="rounded-lg border border-hairline/30 bg-card p-3" title="Handoff size" description="UTF-8 bytes · 1,024–12,000">
+                  <input aria-label="Handoff size" className={inputCls} type="number" min={1_024} max={12_000} step={1} disabled={saving} value={numberInputValue(draft.handoffByteCap)} onChange={(event) => updateNumber("handoffByteCap", event.currentTarget.value)} />
+                </SettingsRow>
+                <SettingsRow
+                  className="rounded-lg border border-hairline/30 bg-card p-3"
+                  title="Fresh session"
+                  description="Start each turn from bounded replay."
+                  control={(
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={draft.freshSessionEnforcement}
+                      aria-label="Fresh session each turn"
+                      disabled={saving}
+                      onClick={() => {
+                        setDraft((current) => ({ ...current, freshSessionEnforcement: !current.freshSessionEnforcement }));
+                        setStatus("clean");
+                        setError(null);
+                      }}
+                      className={cn(
+                        "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 disabled:cursor-not-allowed disabled:opacity-50",
+                        draft.freshSessionEnforcement ? "bg-accent" : "bg-control",
+                      )}
+                    >
+                      <span className={cn("absolute top-[3px] size-5 rounded-full bg-white transition-all", draft.freshSessionEnforcement ? "left-[21px]" : "left-[3px]")} />
+                    </button>
+                  )}
                 />
               </div>
-              {draft.cumulativeTokenPolicy.mode !== "disabled" && (
-                <label className="min-w-[160px] flex-1">
-                  <span className="text-[13px] text-ink">Token limit</span>
-                  <span className="mt-0.5 block text-[11.5px] text-ink-secondary">1,000–10,000,000</span>
-                  <input className={cn(inputCls, "mt-1.5")} type="number" min={1_000} max={10_000_000} step={1} disabled={saving} value={numberInputValue(draft.cumulativeTokenPolicy.limit)} onChange={(event) => updateToken({ limit: event.currentTarget.value === "" ? Number.NaN : Number(event.currentTarget.value) })} />
-                </label>
-              )}
-            </div>
-            <div className="mt-2 text-[12px] leading-relaxed text-ink-secondary">
-              Soft warns once. Hard requests a stop after the provider reports a sample.
-            </div>
-          </section>
+            </section>
 
-          <div className="flex flex-wrap items-center gap-3">
-            <button type="button" onClick={() => void save(false)} disabled={saving || !dirty} className="rounded-lg bg-raised px-3 py-1.5 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-50">
-              {saving ? "Saving…" : "Save"}
-            </button>
-            <button type="button" onClick={() => void save(true)} disabled={saving} className="rounded-lg px-2 py-1.5 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50">
-              Reset
-            </button>
-            {status === "saved" && <span className="text-[12px] text-ink-secondary">Saved</span>}
-            {status === "clean" && !dirty && <span className="text-[12px] text-ink-secondary">Up to date</span>}
+            <section className="rounded-xl border border-hairline/40 bg-inset p-3">
+              <div className="text-[11.5px] font-medium uppercase tracking-[0.08em] text-ink-secondary">Token budget</div>
+              <div className="mt-3 space-y-3">
+                <SettingsRow className="rounded-lg border border-hairline/30 bg-card p-3" title="Policy" description="Disabled, warning, or hard cap. Soft warns once; hard requests a stop after the provider reports a sample.">
+                  <PillDropdown
+                    value={draft.cumulativeTokenPolicy.mode}
+                    options={tokenOptions}
+                    disabled={saving}
+                    ariaLabel="Cumulative token policy"
+                    onChange={(mode) => updateToken({ mode })}
+                  />
+                </SettingsRow>
+                {draft.cumulativeTokenPolicy.mode !== "disabled" && (
+                  <SettingsRow className="rounded-lg border border-hairline/30 bg-card p-3" title="Token limit" description="1,000–10,000,000">
+                    <input aria-label="Token limit" className={inputCls} type="number" min={1_000} max={10_000_000} step={1} disabled={saving} value={numberInputValue(draft.cumulativeTokenPolicy.limit)} onChange={(event) => updateToken({ limit: event.currentTarget.value === "" ? Number.NaN : Number(event.currentTarget.value) })} />
+                  </SettingsRow>
+                )}
+              </div>
+            </section>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <button type="button" onClick={() => void save(false)} disabled={saving || !dirty} className="rounded-lg bg-raised px-3 py-1.5 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-50">
+                {saving ? "Saving…" : "Save"}
+              </button>
+              <button type="button" onClick={() => void save(true)} disabled={saving} className="rounded-lg px-2 py-1.5 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50">
+                Reset
+              </button>
+              {status === "saved" && <span className="text-[12px] text-ink-secondary">Saved</span>}
+              {status === "clean" && !dirty && <span className="text-[12px] text-ink-secondary">Up to date</span>}
+            </div>
+            {error && <div className="text-[12px] text-danger">{error}</div>}
+            <div className="text-[11.5px] leading-relaxed text-ink-secondary">
+              Changes apply to the next admitted turn. Repeat, loop, and conflicting-writer guards remain active.
+            </div>
           </div>
-          {error && <div className="text-[12px] text-danger">{error}</div>}
-          <div className="text-[11.5px] leading-relaxed text-ink-secondary">
-            Changes apply to the next admitted turn. Repeat, loop, and conflicting-writer guards remain active.
-          </div>
-        </div>
-      )}
-    </div>
+        )}
+      </div>
+    </SettingsRow>
   );
 }
 
@@ -752,7 +733,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
           </Field>
           <Field label="Description">
             <textarea
-              className={cn(inputCls, "min-h-[96px] resize-none")}
+              className={cn(inputCls, "min-h-[96px] resize-y")}
               maxLength={BOT_PROFILE_LIMITS.description}
               placeholder="What this agent is for"
               value={bot.description}
@@ -760,22 +741,34 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             />
           </Field>
 
-          <div className={cn(
-            "rounded-xl border p-4",
-            bot.chiefOfStaff ? "border-accent/40 bg-accent/10" : "border-hairline/40 bg-card",
-          )}>
-            <div className="flex items-center gap-3">
+          <SettingsRow
+            className={cn(
+              "rounded-xl border p-4",
+              bot.chiefOfStaff ? "border-accent/40 bg-accent/10" : "border-hairline/40 bg-card",
+            )}
+            title="Chief of Staff"
+            description={
+              bot.chiefOfStaff && !canCoordinate
+                ? "This bot still holds the role, but its current engine cannot contact teammates. Choose a Claude or ACP engine to restore coordination."
+                : bot.chiefOfStaff
+                  ? `This is the primary contact for ${sectionName}. It can create and coordinate specialists in this section, then combine their work into one answer.`
+                  : !canCoordinate
+                    ? "Choose a Claude or ACP engine to let this bot coordinate teammates."
+                    : currentChief
+                      ? `Make this bot the ${sectionName} Chief and hand the role over from ${currentChief.name}.`
+                      : `Make this bot the primary contact for the ${sectionName} section.`
+            }
+            leading={(
               <span className={cn(
                 "flex size-8 shrink-0 items-center justify-center rounded-lg",
                 bot.chiefOfStaff ? "bg-accent text-white" : "bg-control text-ink-secondary",
               )}>
-                <Crown size={17} />
+                <Crown size={17} aria-hidden="true" />
               </span>
-              <div className="min-w-0 flex-1">
-                <div className="text-[15px] font-medium text-ink">Chief of Staff</div>
-                <div className="text-[11.5px] text-ink-secondary">One for {sectionName}</div>
-              </div>
+            )}
+            control={(
               <button
+                type="button"
                 role="switch"
                 aria-checked={Boolean(bot.chiefOfStaff)}
                 aria-label="Chief of Staff"
@@ -787,102 +780,79 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                   bot.chiefOfStaff ? "bg-accent" : "bg-control",
                 )}
               >
-                <span
-                  className={cn(
-                    "absolute top-[3px] size-5 rounded-full bg-white transition-all",
-                    bot.chiefOfStaff ? "left-[21px]" : "left-[3px]",
-                  )}
-                />
+                <span className={cn(
+                  "absolute top-[3px] size-5 rounded-full bg-white transition-all",
+                  bot.chiefOfStaff ? "left-[21px]" : "left-[3px]",
+                )} />
               </button>
-            </div>
-            <div className="mt-3 text-[13px] leading-relaxed text-ink-secondary">
-              {bot.chiefOfStaff && !canCoordinate
-                ? "This bot still holds the role, but its current engine cannot contact teammates. Choose a Claude or ACP engine to restore coordination."
-                : bot.chiefOfStaff
-                  ? `This is the primary contact for ${sectionName}. It can create and coordinate specialists in this section, then combine their work into one answer.`
-                : !canCoordinate
-                  ? "Choose a Claude or ACP engine to let this bot coordinate teammates."
-                  : currentChief
-                    ? `Make this bot the ${sectionName} Chief and hand the role over from ${currentChief.name}.`
-                    : `Make this bot the primary contact for the ${sectionName} section.`}
-            </div>
-          </div>
+            )}
+          />
 
-          <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4">
-            <div>
-              <div className="text-[15px] font-medium text-ink">
-                Ask me before contacting other bots
-              </div>
-              <div className="mt-0.5 text-[13px] text-ink-secondary">
-                {bot.approvePeerComms
-                  ? "This bot will stop and ask before it reaches out to another bot."
-                  : "Let this bot talk to teammates on its own, without a confirmation step."}
-              </div>
-            </div>
-            <button
-              role="switch"
-              aria-checked={Boolean(bot.approvePeerComms)}
-              aria-label="Ask me before contacting other bots"
-              disabled={!bot.approvePeerComms && !canCoordinate}
-              onClick={() => patch({ approvePeerComms: !bot.approvePeerComms })}
-              title={!bot.approvePeerComms && !canCoordinate ? "This engine cannot contact other bots" : undefined}
-              className={cn(
-                "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40",
-                bot.approvePeerComms ? "bg-accent" : "bg-control",
-              )}
-            >
-              <span
+          <SettingsRow
+            className="rounded-xl bg-card p-4"
+            title="Ask me before contacting other bots"
+            description={bot.approvePeerComms
+              ? "This bot will stop and ask before it reaches out to another bot."
+              : "Let this bot talk to teammates on its own, without a confirmation step."}
+            control={(
+              <button
+                type="button"
+                role="switch"
+                aria-checked={Boolean(bot.approvePeerComms)}
+                aria-label="Ask me before contacting other bots"
+                disabled={!bot.approvePeerComms && !canCoordinate}
+                onClick={() => patch({ approvePeerComms: !bot.approvePeerComms })}
+                title={!bot.approvePeerComms && !canCoordinate ? "This engine cannot contact other bots" : undefined}
                 className={cn(
+                  "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40",
+                  bot.approvePeerComms ? "bg-accent" : "bg-control",
+                )}
+              >
+                <span className={cn(
                   "absolute top-[3px] size-5 rounded-full bg-white transition-all",
                   bot.approvePeerComms ? "left-[21px]" : "left-[3px]",
-                )}
-              />
-            </button>
-          </div>
+                )} />
+              </button>
+            )}
+          />
 
           <RuntimeControlsCard key={`runtime-${bot.id}`} bot={bot} />
 
-          <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4">
-            <div>
-              <div className="text-[15px] font-medium text-ink">Connected apps</div>
-              <div className="mt-0.5 text-[13px] text-ink-secondary">
-                {!connectedAppsConfigured
-                  ? "Connect apps in App Settings before giving this bot access."
-                  : !canUseConnectedApps
-                    ? "This bot's current engine cannot use connected apps."
-                    : connectedAppsEnabled
-                      ? "Let this bot use your connected Gmail, Calendar, Slack, and other apps."
-                      : "Keep your connected apps unavailable to this bot."}
-              </div>
-            </div>
-            <button
-              role="switch"
-              aria-checked={connectedAppsEnabled}
-              aria-label="Allow this bot to use connected apps"
-              disabled={
-                !connectedAppsEnabled && (!connectedAppsConfigured || !canUseConnectedApps)
-              }
-              onClick={() => patch({ composio: !connectedAppsEnabled })}
-              title={
-                !connectedAppsEnabled && !connectedAppsConfigured
+          <SettingsRow
+            className="rounded-xl bg-card p-4"
+            title="Connected apps"
+            description={!connectedAppsConfigured
+              ? "Connect apps in App Settings before giving this bot access."
+              : !canUseConnectedApps
+                ? "This bot's current engine cannot use connected apps."
+                : connectedAppsEnabled
+                  ? "Let this bot use your connected Gmail, Calendar, Slack, and other apps."
+                  : "Keep your connected apps unavailable to this bot."}
+            control={(
+              <button
+                type="button"
+                role="switch"
+                aria-checked={connectedAppsEnabled}
+                aria-label="Allow this bot to use connected apps"
+                disabled={!connectedAppsEnabled && (!connectedAppsConfigured || !canUseConnectedApps)}
+                onClick={() => patch({ composio: !connectedAppsEnabled })}
+                title={!connectedAppsEnabled && !connectedAppsConfigured
                   ? "Connect apps in App Settings first"
                   : !connectedAppsEnabled && !canUseConnectedApps
                     ? "This engine cannot use connected apps"
-                    : undefined
-              }
-              className={cn(
-                "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40",
-                connectedAppsEnabled ? "bg-accent" : "bg-control",
-              )}
-            >
-              <span
+                    : undefined}
                 className={cn(
+                  "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40",
+                  connectedAppsEnabled ? "bg-accent" : "bg-control",
+                )}
+              >
+                <span className={cn(
                   "absolute top-[3px] size-5 rounded-full bg-white transition-all",
                   connectedAppsEnabled ? "left-[21px]" : "left-[3px]",
-                )}
-              />
-            </button>
-          </div>
+                )} />
+              </button>
+            )}
+          />
 
           <div className="rounded-xl bg-card p-4">
             <ModelPicker
@@ -994,74 +964,68 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
           {/* keyed so switching bots never shows one bot's notes under another's name */}
           <MemoryCard key={bot.id} bot={bot} />
 
-          <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4">
-            <div>
-              <div className="text-[15px] font-medium text-ink">Auto mode</div>
-              <div className="mt-0.5 text-[13px] text-ink-secondary">
-                {bot.computer === "local"
-                  ? bot.autoApprove
-                    ? "Keeps going on this computer — you'll still be asked about anything destructive, and about questions it asks you."
-                    : "Approve each action on this computer yourself. Turn on to let this bot keep working without stopping to ask."
-                  : bot.autoApprove
-                  ? "Keeps going on its own — you'll still be asked about anything destructive, and about questions it asks you."
-                  : "Approve each action yourself. Turn on to let this bot keep working without stopping to ask."}
-              </div>
-            </div>
-            <button
-              role="switch"
-              aria-checked={Boolean(bot.autoApprove)}
-              aria-label="Auto mode"
-              onClick={() => {
-                if (!bot.autoApprove && bot.computer === "local") setLocalAutoWarning("auto");
-                else patch({ autoApprove: !bot.autoApprove });
-              }}
-              className={cn(
-                "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors",
-                bot.autoApprove ? "bg-accent" : "bg-control",
-              )}
-            >
-              <span
+          <SettingsRow
+            className="rounded-xl bg-card p-4"
+            title="Auto mode"
+            description={bot.computer === "local"
+              ? bot.autoApprove
+                ? "Keeps going on this computer — you'll still be asked about anything destructive, and about questions it asks you."
+                : "Approve each action on this computer yourself. Turn on to let this bot keep working without stopping to ask."
+              : bot.autoApprove
+                ? "Keeps going on its own — you'll still be asked about anything destructive, and about questions it asks you."
+                : "Approve each action yourself. Turn on to let this bot keep working without stopping to ask."}
+            control={(
+              <button
+                type="button"
+                role="switch"
+                aria-checked={Boolean(bot.autoApprove)}
+                aria-label="Auto mode"
+                onClick={() => {
+                  if (!bot.autoApprove && bot.computer === "local") setLocalAutoWarning("auto");
+                  else patch({ autoApprove: !bot.autoApprove });
+                }}
                 className={cn(
+                  "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors",
+                  bot.autoApprove ? "bg-accent" : "bg-control",
+                )}
+              >
+                <span className={cn(
                   "absolute top-[3px] size-5 rounded-full bg-white transition-all",
                   bot.autoApprove ? "left-[21px]" : "left-[3px]",
-                )}
-              />
-            </button>
-          </div>
+                )} />
+              </button>
+            )}
+          />
 
           <VoiceSettings bot={bot} onPatch={patch} />
 
-          <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4">
-            <div>
-              <div className="text-[15px] font-medium text-ink">
-                Notifications
-              </div>
-              <div className="mt-0.5 text-[13px] text-ink-secondary">
-                Get notified when this agent finishes or needs input
-              </div>
-            </div>
-            <button
-              role="switch"
-              aria-checked={bot.notifications}
-              aria-label="Agent notifications"
-              onClick={() => {
-                const enabled = !bot.notifications;
-                if (enabled) void requestNotificationPermission();
-                patch({ notifications: enabled });
-              }}
-              className={cn(
-                "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors",
-                bot.notifications ? "bg-accent" : "bg-control",
-              )}
-            >
-              <span
+          <SettingsRow
+            className="rounded-xl bg-card p-4"
+            title="Notifications"
+            description="Get notified when this agent finishes or needs input"
+            control={(
+              <button
+                type="button"
+                role="switch"
+                aria-checked={bot.notifications}
+                aria-label="Agent notifications"
+                onClick={() => {
+                  const enabled = !bot.notifications;
+                  if (enabled) void requestNotificationPermission();
+                  patch({ notifications: enabled });
+                }}
                 className={cn(
+                  "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors",
+                  bot.notifications ? "bg-accent" : "bg-control",
+                )}
+              >
+                <span className={cn(
                   "absolute top-[3px] size-5 rounded-full bg-white transition-all",
                   bot.notifications ? "left-[21px]" : "left-[3px]",
-                )}
-              />
-            </button>
-          </div>
+                )} />
+              </button>
+            )}
+          />
         </div>
       </div>
     </aside>
