@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronLeft, Crown, FolderOpen, Lock, LockOpen, X } from "lucide-react";
+import { ChevronDown, ChevronLeft, Crown, FolderOpen, Lock, LockOpen, RotateCcw, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api, chiefRuntimePolicyLocked, runtimePolicySignature, useStore, type Bot, type RuntimePolicy } from "@/state/store";
 import { stateForBot } from "@/lib/mascot";
@@ -446,6 +446,12 @@ function RuntimeControlsCard({ bot }: { bot: Bot }) {
   const dirty = !sameRuntimePolicy(base, draft);
   const saving = status === "saving";
   const chiefLocked = chiefRuntimePolicyLocked(bot);
+  const chiefControlLabel = chiefLocked
+    ? "Allow the Chief to adapt limits"
+    : "Prevent the Chief from adapting limits";
+  const chiefControlTitle = chiefLocked
+    ? "Locked · click to allow the Chief to adapt limits"
+    : "Allowed · click to prevent the Chief from adapting limits";
 
   const toggleChiefControl = async () => {
     setChiefLockSaving(true);
@@ -502,13 +508,18 @@ function RuntimeControlsCard({ bot }: { bot: Bot }) {
         </div>
 
         <SettingsRow
-          className="rounded-lg border border-hairline/40 bg-inset px-3 py-2.5"
-          title="Chief control"
-          description={chiefLocked ? "Locked · the Chief cannot adapt this bot's limits." : "Allowed · the Chief may adapt limits for future tasks."}
+          className={cn(
+            "rounded-lg border px-3 py-2.5",
+            chiefLocked ? "border-danger/40 bg-danger/10" : "border-hairline/40 bg-inset",
+          )}
+          title={<span className={chiefLocked ? "text-danger" : undefined}>Chief control</span>}
+          description={chiefLocked
+            ? <span className="text-danger">Locked · the Chief cannot adapt this bot's limits.</span>
+            : "Allowed · the Chief may adapt limits for future tasks."}
           leading={(
             <span className={cn(
               "flex size-7 shrink-0 items-center justify-center rounded-md",
-              chiefLocked ? "bg-control text-ink-secondary" : "bg-accent/10 text-accent",
+              chiefLocked ? "bg-danger/15 text-danger" : "bg-control text-ink-secondary",
             )}>
               {chiefLocked ? <Lock size={14} aria-hidden="true" /> : <LockOpen size={14} aria-hidden="true" />}
             </span>
@@ -517,18 +528,21 @@ function RuntimeControlsCard({ bot }: { bot: Bot }) {
             <button
               type="button"
               role="switch"
-              aria-checked={!chiefLocked}
-              aria-label="Allow the Chief to adapt limits"
+              aria-checked={chiefLocked}
+              aria-label={chiefControlLabel}
+              title={chiefControlTitle}
               disabled={chiefLockSaving}
               onClick={() => void toggleChiefControl()}
               className={cn(
-                "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50",
-                chiefLocked ? "bg-control" : "bg-accent",
+                "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
+                chiefLocked
+                  ? "bg-danger focus-visible:ring-danger/50"
+                  : "bg-control focus-visible:ring-hairline/70",
               )}
             >
               <span className={cn(
                 "absolute top-[3px] size-5 rounded-full bg-white transition-all",
-                chiefLocked ? "left-[3px]" : "left-[21px]",
+                chiefLocked ? "left-[21px]" : "left-[3px]",
               )} />
             </button>
           )}
@@ -615,15 +629,24 @@ function RuntimeControlsCard({ bot }: { bot: Bot }) {
               </div>
             </section>
 
-            <div className="flex flex-wrap items-center gap-3">
-              <button type="button" onClick={() => void save(false)} disabled={saving || !dirty} className="rounded-lg bg-raised px-3 py-1.5 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-50">
+            <div className="flex items-center gap-2">
+              <button type="button" onClick={() => void save(false)} disabled={saving || !dirty} className="min-w-0 w-full flex-1 rounded-lg bg-raised px-3 py-2 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-50">
                 {saving ? "Saving…" : "Save"}
               </button>
-              <button type="button" onClick={() => void save(true)} disabled={saving} className="rounded-lg px-2 py-1.5 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50">
-                Reset
+              <button
+                type="button"
+                onClick={() => void save(true)}
+                disabled={saving}
+                aria-label="Reset runtime controls"
+                title="Reset runtime controls"
+                className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-danger/10 text-danger hover:bg-danger/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger/50 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <RotateCcw size={15} aria-hidden="true" />
               </button>
-              {status === "saved" && <span className="text-[12px] text-ink-secondary">Saved</span>}
-              {status === "clean" && !dirty && <span className="text-[12px] text-ink-secondary">Up to date</span>}
+            </div>
+            <div className="min-h-4 text-[12px] text-ink-secondary">
+              {status === "saved" && "Saved"}
+              {status === "clean" && !dirty && "Up to date"}
             </div>
             {error && <div className="text-[12px] text-danger">{error}</div>}
             <div className="text-[11.5px] leading-relaxed text-ink-secondary">
