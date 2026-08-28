@@ -104,7 +104,7 @@ export type RuntimeEvent = RuntimeEventBase &
          * The one figure the harness accumulates — thread.token-usage.updated
          * is a live indicator whose meaning differs per driver (a per-call
          * delta, a thread total, a per-step figure) and must never be summed. */
-        usage?: { input: number; output: number };
+        usage?: { input: number; output: number; cachedInput?: number };
       }
     | {
         type: "item.started";
@@ -138,7 +138,7 @@ export type RuntimeEvent = RuntimeEventBase &
         source: "user" | "auto" | "timeout" | "system" | "unavailable" | "peer";
         approvalScope?: "local-computer";
       }
-    | { type: "thread.token-usage.updated"; input: number; output: number }
+    | { type: "thread.token-usage.updated"; input: number; output: number; cachedInput?: number }
     // `setup: true` marks a failure the user fixes by installing or
     // configuring something, not by retrying — the UI offers setup instead.
     | { type: "runtime.error"; message: string; setup?: boolean }
@@ -346,6 +346,10 @@ export interface ProviderInstance {
   snapshot(): Promise<ProviderSnapshot>;
   /** Cheap one-shot text call (upstream TextGeneration) — titles, summaries. */
   generateText?(prompt: string): Promise<string>;
+  /** Isolated, tool-free permission review on this same provider. Kept
+   * separate from generateText so the UI never infers a security capability
+   * from a generic helper that may expose prompts in argv or lack approvals. */
+  reviewPermission?(prompt: string, signal?: AbortSignal): Promise<string>;
   dispose(): Promise<void>;
 }
 

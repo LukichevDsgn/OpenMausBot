@@ -98,19 +98,30 @@ describe("Store", () => {
   it("addTaskUsage accumulates settled-turn totals per task and survives a restart", () => {
     const store = new Store(selection);
     const bot = store.createBot();
-    expect(store.addTaskUsage(bot.id, bot.threadId, { input: 1200, output: 300, costUsd: null })).toEqual({
+    expect(store.addTaskUsage(bot.id, bot.threadId, { input: 1200, output: 300, cachedInput: 1000, costUsd: null })).toEqual({
       input: 1200,
       output: 300,
+      cachedInput: 1000,
       costUsd: null,
       turns: 1,
     });
+    // a driver that never reports the cached share leaves it unchanged
     store.addTaskUsage(bot.id, bot.threadId, { input: 800, output: 100, costUsd: null });
-    store.addTaskUsage(bot.id, bot.threadId, { input: Number.NaN, output: -20, costUsd: null });
+    store.addTaskUsage(bot.id, bot.threadId, { input: Number.NaN, output: -20, cachedInput: -5, costUsd: null });
+    // Providers occasionally report a cache count larger than input; keep the
+    // persisted share physically possible so percentages cannot exceed 100%.
+    store.addTaskUsage(bot.id, bot.threadId, { input: 10, output: 0, cachedInput: 20, costUsd: null });
     // a different thread never inherits another task's tally
     expect(store.addTaskUsage(bot.id, "no-such-thread", { input: 5, output: 5, costUsd: null })).toBeNull();
 
     const reloaded = new Store(selection);
-    expect(reloaded.taskByThread(bot.id, bot.threadId)?.usage).toEqual({ input: 2000, output: 400, costUsd: null, turns: 3 });
+    expect(reloaded.taskByThread(bot.id, bot.threadId)?.usage).toEqual({
+      input: 2010,
+      output: 400,
+      cachedInput: 1010,
+      costUsd: null,
+      turns: 4,
+    });
   });
 
   it("persists the per-bot composio gate", () => {
@@ -256,6 +267,28 @@ describe("Store", () => {
 
     expect(channel.section).toBe("Work");
     expect(new Store(selection).group(channel.id)?.section).toBe("Work");
+  });
+
+  it("persists a channel's completed setup in the same create write", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const channel = store.createGroup("Launch", [bot.id], false, "Work", {
+      bulletin: "Ship carefully.",
+      defaultResponder: { kind: "mentions" },
+      completed: true,
+    });
+
+    expect(channel).toMatchObject({
+      bulletin: "Ship carefully.",
+      defaultResponder: { kind: "mentions" },
+      setupSkippedAt: null,
+    });
+    expect(channel.setupCompletedAt).toEqual(expect.any(Number));
+    expect(new Store(selection).group(channel.id)).toMatchObject({
+      bulletin: "Ship carefully.",
+      defaultResponder: { kind: "mentions" },
+      setupCompletedAt: channel.setupCompletedAt,
+    });
   });
 
   it("migrates old rooms without routing to their first member", () => {
@@ -618,6 +651,7 @@ describe("Store change stream", () => {
     expect(events.every((e) => e.type === "bot" && e.botId === bot.id)).toBe(true);
     expect(events).toHaveLength(7);
     store.deleteBot(bot.id);
+    expect(events).toContainEqual({ type: "thread.deleted", threadId: bot.threadId });
     expect(events.at(-1)).toEqual({ type: "bot.deleted", botId: bot.id });
   });
 
@@ -634,6 +668,7 @@ describe("Store change stream", () => {
     expect(events.map((e) => e.type)).toEqual(["group", "group"]);
     expect(store.group(g.id)?.unread).toBe(true);
     store.deleteGroup(g.id);
+    expect(events).toContainEqual({ type: "thread.deleted", threadId: g.threadId });
     expect(events.at(-1)).toEqual({ type: "group.deleted", groupId: g.id });
   });
 
@@ -709,9 +744,42 @@ describe("Store redacts bot-authored secrets on write", () => {
     const card = store.appendMessage(bot.threadId, {
       role: "bot",
       kind: "options",
-      card: { title: "Run this?", summary: `curl -H "Authorization: Bearer ${key}"`, options: [], requestId: "r1", tool: "Bash" } as never,
+      card: { title: "Run this?", summary: `curl -H "Authorization: Bearer ${key}"`, held: `Blocked ${key}`, options: [], requestId: "r1", tool: "Bash" } as never,
     });
     expect((card.card as { summary?: string }).summary).not.toContain(key);
+    expect(card.card?.held).not.toContain(key);
+    const routineCard = store.appendMessage(bot.threadId, {
+      role: "bot",
+      kind: "options",
+      card: {
+        title: "Confirm routine",
+        subtitle: "Every morning",
+        options: ["Confirm", "Cancel"],
+        requestId: "routine-request",
+        tool: "schedule_routine",
+        routineRequest: {
+          version: 1,
+          requestId: "routine-request",
+          botId: bot.id,
+          threadId: bot.threadId,
+          createdAt: 1,
+          operation: {
+            action: "create",
+            routine: {
+              name: `Use ${key}`,
+              instructions: `Send a request with ${key}`,
+              schedule: { type: "daily", time: "09:00", weekdays: [1] },
+              runOn: "maus",
+              durationMinutes: 30,
+            },
+          },
+        },
+      },
+    });
+    expect(routineCard.card?.routineRequest?.operation.action).toBe("create");
+    if (routineCard.card?.routineRequest?.operation.action !== "create") throw new Error("missing routine payload");
+    expect(routineCard.card.routineRequest.operation.routine.name).not.toContain(key);
+    expect(routineCard.card.routineRequest.operation.routine.instructions).not.toContain(key);
     const secretCard = store.appendMessage(bot.threadId, {
       role: "bot",
       kind: "secret",
