@@ -163,11 +163,15 @@ function CanonicalFaceRig({
   faceScale,
   faceOffset,
   gaze,
+  showMouth,
+  mouthStroke,
 }: {
   state: MausState;
   faceScale: number;
   faceOffset: Readonly<{ x: number; y: number }>;
   gaze: Readonly<{ x: number; y: number }>;
+  showMouth: boolean;
+  mouthStroke: number;
 }) {
   const recipe = canonicalFaceRecipeForState(state);
   const eyeWidth = snapHalf(CANONICAL_FACE_CONTRACT.eyeWidth * recipe.eyeScaleX);
@@ -188,13 +192,15 @@ function CanonicalFaceRig({
       <g transform={`translate(${50 + faceOffset.x} ${50 + faceOffset.y}) scale(${faceScale}) translate(-50 -50)`}>
         <rect x={leftX} y={eyeY} width={eyeWidth} height={eyeHeight} rx={eyeWidth / 2} fill="#ffffff" />
         <rect x={rightX} y={eyeY} width={eyeWidth} height={eyeHeight} rx={eyeWidth / 2} fill="#ffffff" />
-        <path
-          d={`M${50 - mouthHalfWidth} ${mouthY} Q50 ${mouthY + recipe.mouthCurve} ${50 + mouthHalfWidth} ${mouthY}`}
-          fill="none"
-          stroke="#ffffff"
-          strokeWidth={CANONICAL_FACE_CONTRACT.mouthStrokeWidth}
-          strokeLinecap="round"
-        />
+        {showMouth ? (
+          <path
+            d={`M${50 - mouthHalfWidth} ${mouthY} Q50 ${mouthY + recipe.mouthCurve} ${50 + mouthHalfWidth} ${mouthY}`}
+            fill="none"
+            stroke="#ffffff"
+            strokeWidth={mouthStroke}
+            strokeLinecap="round"
+          />
+        ) : null}
       </g>
     </svg>
   );
@@ -256,6 +262,8 @@ function MausAvatarComponent(
     lookAround,
     trackPointer = true,
     animated = true,
+    showMouth = true,
+    mouthStroke = CANONICAL_FACE_CONTRACT.mouthStrokeWidth,
   }: MausAvatarProps,
   ref: React.Ref<MausAvatarHandle>,
 ) {
@@ -329,6 +337,8 @@ function MausAvatarComponent(
             faceScale={presentation.faceScale}
             faceOffset={presentation.faceOffset}
             gaze={{ x: (gaze?.x ?? 0) + pointer.x, y: (gaze?.y ?? 0) + pointer.y }}
+            showMouth={showMouth}
+            mouthStroke={mouthStroke}
           />
         </span>
       </span>
