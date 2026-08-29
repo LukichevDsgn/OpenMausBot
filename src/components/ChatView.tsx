@@ -1243,6 +1243,7 @@ export function ChatView({ bot }: { bot: Bot }) {
             avatar={
               <MausAvatar
                 color={bot.color}
+                avatarDefinition={bot.avatarDefinition}
                 state={toolInFlight ? "working" : "thinking"}
                 size={36}
                 forward={false}
