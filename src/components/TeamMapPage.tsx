@@ -32,6 +32,7 @@ function BotNode({ bot, chief = false }: { bot: Bot; chief?: boolean }) {
     >
       <MausAvatar
         color={bot.color}
+        avatarDefinition={bot.avatarDefinition}
         state={normalizeState(bot.mascotExpression) ?? "idle"}
         size={34}
         motion="none"
