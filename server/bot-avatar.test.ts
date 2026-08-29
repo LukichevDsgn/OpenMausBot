@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   botAvatarProfile,
   botAvatarCropSchema,
+  botProceduralAvatarSchema,
   botAvatarUrlFromStoredPath,
   botAvatarUrlSchema,
 } from "../shared/bot-avatar.ts";
@@ -37,7 +38,31 @@ describe("bot avatar profile schema", () => {
   });
 
   it("falls back safely for malformed persisted data", () => {
-    expect(botAvatarProfile({ avatarUrl: "https://example.test/pixel.png", avatarCrop: "round" }))
+    expect(botAvatarProfile({
+      avatarUrl: "https://example.test/pixel.png",
+      avatarCrop: "round",
+      avatarDefinition: { version: 1, seed: "safe", silhouette: "raw-svg" },
+    }))
       .toEqual({ avatarCrop: "mascot" });
+  });
+
+  it("keeps stable silhouette ids while stripping retired appearance fields", () => {
+    const stored = {
+      version: 1 as const,
+      seed: "bot-42",
+      silhouette: "leaf" as const,
+      restingAnimationId: "thinking",
+      expressionPreset: "side-eye",
+    };
+    expect(botProceduralAvatarSchema.parse(stored)).toEqual({
+      version: 1,
+      seed: "bot-42",
+      silhouette: "leaf",
+    });
+    expect(botAvatarProfile({ avatarDefinition: stored }).avatarDefinition).toEqual({
+      version: 1,
+      seed: "bot-42",
+      silhouette: "leaf",
+    });
   });
 });
