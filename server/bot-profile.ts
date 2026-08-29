@@ -1,6 +1,10 @@
 import { z } from "zod";
 
-import { botAvatarCropSchema, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
+import {
+  botAvatarCropSchema,
+  botAvatarUrlSchema,
+  botProceduralAvatarSchema,
+} from "../shared/bot-avatar.ts";
 import { BOT_PROFILE_LIMITS } from "../shared/bot-profile.ts";
 
 import type { BotRecord } from "./store.ts";
@@ -12,6 +16,7 @@ export const BOT_PROFILE_PATCH_FIELDS = [
   "notifications",
   "avatarUrl",
   "avatarCrop",
+  "avatarDefinition",
   "voice",
   "speakReplies",
 ] as const;
@@ -37,6 +42,11 @@ const profilePatchSchema = z.object({
     })
     .optional(),
   avatarCrop: botAvatarCropSchema.optional(),
+  avatarDefinition: z
+    .union([botProceduralAvatarSchema, z.null()], {
+      error: "avatarDefinition must be a supported procedural avatar",
+    })
+    .optional(),
   voice: z
     .string({ error: "voice must be a string" })
     .max(BOT_PROFILE_LIMITS.voice, { error: "voice must be at most 200 characters" })
@@ -49,7 +59,15 @@ export type BotProfilePatchInput = z.input<typeof profilePatchSchema>;
 export type BotProfilePatch = Partial<
   Pick<
     BotRecord,
-    "name" | "title" | "description" | "notifications" | "avatarUrl" | "avatarCrop" | "voice" | "speakReplies"
+    | "name"
+    | "title"
+    | "description"
+    | "notifications"
+    | "avatarUrl"
+    | "avatarCrop"
+    | "avatarDefinition"
+    | "voice"
+    | "speakReplies"
   >
 >;
 
@@ -77,11 +95,18 @@ export function parseBotProfilePatch(input: BotProfilePatchInput, strict = false
     if (issue?.path[0] === "avatarCrop") {
       return { ok: false, error: "avatarCrop must be mascot, circle, rounded, or square" };
     }
+    if (issue?.path[0] === "avatarDefinition") {
+      return {
+        ok: false,
+        error: "avatarDefinition must use version 1, a safe seed, and a supported silhouette id",
+      };
+    }
     return { ok: false, error: issue?.message ?? "invalid profile patch" };
   }
 
-  const { avatarUrl, ...fields } = parsed.data;
+  const { avatarUrl, avatarDefinition, ...fields } = parsed.data;
   const patch: BotProfilePatch = fields;
   if (avatarUrl !== undefined) patch.avatarUrl = avatarUrl || undefined;
+  if (avatarDefinition !== undefined) patch.avatarDefinition = avatarDefinition || undefined;
   return { ok: true, patch };
 }
