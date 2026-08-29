@@ -106,6 +106,33 @@ describe("Store", () => {
     expect(reloaded.bot(bot.id)?.composio).toBe(false);
   });
 
+  it("persists valid avatar definitions and sanitizes retired fields on reload", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.patchBot(bot.id, {
+      avatarDefinition: { version: 1, seed: "stored-avatar", silhouette: "shield" },
+    });
+    expect(new Store(selection).bot(bot.id)?.avatarDefinition).toEqual({
+      version: 1,
+      seed: "stored-avatar",
+      silhouette: "shield",
+    });
+
+    const botsFile = join(DATA_DIR, "bots.json");
+    const raw: BotRecord[] = JSON.parse(readFileSync(botsFile, "utf8"));
+    Object.assign(raw.find((candidate) => candidate.id === bot.id)!.avatarDefinition!, {
+      restingAnimationId: "thinking",
+      expressionPreset: "side-eye",
+    });
+    writeFileSync(botsFile, JSON.stringify(raw));
+
+    expect(new Store(selection).bot(bot.id)?.avatarDefinition).toEqual({
+      version: 1,
+      seed: "stored-avatar",
+      silhouette: "shield",
+    });
+  });
+
   it("rotates colors across created bots", () => {
     const store = new Store(selection);
     const first = store.createBot();
