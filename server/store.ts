@@ -13,7 +13,11 @@ import { workspaceDir } from "./workspace.ts";
 import { newId, type CloudBackend, type ModelSelection, type ThreadId } from "./contracts.ts";
 import { pickBotName } from "./names.ts";
 import { redactSecretsInText } from "./redact.ts";
-import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
+import {
+  botAvatarProfile,
+  type BotAvatarCrop,
+  type BotProceduralAvatar,
+} from "../shared/bot-avatar.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { RoutineRunCardData } from "../shared/routine-run.ts";
 
@@ -358,6 +362,8 @@ export interface BotRecord {
   avatarUrl?: string;
   /** Mascot, or the crop applied to avatarUrl. */
   avatarCrop?: BotAvatarCrop;
+  /** Versioned parameters for the app-owned procedural mascot. */
+  avatarDefinition?: BotProceduralAvatar;
   unread: boolean;
   modelSelection: ModelSelection;
   /** provider-native continuation per instance (e.g. claude session id) */
@@ -602,6 +608,14 @@ export class Store {
       }
       if (b.avatarCrop !== undefined && avatar.avatarCrop !== b.avatarCrop) {
         delete b.avatarCrop;
+        botsMigrated = true;
+      }
+      if (
+        b.avatarDefinition !== undefined &&
+        JSON.stringify(avatar.avatarDefinition) !== JSON.stringify(b.avatarDefinition)
+      ) {
+        if (avatar.avatarDefinition) b.avatarDefinition = avatar.avatarDefinition;
+        else delete b.avatarDefinition;
         botsMigrated = true;
       }
     }
