@@ -59,4 +59,30 @@ describe("parseBotProfilePatch (both modes)", () => {
       error: "avatarCrop must be mascot, circle, rounded, or square",
     });
   });
+
+  it("accepts, sanitizes, and clears a procedural avatar definition", () => {
+    const avatarDefinition = {
+      version: 1 as const,
+      seed: "profile-avatar",
+      silhouette: "pebble" as const,
+      restingAnimationId: "thinking",
+    };
+    expect(parseBotProfilePatch({ avatarDefinition }, true)).toEqual({
+      ok: true,
+      patch: {
+        avatarDefinition: { version: 1, seed: "profile-avatar", silhouette: "pebble" },
+      },
+    });
+    expect(parseBotProfilePatch({ avatarDefinition: null }, true)).toEqual({
+      ok: true,
+      patch: { avatarDefinition: undefined },
+    });
+    // SAFETY: intentionally violates the silhouette union to exercise runtime validation.
+    expect(parseBotProfilePatch({
+      avatarDefinition: { version: 1, seed: "profile-avatar", silhouette: "raw-svg" },
+    } as never, true)).toEqual({
+      ok: false,
+      error: "avatarDefinition must use version 1, a safe seed, and a supported silhouette id",
+    });
+  });
 });
