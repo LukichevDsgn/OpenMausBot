@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   BotAvatar,
+  CANONICAL_FACE_CONTRACT,
   canonicalFaceBounds,
   canonicalFaceRecipeForState,
   MausAvatar,
@@ -59,6 +60,28 @@ describe("canonical procedural avatar face", () => {
       expect(markup, silhouette).toContain("linearGradient");
       expect(markup, silhouette).toContain(`data-avatar-surface="${proceduralAvatarPresentation({ ...DEFAULT_PROCEDURAL_AVATAR, silhouette }).surface}"`);
     }
+  });
+
+  it("routes mouth visibility and stroke controls through the canonical face rig", () => {
+    const baseProps = {
+      animated: false,
+      color: "blue" as const,
+      size: 112,
+      trackPointer: false,
+    };
+    const defaultMarkup = renderToStaticMarkup(createElement(MausAvatar, baseProps));
+    const hiddenMarkup = renderToStaticMarkup(
+      createElement(MausAvatar, { ...baseProps, showMouth: false }),
+    );
+    const customStrokeMarkup = renderToStaticMarkup(
+      createElement(MausAvatar, { ...baseProps, mouthStroke: 6.5 }),
+    );
+
+    expect(defaultMarkup).toContain(
+      `stroke-width="${CANONICAL_FACE_CONTRACT.mouthStrokeWidth}"`,
+    );
+    expect(hiddenMarkup).not.toContain('stroke="#ffffff"');
+    expect(customStrokeMarkup).toContain('stroke-width="6.5"');
   });
 
   it("derives representative reactions from runtime state", () => {
