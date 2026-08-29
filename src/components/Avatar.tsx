@@ -16,22 +16,14 @@ import {
 import { MAUS_COLORS, type MausColor, type MausMotion, type MausState } from "@/lib/mascot";
 import {
   CursorAvatar,
-  DEFAULT_SILHOUETTE,
   type CursorAvatarHandle,
-  type CursorSilhouette,
 } from "./CursorAvatar";
-import { botAvatarProfile, type BotAvatarCrop } from "../../shared/bot-avatar";
-
-/**
- * The pack's baked-in silhouette was exported with the body fill hardcoded
- * to black instead of the {{GRADIENT}} placeholder the component
- * substitutes, which painted every bot the same. Restore the slot so the
- * per-bot gradient actually lands on the body.
- */
-const GRADIENT_SILHOUETTE: CursorSilhouette = {
-  ...DEFAULT_SILHOUETTE,
-  body: DEFAULT_SILHOUETTE.body.replace(/fill="#000000"/g, 'fill="{{GRADIENT}}"'),
-};
+import { proceduralAvatarPresentation } from "@/lib/procedural-avatar";
+import {
+  botAvatarProfile,
+  type BotAvatarCrop,
+  type BotProceduralAvatar,
+} from "../../shared/bot-avatar";
 
 /**
  * Legacy face-placement knobs from the Maus body era. The cursor mascot
@@ -101,10 +93,118 @@ const gradientFor = (color: MausColor): [string, string, string] => {
   return [mix(fill, "#ffffff", 0.55), fill, mix(fill, "#000000", 0.42)];
 };
 
+/** One screen-upright white face, independent from animated body geometry. */
+export const CANONICAL_FACE_CONTRACT = {
+  eyeWidth: 5,
+  eyeHeight: 13,
+  eyeGap: 9,
+  eyeCenterY: 45,
+  mouthWidth: 8,
+  mouthCenterY: 68,
+  mouthStrokeWidth: 2.8,
+} as const;
+
+type FaceRecipe = Readonly<{
+  eyeScaleX: number;
+  eyeScaleY: number;
+  eyeShiftX: number;
+  eyeShiftY: number;
+  mouthCurve: number;
+}>;
+
+const FACE_RECIPE = {
+  idle: { eyeScaleX: 1, eyeScaleY: 1, eyeShiftX: 0, eyeShiftY: 0, mouthCurve: 0.7 },
+  happy: { eyeScaleX: 1, eyeScaleY: 0.92, eyeShiftX: 0, eyeShiftY: 0.5, mouthCurve: 1.2 },
+  surprised: { eyeScaleX: 1.04, eyeScaleY: 1.16, eyeShiftX: 0, eyeShiftY: -1, mouthCurve: 0.8 },
+  sleepy: { eyeScaleX: 1, eyeScaleY: 0.55, eyeShiftX: 0, eyeShiftY: 2, mouthCurve: -0.5 },
+  focused: { eyeScaleX: 0.98, eyeScaleY: 0.9, eyeShiftX: 1, eyeShiftY: 0.5, mouthCurve: 0.2 },
+  curious: { eyeScaleX: 1, eyeScaleY: 1, eyeShiftX: -1, eyeShiftY: 0, mouthCurve: 0.7 },
+  stern: { eyeScaleX: 1, eyeScaleY: 0.82, eyeShiftX: 0, eyeShiftY: 1, mouthCurve: -0.7 },
+  sad: { eyeScaleX: 0.96, eyeScaleY: 0.9, eyeShiftX: 0, eyeShiftY: 0.5, mouthCurve: -0.8 },
+} as const satisfies Record<string, FaceRecipe>;
+
+export function canonicalFaceRecipeForState(state: MausState): FaceRecipe {
+  if (["happy", "celebrate", "excited", "laughing", "proud", "playful"].includes(state)) return FACE_RECIPE.happy;
+  if (["surprised", "scared", "notifying", "spawning"].includes(state)) return FACE_RECIPE.surprised;
+  if (["sleeping", "drowsy", "powering-down"].includes(state)) return FACE_RECIPE.sleepy;
+  if (["thinking", "searching", "working", "loading", "writing", "uploading", "progress", "radar"].includes(state)) return FACE_RECIPE.focused;
+  if (["curious", "listening", "receiving", "dictating"].includes(state)) return FACE_RECIPE.curious;
+  if (["alerting", "angry", "suspicious"].includes(state)) return FACE_RECIPE.stern;
+  if (["sad", "bored", "shy"].includes(state)) return FACE_RECIPE.sad;
+  return FACE_RECIPE.idle;
+}
+
+const snapHalf = (value: number) => Math.round(value * 2) / 2;
+
+export function canonicalFaceBounds(
+  faceOffset: Readonly<{ x: number; y: number }>,
+  faceScale: number,
+  opticalScale: number,
+) {
+  const recipe = FACE_RECIPE.surprised;
+  const eyeWidth = CANONICAL_FACE_CONTRACT.eyeWidth * recipe.eyeScaleX;
+  const eyeHeight = CANONICAL_FACE_CONTRACT.eyeHeight * recipe.eyeScaleY;
+  const left = 50 - CANONICAL_FACE_CONTRACT.eyeGap / 2 - eyeWidth / 2 + recipe.eyeShiftX;
+  const right = 50 + CANONICAL_FACE_CONTRACT.eyeGap / 2 + eyeWidth / 2 + recipe.eyeShiftX;
+  const top = CANONICAL_FACE_CONTRACT.eyeCenterY + recipe.eyeShiftY - eyeHeight / 2;
+  const bottom = Math.max(
+    CANONICAL_FACE_CONTRACT.eyeCenterY + recipe.eyeShiftY + eyeHeight / 2,
+    CANONICAL_FACE_CONTRACT.mouthCenterY + 1.2 + CANONICAL_FACE_CONTRACT.mouthStrokeWidth / 2,
+  );
+  const x = (value: number) =>
+    50 + ((value - 50) * faceScale + faceOffset.x) * opticalScale;
+  const y = (value: number) =>
+    50 + ((value - 50) * faceScale + faceOffset.y) * opticalScale;
+  return { left: x(left), right: x(right), top: y(top), bottom: y(bottom) };
+}
+
+function CanonicalFaceRig({
+  state,
+  faceScale,
+  faceOffset,
+  gaze,
+}: {
+  state: MausState;
+  faceScale: number;
+  faceOffset: Readonly<{ x: number; y: number }>;
+  gaze: Readonly<{ x: number; y: number }>;
+}) {
+  const recipe = canonicalFaceRecipeForState(state);
+  const eyeWidth = snapHalf(CANONICAL_FACE_CONTRACT.eyeWidth * recipe.eyeScaleX);
+  const eyeHeight = snapHalf(CANONICAL_FACE_CONTRACT.eyeHeight * recipe.eyeScaleY);
+  const gazeX = Math.max(-1.5, Math.min(1.5, gaze.x));
+  const gazeY = Math.max(-1, Math.min(1, gaze.y));
+  const leftX = snapHalf(50 - CANONICAL_FACE_CONTRACT.eyeGap / 2 - eyeWidth / 2 + recipe.eyeShiftX + gazeX);
+  const rightX = snapHalf(50 + CANONICAL_FACE_CONTRACT.eyeGap / 2 - eyeWidth / 2 + recipe.eyeShiftX + gazeX);
+  const eyeY = snapHalf(CANONICAL_FACE_CONTRACT.eyeCenterY + recipe.eyeShiftY - eyeHeight / 2 + gazeY);
+  const mouthY = snapHalf(CANONICAL_FACE_CONTRACT.mouthCenterY);
+  const mouthHalfWidth = CANONICAL_FACE_CONTRACT.mouthWidth / 2;
+  return (
+    <svg
+      viewBox="0 0 100 100"
+      aria-hidden="true"
+      className="pointer-events-none absolute inset-0 size-full overflow-visible"
+    >
+      <g transform={`translate(${50 + faceOffset.x} ${50 + faceOffset.y}) scale(${faceScale}) translate(-50 -50)`}>
+        <rect x={leftX} y={eyeY} width={eyeWidth} height={eyeHeight} rx={eyeWidth / 2} fill="#ffffff" />
+        <rect x={rightX} y={eyeY} width={eyeWidth} height={eyeHeight} rx={eyeWidth / 2} fill="#ffffff" />
+        <path
+          d={`M${50 - mouthHalfWidth} ${mouthY} Q50 ${mouthY + recipe.mouthCurve} ${50 + mouthHalfWidth} ${mouthY}`}
+          fill="none"
+          stroke="#ffffff"
+          strokeWidth={CANONICAL_FACE_CONTRACT.mouthStrokeWidth}
+          strokeLinecap="round"
+        />
+      </g>
+    </svg>
+  );
+}
+
 export type MausAvatarHandle = CursorAvatarHandle;
 
 export type MausAvatarProps = {
   color: MausColor;
+  avatarDefinition?: BotProceduralAvatar | null;
   /** Named behaviour — drives the expression pool, its cadence and blinking. */
   state?: MausState;
   /** Pin one of the 25 faces and stop the state's own drift. */
@@ -141,6 +241,7 @@ export type MausAvatarProps = {
 function MausAvatarComponent(
   {
     color,
+    avatarDefinition,
     state = "idle",
     expression,
     size = 44,
@@ -151,8 +252,6 @@ function MausAvatarComponent(
     gaze,
     spring,
     eyeScale,
-    showMouth,
-    mouthStroke,
     forward = true,
     lookAround,
     trackPointer = true,
@@ -161,6 +260,7 @@ function MausAvatarComponent(
   ref: React.Ref<MausAvatarHandle>,
 ) {
   const inner = useRef<CursorAvatarHandle>(null);
+  const presentation = proceduralAvatarPresentation(avatarDefinition);
   useImperativeHandle(ref, () => ({
     blink: () => inner.current?.blink(),
     spin: (durationMs?: number) => inner.current?.spin(durationMs),
@@ -193,30 +293,45 @@ function MausAvatarComponent(
     });
   };
   const onPointerLeave = () => setPointer({ x: 0, y: 0 });
+  const renderedState = motionState ?? state;
 
   return (
     <span
       className="inline-flex shrink-0"
+      data-avatar-surface={presentation.surface}
       onPointerMove={trackPointer && animated ? onPointerMove : undefined}
       onPointerLeave={trackPointer && animated ? onPointerLeave : undefined}
     >
-      <CursorAvatar
-        ref={inner}
-        state={motionState ?? state}
-        expression={expression}
-        size={size}
-        silhouette={GRADIENT_SILHOUETTE}
-        gradient={gradientFor(color)}
-        title={label ?? null}
-        lookAround={lookAround ?? (forward ? 0 : 1)}
-        gaze={{ x: (gaze?.x ?? 0) + pointer.x, y: (gaze?.y ?? 0) + pointer.y }}
-        turn={turn}
-        spring={spring}
-        eyeScale={eyeScale}
-        showMouth={showMouth}
-        mouthStroke={mouthStroke}
-        paused={!animated}
-      />
+      <span className="relative block shrink-0" style={{ width: size, height: size }}>
+        <span
+          className="absolute inset-0"
+          style={{ transform: `scale(${presentation.opticalScale})`, transformOrigin: "center" }}
+        >
+          <CursorAvatar
+            ref={inner}
+            state={renderedState}
+            expression={expression}
+            size={size}
+            silhouette={presentation.silhouette}
+            gradient={gradientFor(color)}
+            title={label ?? null}
+            lookAround={lookAround ?? (forward ? 0 : 1)}
+            gaze={{ x: (gaze?.x ?? 0) + pointer.x, y: (gaze?.y ?? 0) + pointer.y }}
+            turn={turn}
+            spring={spring}
+            eyeScale={eyeScale}
+            showMouth={false}
+            eyeColor="transparent"
+            paused={!animated}
+          />
+          <CanonicalFaceRig
+            state={renderedState}
+            faceScale={presentation.faceScale}
+            faceOffset={presentation.faceOffset}
+            gaze={{ x: (gaze?.x ?? 0) + pointer.x, y: (gaze?.y ?? 0) + pointer.y }}
+          />
+        </span>
+      </span>
     </span>
   );
 }
@@ -229,6 +344,7 @@ export type BotAvatarProps = Omit<MausAvatarProps, "color"> & {
     color: MausColor;
     avatarUrl?: string | null;
     avatarCrop?: BotAvatarCrop;
+    avatarDefinition?: BotProceduralAvatar | null;
   };
 };
 
@@ -248,6 +364,7 @@ export function BotAvatar({ bot, size = 44, label, ...mascotProps }: BotAvatarPr
       <MausAvatar
         {...mascotProps}
         color={bot.color}
+        avatarDefinition={profile.avatarDefinition}
         size={size}
         label={label ?? bot.name}
       />
