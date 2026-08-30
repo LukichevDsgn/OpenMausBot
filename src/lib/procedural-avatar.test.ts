@@ -44,5 +44,21 @@ describe("procedural avatar presentation", () => {
       .toBe("procedural:orb");
     expect(proceduralAvatarPresentation({ ...DEFAULT_PROCEDURAL_AVATAR, silhouette: "hex" }).surface)
       .toBe("procedural:tile");
+
+    for (const [legacy, canonical] of [["moon", "orb"], ["hex", "tile"]] as const) {
+      const legacyPresentation = proceduralAvatarPresentation({
+        ...DEFAULT_PROCEDURAL_AVATAR,
+        silhouette: legacy,
+      });
+      const canonicalPresentation = proceduralAvatarPresentation({
+        ...DEFAULT_PROCEDURAL_AVATAR,
+        silhouette: canonical,
+      });
+      expect(legacyPresentation.silhouette).toBe(canonicalPresentation.silhouette);
+      expect(legacyPresentation.opticalScale).toBe(canonicalPresentation.opticalScale);
+      expect(legacyPresentation.faceScale).toBe(canonicalPresentation.faceScale);
+      expect(legacyPresentation.faceOffset).toBe(canonicalPresentation.faceOffset);
+      expect(legacyPresentation.faceSafeZone).toBe(canonicalPresentation.faceSafeZone);
+    }
   });
 });

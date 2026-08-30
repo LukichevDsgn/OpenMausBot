@@ -14,6 +14,7 @@ import {
   proceduralAvatarPresentation,
   VISIBLE_PROCEDURAL_AVATAR_SILHOUETTES,
 } from "@/lib/procedural-avatar";
+import { MAUS_STATES } from "@/lib/mascot";
 
 const definition = {
   ...DEFAULT_PROCEDURAL_AVATAR,
@@ -24,29 +25,45 @@ const definition = {
 const surfaceFrom = (markup: string) =>
   markup.match(/data-avatar-surface="([^"]+)"/)?.[1];
 
+const persistedSilhouettes = [
+  "cursor",
+  ...VISIBLE_PROCEDURAL_AVATAR_SILHOUETTES,
+  "moon",
+  "hex",
+] as const;
+
+const canonicalFaceFrom = (markup: string) =>
+  markup.slice(markup.lastIndexOf('<svg viewBox="0 0 100 100"'));
+
 describe("canonical procedural avatar face", () => {
   it("keeps the complete upright face inside every visible shape safe zone", () => {
-    for (const silhouette of ["cursor", ...VISIBLE_PROCEDURAL_AVATAR_SILHOUETTES] as const) {
+    for (const silhouette of persistedSilhouettes) {
       const presentation = proceduralAvatarPresentation({
         ...DEFAULT_PROCEDURAL_AVATAR,
         silhouette,
       });
-      const bounds = canonicalFaceBounds(
-        presentation.faceOffset,
-        presentation.faceScale,
-        presentation.opticalScale,
-      );
       expect(presentation.faceScale * presentation.opticalScale, silhouette).toBeCloseTo(0.78, 6);
-      expect(bounds.left, silhouette).toBeGreaterThanOrEqual(presentation.faceSafeZone.left);
-      expect(bounds.right, silhouette).toBeLessThanOrEqual(presentation.faceSafeZone.right);
-      expect(bounds.top, silhouette).toBeGreaterThanOrEqual(presentation.faceSafeZone.top);
-      expect(bounds.bottom, silhouette).toBeLessThanOrEqual(presentation.faceSafeZone.bottom);
-      expect(Object.values(bounds).every(Number.isFinite), silhouette).toBe(true);
+      for (const state of MAUS_STATES) {
+        for (const gaze of [{ x: -1.5, y: -1 }, { x: 0, y: 0 }, { x: 1.5, y: 1 }]) {
+          const bounds = canonicalFaceBounds(
+            presentation.faceOffset,
+            presentation.faceScale,
+            presentation.opticalScale,
+            { state, gaze },
+          );
+          const scope = `${silhouette}:${state}:${gaze.x},${gaze.y}`;
+          expect(bounds.left, scope).toBeGreaterThanOrEqual(presentation.faceSafeZone.left);
+          expect(bounds.right, scope).toBeLessThanOrEqual(presentation.faceSafeZone.right);
+          expect(bounds.top, scope).toBeGreaterThanOrEqual(presentation.faceSafeZone.top);
+          expect(bounds.bottom, scope).toBeLessThanOrEqual(presentation.faceSafeZone.bottom);
+          expect(Object.values(bounds).every(Number.isFinite), scope).toBe(true);
+        }
+      }
     }
   });
 
   it("renders one white face rig and a silhouette-fitted gradient for every visible shape", () => {
-    for (const silhouette of ["cursor", ...VISIBLE_PROCEDURAL_AVATAR_SILHOUETTES] as const) {
+    for (const silhouette of persistedSilhouettes) {
       const markup = renderToStaticMarkup(createElement(MausAvatar, {
         color: "blue",
         avatarDefinition: { ...DEFAULT_PROCEDURAL_AVATAR, silhouette },
@@ -84,6 +101,96 @@ describe("canonical procedural avatar face", () => {
     expect(customStrokeMarkup).toContain('stroke-width="6.5"');
   });
 
+  it("keeps automatic canonical blinking active unless animation is paused", () => {
+    const animatedMarkup = renderToStaticMarkup(createElement(MausAvatar, {
+      color: "blue",
+      state: "working",
+      size: 44,
+      animated: true,
+      trackPointer: false,
+    }));
+    const pausedMarkup = renderToStaticMarkup(createElement(MausAvatar, {
+      color: "blue",
+      state: "working",
+      size: 44,
+      animated: false,
+      trackPointer: false,
+    }));
+
+    expect(animatedMarkup).toContain("data-avatar-auto-blink");
+    expect(pausedMarkup).not.toContain("data-avatar-auto-blink");
+  });
+
+  it("applies the same state, motion, gaze, and pause contract to every stored silhouette", () => {
+    for (const silhouette of persistedSilhouettes) {
+      const avatarDefinition = { ...DEFAULT_PROCEDURAL_AVATAR, silhouette };
+      const animatedMarkup = renderToStaticMarkup(createElement(MausAvatar, {
+        avatarDefinition,
+        color: "cyan",
+        state: "working",
+        motion: "surprise",
+        motionKey: 17,
+        gaze: { x: 1, y: -1 },
+        size: 44,
+        animated: true,
+        trackPointer: false,
+      }));
+      const pausedMarkup = renderToStaticMarkup(createElement(MausAvatar, {
+        avatarDefinition,
+        color: "cyan",
+        state: "working",
+        motion: "surprise",
+        motionKey: 17,
+        gaze: { x: 1, y: -1 },
+        size: 44,
+        animated: false,
+        trackPointer: false,
+      }));
+
+      expect(animatedMarkup, silhouette).toContain('data-avatar-state="working"');
+      expect(animatedMarkup, silhouette).toContain('data-avatar-motion="surprise"');
+      expect(animatedMarkup, silhouette).toContain('data-avatar-motion-key="17"');
+      expect(animatedMarkup, silhouette).toContain('data-avatar-animated="true"');
+      expect(animatedMarkup, silhouette).toContain('data-avatar-face-state="working"');
+      expect(animatedMarkup, silhouette).toContain("data-avatar-auto-blink");
+      expect(pausedMarkup, silhouette).toContain('data-avatar-animated="false"');
+      expect(pausedMarkup, silhouette).not.toContain("data-avatar-auto-blink");
+      expect(pausedMarkup, silhouette).not.toContain("data-avatar-one-shot-blink");
+    }
+  });
+
+  it("keeps the canonical face upright and optically equal at every app size", () => {
+    for (const size of [16, 24, 32, 44, 64]) {
+      const expectedEyeWidth = CANONICAL_FACE_CONTRACT.eyeWidth * 0.78 * size / 100;
+      for (const silhouette of persistedSilhouettes) {
+        const presentation = proceduralAvatarPresentation({
+          ...DEFAULT_PROCEDURAL_AVATAR,
+          silhouette,
+        });
+        const markup = renderToStaticMarkup(createElement(MausAvatar, {
+          color: "purple",
+          avatarDefinition: { ...DEFAULT_PROCEDURAL_AVATAR, silhouette },
+          state: "surprised",
+          gaze: { x: 1.5, y: -1 },
+          turn: 135,
+          size,
+          animated: false,
+          trackPointer: false,
+        }));
+        const faceMarkup = canonicalFaceFrom(markup);
+        const renderedEyeWidth = CANONICAL_FACE_CONTRACT.eyeWidth
+          * presentation.faceScale
+          * presentation.opticalScale
+          * size / 100;
+
+        expect(renderedEyeWidth, `${silhouette}:${size}`).toBeCloseTo(expectedEyeWidth, 8);
+        expect(faceMarkup, `${silhouette}:${size}`).toContain('data-canonical-avatar-face="true"');
+        expect(faceMarkup, `${silhouette}:${size}`).not.toContain("rotate(");
+        expect(faceMarkup, `${silhouette}:${size}`).not.toContain("scale(-");
+      }
+    }
+  });
+
   it("derives representative reactions from runtime state", () => {
     expect(canonicalFaceRecipeForState("idle")).not.toEqual(canonicalFaceRecipeForState("happy"));
     expect(canonicalFaceRecipeForState("working")).toEqual(canonicalFaceRecipeForState("thinking"));
@@ -115,6 +222,32 @@ describe("canonical procedural avatar face", () => {
     expect(surfaceFrom(list)).toBe("procedural:leaf");
     expect(surfaceFrom(profile)).toBe(surfaceFrom(list));
     expect(surfaceFrom(shared)).toBe(surfaceFrom(list));
+  });
+
+  it("keeps legacy moon/orb and hex/tile surfaces identical across list, chat, profile, and preview sizes", () => {
+    for (const [legacy, canonical] of [["moon", "orb"], ["hex", "tile"]] as const) {
+      for (const size of [24, 32, 44, 64]) {
+        const legacyMarkup = renderToStaticMarkup(createElement(MausAvatar, {
+          color: "teal",
+          avatarDefinition: { ...DEFAULT_PROCEDURAL_AVATAR, silhouette: legacy },
+          state: "surprised",
+          size,
+          animated: false,
+          trackPointer: false,
+        }));
+        const canonicalMarkup = renderToStaticMarkup(createElement(MausAvatar, {
+          color: "teal",
+          avatarDefinition: { ...DEFAULT_PROCEDURAL_AVATAR, silhouette: canonical },
+          state: "surprised",
+          size,
+          animated: false,
+          trackPointer: false,
+        }));
+        expect(surfaceFrom(legacyMarkup), `${legacy}:${size}`).toBe(surfaceFrom(canonicalMarkup));
+        expect(canonicalFaceFrom(legacyMarkup), `${legacy}:${size}`)
+          .toBe(canonicalFaceFrom(canonicalMarkup));
+      }
+    }
   });
 
   it("does not replace a valid uploaded avatar", () => {

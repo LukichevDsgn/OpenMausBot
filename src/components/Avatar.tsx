@@ -140,22 +140,141 @@ export function canonicalFaceBounds(
   faceOffset: Readonly<{ x: number; y: number }>,
   faceScale: number,
   opticalScale: number,
+  {
+    state = "surprised",
+    gaze = { x: 0, y: 0 },
+    showMouth = true,
+    mouthStroke = CANONICAL_FACE_CONTRACT.mouthStrokeWidth,
+  }: {
+    state?: MausState;
+    gaze?: Readonly<{ x: number; y: number }>;
+    showMouth?: boolean;
+    mouthStroke?: number;
+  } = {},
 ) {
-  const recipe = FACE_RECIPE.surprised;
-  const eyeWidth = CANONICAL_FACE_CONTRACT.eyeWidth * recipe.eyeScaleX;
-  const eyeHeight = CANONICAL_FACE_CONTRACT.eyeHeight * recipe.eyeScaleY;
-  const left = 50 - CANONICAL_FACE_CONTRACT.eyeGap / 2 - eyeWidth / 2 + recipe.eyeShiftX;
-  const right = 50 + CANONICAL_FACE_CONTRACT.eyeGap / 2 + eyeWidth / 2 + recipe.eyeShiftX;
-  const top = CANONICAL_FACE_CONTRACT.eyeCenterY + recipe.eyeShiftY - eyeHeight / 2;
-  const bottom = Math.max(
-    CANONICAL_FACE_CONTRACT.eyeCenterY + recipe.eyeShiftY + eyeHeight / 2,
-    CANONICAL_FACE_CONTRACT.mouthCenterY + 1.2 + CANONICAL_FACE_CONTRACT.mouthStrokeWidth / 2,
-  );
+  const recipe = canonicalFaceRecipeForState(state);
+  const eyeWidth = snapHalf(CANONICAL_FACE_CONTRACT.eyeWidth * recipe.eyeScaleX);
+  const eyeHeight = snapHalf(CANONICAL_FACE_CONTRACT.eyeHeight * recipe.eyeScaleY);
+  const gazeX = Math.max(-1.5, Math.min(1.5, gaze.x));
+  const gazeY = Math.max(-1, Math.min(1, gaze.y));
+  const left = snapHalf(50 - CANONICAL_FACE_CONTRACT.eyeGap / 2 - eyeWidth / 2 + recipe.eyeShiftX + gazeX);
+  const right = snapHalf(50 + CANONICAL_FACE_CONTRACT.eyeGap / 2 + eyeWidth / 2 + recipe.eyeShiftX + gazeX);
+  const top = snapHalf(CANONICAL_FACE_CONTRACT.eyeCenterY + recipe.eyeShiftY - eyeHeight / 2 + gazeY);
+  const eyeBottom = top + eyeHeight;
+  const mouthExtent = Math.abs(recipe.mouthCurve) + Math.max(0, mouthStroke) / 2;
+  const mouthTop = CANONICAL_FACE_CONTRACT.mouthCenterY - mouthExtent;
+  const mouthBottom = CANONICAL_FACE_CONTRACT.mouthCenterY + mouthExtent;
   const x = (value: number) =>
     50 + ((value - 50) * faceScale + faceOffset.x) * opticalScale;
   const y = (value: number) =>
     50 + ((value - 50) * faceScale + faceOffset.y) * opticalScale;
-  return { left: x(left), right: x(right), top: y(top), bottom: y(bottom) };
+  return {
+    left: x(left),
+    right: x(right),
+    top: y(Math.min(top, showMouth ? mouthTop : top)),
+    bottom: y(Math.max(eyeBottom, showMouth ? mouthBottom : eyeBottom)),
+  };
+}
+
+const NON_BLINKING_FACE_STATES = new Set<MausState>([
+  "sleeping",
+  "waking",
+  "drowsy",
+  "orbit",
+  "radar",
+  "progress",
+  "spawning",
+  "loading",
+  "dictating",
+  "writing",
+  "sending",
+  "receiving",
+  "uploading",
+  "alerting",
+  "bouncing",
+  "powering-down",
+]);
+
+function canonicalBlinkInterval(state: MausState): number | null {
+  if (NON_BLINKING_FACE_STATES.has(state)) return null;
+  const recipe = canonicalFaceRecipeForState(state);
+  if (recipe === FACE_RECIPE.surprised) return 2600;
+  if (recipe === FACE_RECIPE.happy) return 3700;
+  if (recipe === FACE_RECIPE.curious) return 4000;
+  if (recipe === FACE_RECIPE.focused) return 4200;
+  if (recipe === FACE_RECIPE.stern) return 5600;
+  if (recipe === FACE_RECIPE.sad) return 6000;
+  return 7200;
+}
+
+function CanonicalEye({
+  x,
+  y,
+  width,
+  height,
+  autoBlinkInterval,
+  blinkKey,
+}: {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  autoBlinkInterval: number | null;
+  blinkKey: number;
+}) {
+  const closedHeight = 0.5;
+  const closedY = snapHalf(y + (height - closedHeight) / 2);
+  const autoTimes = "0;0.94;0.97;1";
+  const autoHeights = `${height};${height};${closedHeight};${height}`;
+  const autoYs = `${y};${y};${closedY};${y}`;
+  const oneShotHeights = `${height};${closedHeight};${height}`;
+  const oneShotYs = `${y};${closedY};${y}`;
+  return (
+    <rect x={x} y={y} width={width} height={height} rx={width / 2} fill="#ffffff">
+      {autoBlinkInterval !== null ? (
+        <>
+          <animate
+            data-avatar-auto-blink="height"
+            attributeName="height"
+            values={autoHeights}
+            keyTimes={autoTimes}
+            dur={`${autoBlinkInterval}ms`}
+            repeatCount="indefinite"
+          />
+          <animate
+            data-avatar-auto-blink="y"
+            attributeName="y"
+            values={autoYs}
+            keyTimes={autoTimes}
+            dur={`${autoBlinkInterval}ms`}
+            repeatCount="indefinite"
+          />
+        </>
+      ) : null}
+      {blinkKey > 0 ? (
+        <>
+          <animate
+            key={`blink-height-${blinkKey}`}
+            data-avatar-one-shot-blink="height"
+            attributeName="height"
+            values={oneShotHeights}
+            keyTimes="0;0.5;1"
+            dur="160ms"
+            repeatCount="1"
+          />
+          <animate
+            key={`blink-y-${blinkKey}`}
+            data-avatar-one-shot-blink="y"
+            attributeName="y"
+            values={oneShotYs}
+            keyTimes="0;0.5;1"
+            dur="160ms"
+            repeatCount="1"
+          />
+        </>
+      ) : null}
+    </rect>
+  );
 }
 
 function CanonicalFaceRig({
@@ -165,6 +284,8 @@ function CanonicalFaceRig({
   gaze,
   showMouth,
   mouthStroke,
+  animated,
+  blinkKey,
 }: {
   state: MausState;
   faceScale: number;
@@ -172,6 +293,8 @@ function CanonicalFaceRig({
   gaze: Readonly<{ x: number; y: number }>;
   showMouth: boolean;
   mouthStroke: number;
+  animated: boolean;
+  blinkKey: number;
 }) {
   const recipe = canonicalFaceRecipeForState(state);
   const eyeWidth = snapHalf(CANONICAL_FACE_CONTRACT.eyeWidth * recipe.eyeScaleX);
@@ -183,15 +306,18 @@ function CanonicalFaceRig({
   const eyeY = snapHalf(CANONICAL_FACE_CONTRACT.eyeCenterY + recipe.eyeShiftY - eyeHeight / 2 + gazeY);
   const mouthY = snapHalf(CANONICAL_FACE_CONTRACT.mouthCenterY);
   const mouthHalfWidth = CANONICAL_FACE_CONTRACT.mouthWidth / 2;
+  const autoBlinkInterval = animated ? canonicalBlinkInterval(state) : null;
   return (
     <svg
       viewBox="0 0 100 100"
       aria-hidden="true"
+      data-canonical-avatar-face="true"
+      data-avatar-face-state={state}
       className="pointer-events-none absolute inset-0 size-full overflow-visible"
     >
       <g transform={`translate(${50 + faceOffset.x} ${50 + faceOffset.y}) scale(${faceScale}) translate(-50 -50)`}>
-        <rect x={leftX} y={eyeY} width={eyeWidth} height={eyeHeight} rx={eyeWidth / 2} fill="#ffffff" />
-        <rect x={rightX} y={eyeY} width={eyeWidth} height={eyeHeight} rx={eyeWidth / 2} fill="#ffffff" />
+        <CanonicalEye x={leftX} y={eyeY} width={eyeWidth} height={eyeHeight} autoBlinkInterval={autoBlinkInterval} blinkKey={animated ? blinkKey : 0} />
+        <CanonicalEye x={rightX} y={eyeY} width={eyeWidth} height={eyeHeight} autoBlinkInterval={autoBlinkInterval} blinkKey={animated ? blinkKey : 0} />
         {showMouth ? (
           <path
             d={`M${50 - mouthHalfWidth} ${mouthY} Q50 ${mouthY + recipe.mouthCurve} ${50 + mouthHalfWidth} ${mouthY}`}
@@ -269,19 +395,28 @@ function MausAvatarComponent(
 ) {
   const inner = useRef<CursorAvatarHandle>(null);
   const presentation = proceduralAvatarPresentation(avatarDefinition);
+  const [faceBlinkKey, setFaceBlinkKey] = useState(0);
   useImperativeHandle(ref, () => ({
-    blink: () => inner.current?.blink(),
+    blink: () => {
+      if (!animated) return;
+      inner.current?.blink();
+      setFaceBlinkKey((value) => value + 1);
+    },
     spin: (durationMs?: number) => inner.current?.spin(durationMs),
     setExpression: (index: number) => inner.current?.setExpression(index),
-  }));
+  }), [animated]);
 
   // A one-shot motion borrows the state for a moment, then hands it back.
   const [motionState, setMotionState] = useState<MausState | null>(null);
   useEffect(() => {
+    setMotionState(null);
     if (motion === "none" || !animated) return;
     const beat = MOTION_FACE[motion];
     if (!beat) return;
-    if (beat.blink) inner.current?.blink();
+    if (beat.blink) {
+      inner.current?.blink();
+      setFaceBlinkKey((value) => value + 1);
+    }
     if (beat.spin) inner.current?.spin(beat.spin);
     if (!beat.state) return;
     setMotionState(beat.state);
@@ -307,6 +442,10 @@ function MausAvatarComponent(
     <span
       className="inline-flex shrink-0"
       data-avatar-surface={presentation.surface}
+      data-avatar-state={renderedState}
+      data-avatar-motion={motion}
+      data-avatar-motion-key={motionKey}
+      data-avatar-animated={animated ? "true" : "false"}
       onPointerMove={trackPointer && animated ? onPointerMove : undefined}
       onPointerLeave={trackPointer && animated ? onPointerLeave : undefined}
     >
@@ -339,6 +478,8 @@ function MausAvatarComponent(
             gaze={{ x: (gaze?.x ?? 0) + pointer.x, y: (gaze?.y ?? 0) + pointer.y }}
             showMouth={showMouth}
             mouthStroke={mouthStroke}
+            animated={animated}
+            blinkKey={faceBlinkKey}
           />
         </span>
       </span>
