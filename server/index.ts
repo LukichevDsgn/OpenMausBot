@@ -78,6 +78,7 @@ import {
   DATA_DIR,
   EVENTS_DIR,
   NATIVE_DIR,
+  antigravityProxySettings,
 } from "./config.ts";
 import { ComputerControl } from "./computer-control.ts";
 import { augmentedPath, findCliCandidates, resetPathCache } from "./env-path.ts";
@@ -3901,6 +3902,7 @@ function configStatus() {
       skillRecorder: skillRecorderEnabled(cfg),
       showToolCalls: showToolCallsEnabled(cfg),
       browser: builtInBrowserEnabled(cfg),
+      antigravityProxy: antigravityProxySettings(cfg),
     },
     // partitionId is non-secret routing metadata. The renderer needs it to
     // show the same durable session as an agent, but config PATCH validation
@@ -6969,17 +6971,10 @@ const server = createServer(async (req, res) => {
       // Provider keys change the fleet. Profile, voice, VPS, and room timeout
       // changes do not rebuild it: no driver reads them, and they should not
       // interrupt in-flight turns.
-      const reloadKeys = Object.keys(patch).filter(
-        (key) =>
-          key !== "profile" &&
-          key !== "tts" &&
-          key !== "imageGen" &&
-          key !== "vps" &&
-          key !== "rooms" &&
-          key !== "localVm" &&
-          key !== "features" &&
-          key !== "browserProfiles",
-      );
+      const reloadKeys = Object.keys(patch).filter((key) => {
+        if (key === "features") return patch.features?.antigravityProxy !== undefined;
+        return !["profile", "tts", "imageGen", "vps", "rooms", "localVm", "browserProfiles"].includes(key);
+      });
       // The cleanup marker becomes committed only after both pieces of durable
       // application state agree. Commit/ACK failures are deferred until every
       // mandatory consequence of the config write has run: no journal I/O

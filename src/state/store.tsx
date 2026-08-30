@@ -300,7 +300,12 @@ export interface ConfigStatus {
   /** who's using the app — collected in onboarding, shown in the sidebar */
   profile?: { name: string; email: string };
   /** Opt-in flags. Absent means off. */
-  features?: { skillRecorder: boolean; showToolCalls?: boolean; browser?: boolean };
+  features?: {
+    skillRecorder: boolean;
+    showToolCalls?: boolean;
+    browser?: boolean;
+    antigravityProxy?: { mode: "off" | "tun" | "proxy"; url: string };
+  };
   /** Named browser sessions any bot can be pointed at. */
   browserProfiles?: BrowserProfile[];
 }
