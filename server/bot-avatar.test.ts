@@ -3,8 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   botAvatarProfile,
   botAvatarCropSchema,
+  botProceduralAvatarSchema,
   botAvatarUrlFromStoredPath,
   botAvatarUrlSchema,
+  generatedBotAvatar,
 } from "../shared/bot-avatar.ts";
 
 describe("bot avatar profile schema", () => {
@@ -37,7 +39,44 @@ describe("bot avatar profile schema", () => {
   });
 
   it("falls back safely for malformed persisted data", () => {
-    expect(botAvatarProfile({ avatarUrl: "https://example.test/pixel.png", avatarCrop: "round" }))
+    expect(botAvatarProfile({
+      avatarUrl: "https://example.test/pixel.png",
+      avatarCrop: "round",
+      avatarDefinition: { version: 1, seed: "safe", silhouette: "custom-svg" },
+    }))
       .toEqual({ avatarCrop: "mascot" });
+  });
+
+  it("accepts only versioned procedural preset ids", () => {
+    const definition = {
+      version: 1 as const,
+      seed: "bot_123",
+      silhouette: "gem" as const,
+      eyeStyle: "calm" as const,
+      mouthStyle: "none" as const,
+      expressionPreset: "side-eye" as const,
+      avatarPresetId: "freddy" as const,
+      restingAnimationId: "thinking" as const,
+    };
+    expect(botProceduralAvatarSchema.parse(definition)).toEqual(definition);
+    for (const malformed of [
+      { ...definition, version: 2 },
+      { ...definition, seed: "<svg>" },
+      { ...definition, silhouette: "arbitrary" },
+      { ...definition, eyeStyle: "laser" },
+      { ...definition, mouthStyle: "markup" },
+      { ...definition, expressionPreset: "<path>" },
+      { ...definition, extra: "not-persisted" },
+    ]) {
+      expect(botProceduralAvatarSchema.safeParse(malformed).success).toBe(false);
+    }
+  });
+
+  it("generates a stable, schema-valid avatar from the persisted seed", () => {
+    const first = generatedBotAvatar(" bot/id ");
+    const second = generatedBotAvatar(first.definition.seed);
+    expect(first).toEqual(second);
+    expect(first.definition.seed).toBe("bot-id");
+    expect(botProceduralAvatarSchema.safeParse(first.definition).success).toBe(true);
   });
 });

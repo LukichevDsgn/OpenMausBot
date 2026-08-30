@@ -170,6 +170,22 @@ describe("steer-queue module", () => {
     expect(_queuedCount("thread-skills")).toBe(0);
   });
 
+  it("compares the complete selected skill set at the queue boundary", () => {
+    const bot = fakeBot("bot-skill-set", "thread-skill-set", true);
+    const store = fakeStore([bot]);
+    queueSteeredMessage(bot, "first", { skillIds: ["one", "two"] });
+    queueSteeredMessage(bot, "same", { skillIds: ["one", "two"] });
+    queueSteeredMessage(bot, "different-order", { skillIds: ["two", "one"] });
+    bot.busy = false;
+    const run = vi.fn();
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][5]).toEqual(["one", "two"]);
+    expect(_queuedCount("thread-skill-set")).toBe(1);
+    drainSteeredMessages(store, run);
+    expect(run.mock.calls[1][5]).toEqual(["two", "one"]);
+  });
+
   it("fires nothing when nothing is queued", () => {
     const run = vi.fn();
     drainSteeredMessages(fakeStore([fakeBot("bot-c", "thread-c", false)]), run);

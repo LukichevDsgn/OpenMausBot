@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,7 +15,7 @@ import {
   setSkillEnabled,
   skillsSystemPrompt,
 } from "./skills.ts";
-import { parseSkillSource } from "./skill-fetch.ts";
+import { fetchSkillFromSource, parseSkillImportInput, parseSkillSource } from "./skill-fetch.ts";
 import { workspaceDir } from "./workspace.ts";
 
 // skills.ts resolves storage through workspaceDir(botId) → DATA_DIR, which
@@ -139,6 +139,26 @@ describe("app-wide global import", () => {
     expect(listSkills(bot)).toEqual([]);
   });
 
+  it("removes its staging directory when a staged file cannot be written", () => {
+    const root = join(scratch, "write-failure-skills");
+    let reads = 0;
+    const failingMarkdown = {
+      path: "notes.md",
+      get content() {
+        reads += 1;
+        if (reads === 3) throw new Error("fixture staged write failure");
+        return "review notes";
+      },
+    };
+    const result = installGlobalSkill(root, "fixture:write-failure", [
+      { path: "SKILL.md", content: SKILL("write-failure") },
+      failingMarkdown,
+    ]);
+    expect(result).toEqual({ error: "global skill import failed" });
+    expect(readdirSync(root).filter((name) => name.includes(".importing-"))).toEqual([]);
+    expect(existsSync(join(root, "write-failure"))).toBe(false);
+  });
+
   it("fails closed on reserved and pre-existing ids without leaking paths", () => {
     const root = join(scratch, "collision-skills");
     const files = [{ path: "SKILL.md", content: SKILL("collision") }];
@@ -216,6 +236,33 @@ describe("app-wide global import", () => {
     expect(batch).toMatchObject({ results: [{ id: "alpha" }, { id: "beta" }] });
     expect(existsSync(join(batchRoot, "alpha", "manifest.json"))).toBe(true);
     expect(existsSync(join(batchRoot, "beta", "manifest.json"))).toBe(true);
+
+    const metadataRoot = join(scratch, "batch-metadata");
+    const metadata = installGlobalSkillBatch(metadataRoot, [{
+      source: "package:portable",
+      files: [{ path: "SKILL.md", content: SKILL("portable") }],
+      manifest: {
+        id: "portable",
+        name: "Portable",
+        version: "1.2.3",
+        description: "Portable instructions",
+        defaultEnabled: false,
+        triggerTerms: ["portable"],
+        requiredCapabilities: ["research"],
+        tools: ["notes"],
+        dependencies: ["source-check"],
+        origin: "recorded",
+      },
+    }]);
+    expect(metadata).toMatchObject({ results: [{ id: "portable" }] });
+    expect(JSON.parse(readFileSync(join(metadataRoot, "portable", "manifest.json"), "utf8"))).toMatchObject({
+      defaultEnabled: false,
+      requiredCapabilities: ["research"],
+      tools: ["notes"],
+      dependencies: ["source-check"],
+      origin: "imported",
+      sourceOrigin: "recorded",
+    });
   });
 });
 
@@ -227,10 +274,122 @@ describe("parseSkillSource", () => {
     expect(parseSkillSource("https://github.com/o/r/blob/main/skills/tdd/SKILL.md")).toMatchObject({
       rawUrl: "https://raw.githubusercontent.com/o/r/main/skills/tdd/SKILL.md",
     });
+    expect(parseSkillSource("https://github.com/kunchenguid/lavish-axi?ysclid=tracking-value")).toMatchObject({
+      owner: "kunchenguid",
+      repo: "lavish-axi",
+      path: "",
+    });
+    expect(parseSkillSource("https://github.com/o/r?not-tracking=kept-invalid")).toMatchObject({ error: expect.any(String) });
+  });
+
+  it("normalizes ysclid before fetching and still refuses a repo without SKILL.md", async () => {
+    const requested: string[] = [];
+    const result = await fetchSkillFromSource(
+      "https://github.com/kunchenguid/lavish-axi?ysclid=tracking-value",
+      async (input) => {
+        requested.push(String(input));
+        return new Response("[]", { status: 200 });
+      },
+    );
+    expect(requested).toEqual(["https://api.github.com/repos/kunchenguid/lavish-axi/contents/"]);
+    expect(result).toEqual({ error: "no SKILL.md found there — paste a skill folder or a repo with a skills/ directory" });
+  });
+
+  it("discovers nested skills after removing a GitHub tracking query", async () => {
+    const listings = new Map<string, unknown>([
+      [
+        "https://api.github.com/repos/kunchenguid/lavish-axi/contents/",
+        [
+          { type: "dir", name: "skills", path: "skills" },
+          { type: "dir", name: ".agents", path: ".agents" },
+        ],
+      ],
+      [
+        "https://api.github.com/repos/kunchenguid/lavish-axi/contents/skills",
+        [{ type: "dir", name: "lavish", path: "skills/lavish" }],
+      ],
+      [
+        "https://api.github.com/repos/kunchenguid/lavish-axi/contents/skills/lavish",
+        [{ type: "file", name: "SKILL.md", path: "skills/lavish/SKILL.md", download_url: "https://raw.test/lavish" }],
+      ],
+      [
+        "https://api.github.com/repos/kunchenguid/lavish-axi/contents/.agents/skills",
+        [{ type: "dir", name: "lavish-design", path: ".agents/skills/lavish-design" }],
+      ],
+      [
+        "https://api.github.com/repos/kunchenguid/lavish-axi/contents/.agents/skills/lavish-design",
+        [{ type: "file", name: "SKILL.md", path: ".agents/skills/lavish-design/SKILL.md", download_url: "https://raw.test/lavish-design" }],
+      ],
+    ]);
+    const result = await fetchSkillFromSource(
+      "https://github.com/kunchenguid/lavish-axi?ysclid=tracking-value",
+      async (input) => {
+        const url = String(input);
+        if (url === "https://raw.test/lavish") return new Response("lavish skill");
+        if (url === "https://raw.test/lavish-design") return new Response("lavish design skill");
+        const listing = listings.get(url);
+        return new Response(listing === undefined ? "not found" : JSON.stringify(listing), {
+          status: listing === undefined ? 404 : 200,
+        });
+      },
+    );
+    expect(result).toMatchObject({
+      skills: [
+        { source: "github.com/kunchenguid/lavish-axi/skills/lavish", files: [{ path: "SKILL.md", content: "lavish skill" }] },
+        { source: "github.com/kunchenguid/lavish-axi/.agents/skills/lavish-design", files: [{ path: "SKILL.md", content: "lavish design skill" }] },
+      ],
+    });
+    const filtered = await fetchSkillFromSource(
+      "npx skills add kunchenguid/lavish-axi --skill lavish",
+      async (input) => {
+        const url = String(input);
+        if (url === "https://raw.test/lavish") return new Response("lavish skill");
+        if (url === "https://raw.test/lavish-design") return new Response("lavish design skill");
+        const listing = listings.get(url);
+        return new Response(listing === undefined ? "not found" : JSON.stringify(listing), { status: listing === undefined ? 404 : 200 });
+      },
+    );
+    expect(filtered).toMatchObject({ skills: [{ source: expect.stringContaining("/lavish") }] });
+    await expect(fetchSkillFromSource(
+      "npx skills add kunchenguid/lavish-axi --skill missing",
+      async (input) => {
+        const url = String(input);
+        if (url === "https://raw.test/lavish") return new Response("lavish skill");
+        if (url === "https://raw.test/lavish-design") return new Response("lavish design skill");
+        const listing = listings.get(url);
+        return new Response(listing === undefined ? "not found" : JSON.stringify(listing), { status: listing === undefined ? 404 : 200 });
+      },
+    )).resolves.toEqual({ error: "requested skill(s) not found: missing" });
   });
 
   it("refuses non-GitHub input loudly", () => {
     expect("error" in parseSkillSource("https://evil.example/skill.md")).toBe(true);
     expect("error" in parseSkillSource("")).toBe(true);
+  });
+});
+
+describe("parseSkillImportInput", () => {
+  it("accepts the skills CLI data shape with repeated exact selectors", () => {
+    expect(parseSkillImportInput("npx skills add kunchenguid/lavish-axi --skill lavish -s lavish-design")).toEqual({
+      source: "kunchenguid/lavish-axi",
+      skillNames: ["lavish", "lavish-design"],
+    });
+    expect(parseSkillImportInput('npx skills add "https://github.com/o/r" --skill lavish')).toEqual({
+      source: "https://github.com/o/r",
+      skillNames: ["lavish"],
+    });
+  });
+
+  it("rejects unknown commands, flags, missing values, duplicates, and malformed quoting", () => {
+    for (const input of [
+      "npx skills remove o/r",
+      "npx skills add o/r --force",
+      "npx skills add o/r --skill",
+      "npx skills add o/r --skill bad_name",
+      "npx skills add o/r --skill one -s one",
+      'npx skills add "o/r',
+    ]) {
+      expect(parseSkillImportInput(input)).toMatchObject({ error: expect.any(String) });
+    }
   });
 });

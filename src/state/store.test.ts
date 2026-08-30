@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   configStatusFromFrame,
+  duplicateBotProfile,
   initialState,
   openNotificationTarget,
   reducer,
@@ -12,6 +13,138 @@ import {
   chiefRuntimePolicyLocked,
   type RuntimePolicy,
 } from "./store";
+
+describe("bot duplication profile", () => {
+  const source = {
+    id: "source",
+    threadId: "source-thread",
+    name: "Source",
+    title: "Builder",
+    description: "A bot",
+    notifications: true,
+    color: "purple",
+    mascotExpression: "curious",
+    avatarCrop: "mascot",
+    unread: false,
+    modelSelection: { instanceId: "codex", model: "default" },
+    messages: [],
+  } satisfies Bot;
+
+  it("copies the complete procedural appearance", () => {
+    const avatarDefinition = {
+      version: 1 as const,
+      seed: "source-seed",
+      silhouette: "spark" as const,
+      eyeStyle: "wide" as const,
+      mouthStyle: "none" as const,
+    };
+    expect(duplicateBotProfile({ ...source, avatarDefinition })).toMatchObject({
+      avatarDefinition,
+      avatarCrop: "mascot",
+      color: "purple",
+      mascotExpression: "curious",
+    });
+  });
+
+  it("explicitly clears the generated preset when a classic bot is copied", () => {
+    expect(duplicateBotProfile(source).avatarDefinition).toBeNull();
+  });
+});
+
+describe("optimistic avatar profile edits", () => {
+  it("updates body Shape and Expression immediately without dropping the procedural definition", () => {
+    const bot = {
+      id: "avatar-bot",
+      threadId: "avatar-thread",
+      name: "Avatar",
+      title: "",
+      description: "",
+      notifications: true,
+      color: "green" as const,
+      avatarCrop: "mascot" as const,
+      mascotExpression: "happy",
+      avatarDefinition: {
+        version: 1 as const,
+        seed: "avatar-seed",
+        silhouette: "gem" as const,
+        eyeStyle: "balanced" as const,
+        mouthStyle: "soft" as const,
+      },
+      unread: false,
+      modelSelection: { instanceId: "fixture", model: "default" },
+      messages: [],
+    } satisfies Bot;
+
+    const shaped = reducer(
+      { ...initialState, bots: [bot] },
+      {
+        type: "updateBot",
+        botId: bot.id,
+        patch: {
+          avatarDefinition: { ...bot.avatarDefinition, silhouette: "spark" },
+        },
+      },
+    );
+    const expressed = reducer(shaped, {
+      type: "updateBot",
+      botId: bot.id,
+      patch: { mascotExpression: "proud" },
+    });
+
+    expect(expressed.bots[0]).toMatchObject({
+      mascotExpression: "proud",
+      avatarDefinition: { ...bot.avatarDefinition, silhouette: "spark" },
+    });
+  });
+});
+
+describe("optimistic review and local computer edits", () => {
+  const bot = {
+    id: "review-bot",
+    threadId: "review-thread",
+    name: "Reviewer",
+    title: "",
+    description: "",
+    notifications: true,
+    color: "green" as const,
+    unread: false,
+    autoApprove: true,
+    computer: "cloud" as const,
+    modelSelection: { instanceId: "fixture", model: "default" },
+    messages: [],
+  } satisfies Bot;
+
+  it.each(["off", "shadow", "enforce"] as const)("keeps Auto mode on when Review changes to %s", (autoReview) => {
+    const next = reducer(
+      { ...initialState, bots: [bot] },
+      { type: "updateBot", botId: bot.id, patch: { autoReview } },
+    );
+
+    expect(next.bots[0]).toMatchObject({ autoReview, autoApprove: true });
+  });
+
+  it("turns Auto mode off only for an unacknowledged switch into This computer", () => {
+    const next = reducer(
+      { ...initialState, bots: [bot] },
+      { type: "updateBot", botId: bot.id, patch: { computer: "local" } },
+    );
+
+    expect(next.bots[0]).toMatchObject({ computer: "local", autoApprove: false });
+  });
+
+  it("keeps Auto mode for an explicitly acknowledged local switch", () => {
+    const next = reducer(
+      { ...initialState, bots: [bot] },
+      {
+        type: "updateBot",
+        botId: bot.id,
+        patch: { computer: "local", acknowledgeLocalAuto: true },
+      },
+    );
+
+    expect(next.bots[0]).toMatchObject({ computer: "local", autoApprove: true });
+  });
+});
 
 describe("notification routing", () => {
   const bots = [{ id: "bot-1", threadId: "main-thread", tasks: [{ threadId: "detached-thread" }] }] as never;

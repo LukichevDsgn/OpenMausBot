@@ -1,5 +1,9 @@
 import { z } from "zod";
 
+import {
+  botProceduralAvatarSchema,
+  type BotProceduralAvatar,
+} from "../shared/bot-avatar.ts";
 import { schemaIssue, type JsonValue } from "./schema.ts";
 import type { MausColor } from "./store.ts";
 
@@ -7,6 +11,10 @@ export const TEAM_MANIFEST_FORMAT = "openmaus.team" as const;
 export const TEAM_MANIFEST_VERSION = 2 as const;
 export const LEGACY_TEAM_MANIFEST_VERSION = 1 as const;
 export const MAX_TEAM_MEMBERS = 200;
+/** Public/imported bot instructions remain bounded independently from the
+ * surrounding package/response byte limits. Keep package agents and legacy
+ * team members on this exact boundary. */
+export const BOT_INSTRUCTIONS_MAX_CHARS = 24_000;
 
 const COLORS = [
   "green",
@@ -43,10 +51,11 @@ const memberSchema = z.object({
   }),
   name: requiredText(100),
   title: optionalText(200),
-  description: optionalText(4_000),
+  description: optionalText(BOT_INSTRUCTIONS_MAX_CHARS),
   appearance: z.object({
     color: z.enum(COLORS, { error: "is not supported" }),
     mascotExpression: optionalText(80),
+    avatarDefinition: botProceduralAvatarSchema.optional(),
   }),
 });
 
@@ -89,6 +98,7 @@ export interface TeamManifestMember {
   appearance: {
     color: MausColor;
     mascotExpression?: string;
+    avatarDefinition?: BotProceduralAvatar;
   };
 }
 
@@ -134,6 +144,7 @@ interface ExportableBot {
   description: string;
   color: MausColor;
   mascotExpression?: string | null;
+  avatarDefinition?: BotProceduralAvatar | null;
 }
 
 interface ExportableTeam {
@@ -160,6 +171,7 @@ export function parseTeamManifest(value: TeamManifestInput): ParsedTeamManifest 
     seenKeys.add(member.key);
     const appearance: TeamManifestMember["appearance"] = { color: member.appearance.color };
     if (member.appearance.mascotExpression) appearance.mascotExpression = member.appearance.mascotExpression;
+    if (member.appearance.avatarDefinition) appearance.avatarDefinition = member.appearance.avatarDefinition;
     return {
       key: member.key,
       name: member.name,
@@ -201,6 +213,7 @@ export interface ImportedMemberProfile {
   description: string;
   color: MausColor;
   mascotExpression?: string;
+  avatarDefinition?: BotProceduralAvatar;
 }
 
 const MAX_MEMBER_NAME = 100;
@@ -254,6 +267,7 @@ export function importedMemberProfile(
     color: member.appearance.color,
   };
   if (member.appearance.mascotExpression) profile.mascotExpression = member.appearance.mascotExpression;
+  if (member.appearance.avatarDefinition) profile.avatarDefinition = member.appearance.avatarDefinition;
   return profile;
 }
 
@@ -283,6 +297,7 @@ export function createTeamManifest(team: ExportableTeam, bots: ExportableBot[]):
     const key = memberKey(bot.name, index, usedKeys);
     const appearance: TeamManifestMember["appearance"] = { color: bot.color };
     if (bot.mascotExpression) appearance.mascotExpression = bot.mascotExpression;
+    if (bot.avatarDefinition) appearance.avatarDefinition = bot.avatarDefinition;
     return {
       key,
       name: bot.name,

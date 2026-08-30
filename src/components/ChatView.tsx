@@ -1006,13 +1006,7 @@ export function ChatView({ bot }: { bot: Bot }) {
     });
   };
 
-  // on Windows the frameless window's min/max/close overlay sits at the
-  // top-right: the header becomes the drag strip and clears room for it
-  const isWin = window.ogb?.platform === "win32";
-  // SAFETY: Electron supports this nonstandard CSS property, which React's type declarations omit.
-  const drag = isWin ? ({ WebkitAppRegion: "drag" } as React.CSSProperties) : undefined;
-  // SAFETY: Electron supports this nonstandard CSS property, which React's type declarations omit.
-  const noDrag = isWin ? ({ WebkitAppRegion: "no-drag" } as React.CSSProperties) : undefined;
+  const rightSidePanelOpen = state.inspectorOpen || state.computerOpen;
 
   return (
     <main className="relative flex h-full min-w-0 flex-1 flex-col bg-app">
@@ -1026,11 +1020,9 @@ export function ChatView({ bot }: { bot: Bot }) {
           "@container/chathead flex items-center justify-between px-5 py-3",
           // Room for the drawer button, which overlays this corner below md.
           "pl-11 md:pl-5",
-          isWin && "pr-[148px]",
         )}
-        style={drag}
       >
-        <div className="flex min-w-0 items-center gap-2.5 rounded-lg px-1.5 py-1" style={noDrag}>
+        <div className="flex min-w-0 items-center gap-2.5 rounded-lg px-1.5 py-1">
           <button
             onClick={() => dispatch({ type: "toggleSettings", open: true })}
             className="flex size-10 shrink-0 items-center justify-center rounded-lg hover:bg-raised/50"
@@ -1055,17 +1047,24 @@ export function ChatView({ bot }: { bot: Bot }) {
           />
           {bot.chiefOfStaff && (
             <span
-              className="flex items-center gap-1 rounded-full bg-accent/12 px-2 py-0.5 text-[11px] font-medium text-accent @max-4xl/chathead:size-7 @max-4xl/chathead:justify-center @max-4xl/chathead:gap-0 @max-4xl/chathead:rounded-full @max-4xl/chathead:bg-accent @max-4xl/chathead:px-0 @max-4xl/chathead:py-0 @max-4xl/chathead:text-white"
+              className={cn(
+                "flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-accent/12 px-2 py-0.5 text-[11px] font-medium text-accent @max-4xl/chathead:size-7 @max-4xl/chathead:justify-center @max-4xl/chathead:gap-0 @max-4xl/chathead:bg-accent @max-4xl/chathead:px-0 @max-4xl/chathead:py-0 @max-4xl/chathead:text-white",
+                rightSidePanelOpen && "size-7 justify-center gap-0 bg-accent px-0 py-0 text-white",
+              )}
               aria-label="Chief of Staff"
               title="Chief of Staff"
             >
-              <Crown size={11} className="@max-4xl/chathead:size-[14px]" aria-hidden="true" />
-              <span className="@max-4xl/chathead:hidden">Chief of Staff</span>
+              <Crown
+                size={11}
+                className={cn("@max-4xl/chathead:size-[14px]", rightSidePanelOpen && "size-[14px]")}
+                aria-hidden="true"
+              />
+              <span className={cn("@max-4xl/chathead:hidden", rightSidePanelOpen && "hidden")}>Chief of Staff</span>
             </span>
           )}
           {bot.busy && <Loader2 size={14} className="animate-spin text-ink-secondary" />}
         </div>
-        <div className="flex shrink-0 items-center gap-2" style={noDrag}>
+        <div className="flex shrink-0 items-center gap-2">
           <button
             onClick={() => setFindOpen((open) => !open)}
             aria-label="Find in conversation"
@@ -1148,10 +1147,12 @@ export function ChatView({ bot }: { bot: Bot }) {
 
       {showToolCallsEnabled(state.config) && <TaskTimeline messages={messages} busy={bot.busy ?? false} />}
 
-      {/* Messages */}
+      {/* Messages and composer share a pane so the dock can float over the
+          transcript without changing the header or side-panel layout. */}
+      <div className="relative min-h-0 flex-1">
       <div
         ref={scrollRef}
-        className="flex-1 overflow-x-hidden overflow-y-auto px-5 [overflow-anchor:none]"
+        className="h-full overflow-x-hidden overflow-y-auto px-5 pb-48 [overflow-anchor:none]"
         onWheel={(e) => {
           if (e.deltaY < 0) setBottomFollow(false);
           else if (atEnd()) setBottomFollow(true);
@@ -1229,6 +1230,7 @@ export function ChatView({ bot }: { bot: Bot }) {
             avatar={
               <MausAvatar
                 color={bot.color}
+                avatarDefinition={bot.avatarDefinition}
                 state={toolInFlight ? "working" : "thinking"}
                 size={36}
                 forward={false}
@@ -1274,7 +1276,7 @@ export function ChatView({ bot }: { bot: Bot }) {
         onClearReply={() => setReplyTo(null)}
         onEditLast={lastUserMessage && !bot.busy ? () => setEditingId(lastUserMessage.id) : undefined}
       />
-
+      </div>
     </main>
   );
 }

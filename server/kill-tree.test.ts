@@ -35,7 +35,7 @@ describe("killCliTree", () => {
     let failureMessage = "";
     let failureStdout = "";
     try {
-      await execCliTree(process.execPath, ["-e", launcher], { timeout: 150 });
+      await execCliTree(process.execPath, ["-e", launcher], { timeout: 1_000 });
     } catch (error) {
       // SAFETY: execCliTree's rejection contract attaches the captured stdout
       // to an Error; this test invokes that function directly.

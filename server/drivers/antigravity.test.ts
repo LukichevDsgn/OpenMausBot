@@ -16,6 +16,7 @@ import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
 import {
   ANTIGRAVITY_COMPUTER_MCP_KEY,
+  ANTIGRAVITY_REVIEW_UNSUPPORTED_REASON,
   ANTIGRAVITY_WORKSPACE_TOOL_CONTRACT,
   AntigravityDriver,
   antigravityComputerMcpServer,
@@ -143,6 +144,14 @@ describe("Antigravity turns (fake CLI)", () => {
   it("respondToRequest resolves `unavailable` — no interactive permission channel, so the caller denies", async () => {
     await create();
     await expect(instance.adapter.respondToRequest("t-happy", "req-1", { behavior: "allow" })).resolves.toBe("unavailable");
+  });
+
+  it("does not advertise approval review because print mode has no safe stdin-only hook", async () => {
+    await create();
+    expect(instance.reviewPermission).toBeUndefined();
+    expect(ANTIGRAVITY_REVIEW_UNSUPPORTED_REASON).toBe(
+      "Antigravity print mode accepts prompts only in --print argv; it has no stdin-only JSON review or isolated permission hook",
+    );
   });
 
   it("injects the workspace tool contract and a long-running turn timeout", async () => {

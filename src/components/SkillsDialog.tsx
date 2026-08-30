@@ -1,26 +1,32 @@
 import { BookOpen, Check, Search, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { searchSkills, skillOriginLabel } from "@/lib/skills";
+import { searchSkills, skillOriginLabel, skillSelectionSummary } from "@/lib/skills";
 import type { SkillCatalogEntry } from "@/state/store";
 import { cn } from "@/lib/cn";
 
 export function SkillsDialog({
   open,
   skills,
+  selectedIds,
   selectedId,
   initialQuery = "",
+  onToggle,
   onSelect,
   onClose,
 }: {
   open: boolean;
   skills: readonly SkillCatalogEntry[];
-  selectedId: string | null;
+  selectedIds?: readonly string[];
+  /** Legacy single-selection props retained for existing story/test callers. */
+  selectedId?: string | null;
   initialQuery?: string;
-  onSelect: (skill: SkillCatalogEntry) => void;
+  onToggle?: (skill: SkillCatalogEntry) => void;
+  onSelect?: (skill: SkillCatalogEntry) => void;
   onClose: () => void;
 }) {
   const [query, setQuery] = useState(initialQuery);
+  const activeSelectedIds = selectedIds ?? (selectedId ? [selectedId] : []);
   const inputRef = useRef<HTMLInputElement>(null);
   const results = useMemo(() => searchSkills(skills, query), [skills, query]);
 
@@ -44,8 +50,8 @@ export function SkillsDialog({
         <div className="flex items-center gap-3 border-b border-hairline/40 px-4 py-3">
           <BookOpen size={18} className="text-ink-secondary" aria-hidden="true" />
           <div className="min-w-0 flex-1">
-            <h2 id="skills-dialog-title" className="text-[15px] font-semibold text-ink">Choose a skill</h2>
-            <p className="text-[12px] text-ink-secondary">Applies to the next message only.</p>
+            <h2 id="skills-dialog-title" className="text-[15px] font-semibold text-ink">Choose skills</h2>
+            <p className="text-[12px] text-ink-secondary">Select skills for the next message.</p>
           </div>
           <button type="button" onClick={onClose} aria-label="Close skills" className="rounded-md p-1 text-ink-secondary hover:bg-control hover:text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">
             <X size={18} />
@@ -59,14 +65,14 @@ export function SkillsDialog({
         </div>
         <div role="listbox" aria-label="Available skills" className="flex-1 overflow-y-auto p-2">
           {results.map((skill) => {
-            const selected = selectedId === skill.id;
+            const selected = activeSelectedIds.includes(skill.id);
             return (
               <button
                 key={skill.id}
                 type="button"
                 role="option"
                 aria-selected={selected}
-                onClick={() => onSelect(skill)}
+                onClick={() => (onToggle ?? onSelect)?.(skill)}
                 className={cn(
                   "flex w-full items-start gap-3 rounded-xl px-3 py-3 text-left hover:bg-control/70 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent",
                   selected && "bg-control",
@@ -82,12 +88,19 @@ export function SkillsDialog({
                   {skill.requiredCapabilities.length > 0 ? (
                     <span className="mt-1.5 block text-[11px] text-ink-secondary">Requires {skill.requiredCapabilities.join(", ")}</span>
                   ) : null}
+                  {skill.dependencies?.length ? (
+                    <span className="mt-1 block text-[11px] text-ink-secondary">Includes {skill.dependencies.join(", ")}</span>
+                  ) : null}
                 </span>
                 {selected ? <Check size={16} className="mt-1 shrink-0 text-accent" aria-hidden="true" /> : null}
               </button>
             );
           })}
           {!results.length ? <div className="px-4 py-10 text-center text-[13px] text-ink-secondary">No skills match “{query.trim()}”.</div> : null}
+        </div>
+        <div className="flex items-center justify-between border-t border-hairline/40 px-4 py-3">
+          <span className="text-[12px] text-ink-secondary">{skillSelectionSummary(skills.length, activeSelectedIds.length)}</span>
+          <button type="button" onClick={onClose} className="rounded-lg bg-accent px-3 py-2 text-[13px] font-medium text-white hover:brightness-110 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">Done</button>
         </div>
       </div>
     </div>

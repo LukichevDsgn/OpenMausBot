@@ -1,25 +1,31 @@
-import { useRef, useState } from "react";
-import { Check, ChevronDown, ImagePlus, Loader2, Sparkles, Trash2 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Check, ChevronDown, ImagePlus, Loader2, Palette, Sparkles, Trash2 } from "lucide-react";
 
 import { api, useStore, type Bot, type ConfigStatus } from "@/state/store";
 import { imageAttachmentFromFile } from "@/lib/composer-attachments";
 import { cn } from "@/lib/cn";
 import {
-  PICKABLE_STATES,
   MAUS_COLORS,
   MAUS_COLOR_NAMES,
   type MausMotion,
   type MausState,
 } from "@/lib/mascot";
 import {
+  exportedAvatarDefinition,
+  exportedAvatarPreset,
+} from "@/lib/avatar-presets";
+import { PROCEDURAL_AVATAR_SILHOUETTE_LABELS } from "@/lib/procedural-avatar";
+import {
   BOT_AVATAR_CROPS,
+  botAvatarProfile,
   botAvatarUrlFromStoredPath,
   type BotAvatarCrop,
 } from "../../shared/bot-avatar";
 import { BotAvatar, MausAvatar } from "./Avatar";
+import { AvatarLabDialog } from "./AvatarLabDialog";
 
 type AvatarPatch = Partial<
-  Pick<Bot, "avatarCrop" | "avatarUrl" | "color" | "mascotExpression">
+  Pick<Bot, "avatarCrop" | "avatarUrl" | "avatarDefinition" | "color" | "mascotExpression">
 >;
 
 const CROP_LABEL = {
@@ -47,9 +53,20 @@ export function BotProfileAvatarCard({
   const [savingKey, setSavingKey] = useState(false);
   const [direction, setDirection] = useState("");
   const [generationOpen, setGenerationOpen] = useState(false);
+  const [avatarLabOpen, setAvatarLabOpen] = useState(false);
   const [generating, setGenerating] = useState(false);
+  const [imageFailed, setImageFailed] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const crop = bot.avatarCrop ?? "mascot";
+  const avatarProfile = botAvatarProfile(bot);
+  const uploadedAvatarUrl = avatarProfile.avatarUrl;
+  const avatarDefinition = avatarProfile.avatarDefinition;
+  const exportedDefinition = exportedAvatarDefinition(avatarDefinition);
+  const currentStyleName = exportedDefinition.avatarPresetId
+    ? exportedAvatarPreset(exportedDefinition.avatarPresetId).name
+    : PROCEDURAL_AVATAR_SILHOUETTE_LABELS[avatarDefinition?.silhouette ?? "cursor"];
+  const nativeMascot = !uploadedAvatarUrl || imageFailed;
+  useEffect(() => setImageFailed(false), [uploadedAvatarUrl]);
   const cropRef = useRef(crop);
   cropRef.current = crop;
   const imageConfigured = state.config?.imageGen?.configured === true;
@@ -128,11 +145,18 @@ export function BotProfileAvatarCard({
   };
 
   return (
-    <div className="overflow-hidden rounded-xl border border-hairline/40 bg-card">
+    <>
+      <div className="overflow-hidden rounded-xl border border-hairline/40 bg-card">
       <div className="flex items-center justify-between border-b border-hairline/40 px-3 py-2.5">
         <span className="rounded-lg bg-control px-3 py-1.5 text-[14px] font-medium text-ink">Avatar</span>
         <button
-          onClick={() => onPatch({ avatarCrop: "mascot", color: "green", mascotExpression: null })}
+          onClick={() => onPatch({
+            avatarCrop: "mascot",
+            avatarUrl: null,
+            avatarDefinition: null,
+            color: "green",
+            mascotExpression: "idle",
+          })}
           className="rounded-md px-2 py-1.5 text-[13px] text-ink-secondary hover:bg-control hover:text-ink"
         >
           Reset mascot
@@ -147,6 +171,7 @@ export function BotProfileAvatarCard({
             size={112}
             motion={mascotMotion?.kind ?? "none"}
             motionKey={mascotMotion?.nonce ?? 0}
+            onImageError={() => setImageFailed(true)}
           />
         </div>
 
@@ -158,6 +183,15 @@ export function BotProfileAvatarCard({
             className="sr-only"
             onChange={(event) => void upload(event.target.files?.[0])}
           />
+          <button
+            type="button"
+            onClick={() => setAvatarLabOpen(true)}
+            disabled={uploading || generating}
+            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-control px-3 py-2 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-50"
+          >
+            <Palette size={14} />
+            Customize
+          </button>
           <button
             type="button"
             onClick={() => fileRef.current?.click()}
@@ -182,51 +216,31 @@ export function BotProfileAvatarCard({
         </div>
         <div className="mt-1.5 text-[11.5px] text-ink-secondary">PNG, JPEG, GIF, or WebP · up to 10 MB</div>
 
-        <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
-          Shape
-        </div>
-        <div className="grid grid-cols-4 overflow-hidden rounded-lg border border-hairline/40">
-          {BOT_AVATAR_CROPS.map((candidate, index) => (
-            <button
-              key={candidate}
-              type="button"
-              aria-pressed={crop === candidate}
-              onClick={() => onPatch({ avatarCrop: candidate })}
-              className={cn(
-                "py-1.5 text-[12.5px]",
-                index > 0 && "border-l border-hairline/40",
-                crop === candidate ? "bg-control text-ink" : "text-ink-secondary hover:bg-control/60 hover:text-ink",
-              )}
-            >
-              {CROP_LABEL[candidate]}
-            </button>
-          ))}
-        </div>
-
-        {crop === "mascot" && (
+        {nativeMascot ? (
           <>
-            <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
-              Expression
+            <div className="mt-4 flex min-w-0 items-center gap-3 rounded-xl border border-hairline/40 bg-inset px-3 py-2.5">
+              <MausAvatar
+                color={bot.color}
+                avatarDefinition={avatarDefinition}
+                state={activeState}
+                size={48}
+                animated={false}
+                label="Current mascot style"
+              />
+              <div className="min-w-0 flex-1">
+                <div className="text-[12px] font-medium text-ink">Current mascot style</div>
+                <div className="truncate text-[11px] text-ink-secondary">
+                  {currentStyleName}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAvatarLabOpen(true)}
+                className="shrink-0 rounded-lg px-2 py-1.5 text-[11.5px] font-medium text-accent hover:bg-control"
+              >
+                Edit
+              </button>
             </div>
-            <div className="grid grid-cols-5 gap-2">
-              {PICKABLE_STATES.map((expression) => (
-                <button
-                  key={expression}
-                  type="button"
-                  aria-pressed={activeState === expression}
-                  onClick={() => onPatch({ mascotExpression: expression })}
-                  className={cn(
-                    "flex h-[58px] items-center justify-center rounded-xl bg-inset transition-colors hover:bg-control",
-                    activeState === expression && "ring-2 ring-accent-border",
-                  )}
-                  title={expression}
-                  aria-label={`Use ${expression} expression`}
-                >
-                  <MausAvatar color={bot.color} state={expression} size={42} animated={false} />
-                </button>
-              ))}
-            </div>
-
             <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
               Color
             </div>
@@ -245,6 +259,29 @@ export function BotProfileAvatarCard({
                   title={color}
                   aria-label={`Use ${color} mascot color`}
                 />
+              ))}
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
+              Image crop
+            </div>
+            <div className="grid grid-cols-3 overflow-hidden rounded-lg border border-hairline/40">
+              {BOT_AVATAR_CROPS.filter((candidate) => candidate !== "mascot").map((candidate, index) => (
+                <button
+                  key={candidate}
+                  type="button"
+                  aria-pressed={crop === candidate}
+                  onClick={() => onPatch({ avatarCrop: candidate })}
+                  className={cn(
+                    "py-1.5 text-[12.5px]",
+                    index > 0 && "border-l border-hairline/40",
+                    crop === candidate ? "bg-control text-ink" : "text-ink-secondary hover:bg-control/60 hover:text-ink",
+                  )}
+                >
+                  {CROP_LABEL[candidate]}
+                </button>
               ))}
             </div>
           </>
@@ -346,6 +383,13 @@ export function BotProfileAvatarCard({
 
         {error && <div role="alert" className="mt-3 text-[12px] text-danger">{error}</div>}
       </div>
-    </div>
+      </div>
+      <AvatarLabDialog
+        open={avatarLabOpen}
+        bot={bot}
+        onApply={onPatch}
+        onClose={() => setAvatarLabOpen(false)}
+      />
+    </>
   );
 }

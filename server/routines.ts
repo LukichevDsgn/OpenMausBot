@@ -7,6 +7,7 @@ import type { RuntimeEvent } from "./contracts.ts";
 import type { RoutineRequestOperation } from "../shared/routine-request.ts";
 
 export type RoutineSchedule =
+  | { type: "manual" }
   | { type: "once"; at: number }
   | { type: "daily"; time: string; weekdays: number[] };
 
@@ -39,6 +40,10 @@ export interface Routine {
   createdAt: number;
   updatedAt: number;
 }
+
+export type ScheduledRoutine = Omit<Routine, "schedule"> & {
+  schedule: Exclude<RoutineSchedule, { type: "manual" }>;
+};
 
 export interface RoutineRun {
   id: string;
@@ -160,6 +165,7 @@ function cleanDays(days: unknown): number[] {
 }
 
 function cleanSchedule(schedule: RoutineSchedule): RoutineSchedule {
+  if (schedule?.type === "manual") return { type: "manual" };
   if (schedule?.type === "once") {
     const at = Number(schedule.at);
     if (!Number.isFinite(at)) throw new Error("Choose a valid date and time");
@@ -175,6 +181,7 @@ function cleanSchedule(schedule: RoutineSchedule): RoutineSchedule {
 
 /** Next wall-clock occurrence in this computer's timezone, strictly after `after`. */
 export function nextOccurrence(schedule: RoutineSchedule, after: number): number | null {
+  if (schedule.type === "manual") return null;
   if (schedule.type === "once") return schedule.at > after ? schedule.at : null;
   const [hour, minute] = schedule.time.split(":").map(Number);
   const weekdays = new Set(cleanDays(schedule.weekdays));
@@ -201,7 +208,7 @@ function sanitizeInput(input: RoutineInput): Omit<Routine, "id" | "createdAt" | 
     prompt,
     botId,
     runOn,
-    enabled: input.enabled !== false,
+    enabled: input.schedule?.type === "manual" ? false : input.enabled !== false,
     schedule: cleanSchedule(input.schedule),
     durationMinutes: Math.min(240, Math.max(15, Math.round(Number(input.durationMinutes) || 30))),
   };
@@ -263,8 +270,12 @@ export class RoutineManager {
     }
   }
 
-  listRoutines(): Routine[] {
-    return this.routines.map((r) => ({ ...r, schedule: { ...r.schedule } }));
+  listRoutines(): ScheduledRoutine[];
+  listRoutines(includeManual: true): Routine[];
+  listRoutines(includeManual = false): Routine[] {
+    return this.routines
+      .filter((routine) => includeManual || routine.schedule.type !== "manual")
+      .map((routine) => ({ ...routine, schedule: { ...routine.schedule } }));
   }
 
   listRuns(from?: number, to?: number): RoutineRun[] {
@@ -702,6 +713,7 @@ export class RoutineManager {
   }
 
   private initialOccurrence(schedule: RoutineSchedule, now: number): number | null {
+    if (schedule.type === "manual") return null;
     // Return the original time, not max(at, now): tick() already decides
     // whether a stale "once" run fires or is recorded as "missed" based on
     // how far past the scheduled time it is. Clamping to now here hides the

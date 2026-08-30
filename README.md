@@ -1,5 +1,7 @@
 > ⚠️ **No affiliation with any cryptocurrency.** OpenMausBot has no token. Any coin using the OpenMausBot, Maus, or SupaMaus name is not created, endorsed, or affiliated with this project or its maintainer. I have received no tokens, payment, or allocation from anyone, and I will not be endorsing any token.
 
+> ⚠️ **Unofficial custom fork.** This repository is a community fork of [OpenMausBot](https://github.com/milind-soni/OpenMausBot), based on source version **0.1.39**. It is not an official OpenMausBot release and has no official binary distribution. Use this repository as source only. See [What this fork changes](docs/FORK_DIFFERENCES.md) for the evidence-backed comparison.
+
 <div align="center">
 
 # OpenMausBot
@@ -16,28 +18,12 @@ Talk to them like contacts. Watch them work. Approve what matters.
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Electron](https://img.shields.io/badge/Electron-macOS%20%C2%B7%20Windows%20%C2%B7%20Ubuntu-2B2E3A?logo=electron&logoColor=9FEAF9)
 ![Agents](https://img.shields.io/badge/agents-Claude%20·%20Codex-d97757)
-[![Release](https://img.shields.io/badge/release-v0.1.37-1084fe)](https://github.com/milind-soni/openmausbot-releases/releases/tag/v0.1.37)
+![Source-only fork](https://img.shields.io/badge/status-source--only-orange)
 ![PRs](https://img.shields.io/badge/PRs-welcome-38d591)
 
 <br>
 
-<a href="https://github.com/milind-soni/openmausbot-releases/releases/download/v0.1.37/OpenMausBot.dmg">
-  <img src="https://img.shields.io/github/v/release/milind-soni/openmausbot-releases?style=for-the-badge&label=%E2%AC%87%EF%B8%8F%20%20Download%20for%20Mac%20%28Apple%20silicon%29&labelColor=070707&color=1084fe&cacheSeconds=300" alt="Download the latest OpenMausBot for Mac with Apple silicon (.dmg)" height="40">
-</a>
-&nbsp;
-<a href="https://github.com/milind-soni/openmausbot-releases/releases/download/v0.1.37/OpenMausBot-intel.dmg">
-  <img src="https://img.shields.io/github/v/release/milind-soni/openmausbot-releases?style=for-the-badge&label=%E2%AC%87%EF%B8%8F%20%20Download%20for%20Mac%20%28Intel%29&labelColor=070707&color=2a9d8f&cacheSeconds=300" alt="Download the latest OpenMausBot for Intel Macs (.dmg)" height="40">
-</a>
-&nbsp;
-<a href="https://github.com/milind-soni/openmausbot-releases/releases/download/v0.1.37/OpenMausBot-setup.exe">
-  <img src="https://img.shields.io/github/v/release/milind-soni/openmausbot-releases?style=for-the-badge&label=%E2%AC%87%EF%B8%8F%20%20Download%20for%20Windows&labelColor=070707&color=4cc2ff&cacheSeconds=300" alt="Download the latest OpenMausBot for Windows (.exe)" height="40">
-</a>
-&nbsp;
-<a href="https://github.com/milind-soni/openmausbot-releases/releases/download/v0.1.37/OpenMausBot-amd64.deb">
-  <img src="https://img.shields.io/github/v/release/milind-soni/openmausbot-releases?style=for-the-badge&label=%E2%AC%87%EF%B8%8F%20%20Download%20for%20Ubuntu&labelColor=070707&color=e95420&cacheSeconds=300" alt="Download the latest OpenMausBot for Ubuntu (.deb)" height="40">
-</a>
-
-<sub>[v0.1.37](https://github.com/milind-soni/openmausbot-releases/releases/tag/v0.1.37) &nbsp;·&nbsp; macOS: Apple silicon & Intel · signed & notarized .dmg &nbsp;·&nbsp; Windows: x64 installer &nbsp;·&nbsp; Ubuntu 24.04 x64: .deb or AppImage beta &nbsp;·&nbsp; [all releases](https://github.com/milind-soni/openmausbot-releases/releases)</sub>
+<sub>Source-only fork. Official upstream releases remain at [OpenMausBot releases](https://github.com/milind-soni/openmausbot-releases).</sub>
 
 <br>
 
@@ -55,6 +41,12 @@ Talk to them like contacts. Watch them work. Approve what matters.
 ---
 
 ## Why
+
+This fork preserves upstream history and credits while adding custom functionality. It does not represent the upstream maintainer's release or endorsement.
+
+## What this fork changes
+
+See [`docs/FORK_DIFFERENCES.md`](docs/FORK_DIFFERENCES.md).
 
 One assistant in one box is the wrong shape for agents. OpenMausBot is an open-source take on **Grok Bot** —
 it keeps the idea (AI as a *messaging app*: a roster of bots you chat with, each with its own personality,
@@ -223,21 +215,12 @@ See [MCP server setup and tool reference](docs/mcp-server.md).
 
 ## Quick start
 
-**Released builds ([v0.1.37](https://github.com/milind-soni/openmausbot-releases/releases/tag/v0.1.37)):** the harness server is embedded, so no separate server setup is required.
-
-| | Download | Install |
-|---|---|---|
-| **macOS** (Apple silicon) | [OpenMausBot.dmg](https://github.com/milind-soni/openmausbot-releases/releases/download/v0.1.37/OpenMausBot.dmg) | Drag it to Applications, open it. Signed & notarized. |
-| **macOS** (Intel) | [OpenMausBot-intel.dmg](https://github.com/milind-soni/openmausbot-releases/releases/download/v0.1.37/OpenMausBot-intel.dmg) | Same app, built for Intel Macs. Signed & notarized. |
-| **Windows** (x64) | [OpenMausBot-setup.exe](https://github.com/milind-soni/openmausbot-releases/releases/download/v0.1.37/OpenMausBot-setup.exe) | Run it — one-click, per-user, no admin rights. The installer isn't code-signed yet, so SmartScreen shows "unknown publisher": **More info → Run anyway**. |
-| **Ubuntu 24.04** (x64) | [OpenMausBot-amd64.deb](https://github.com/milind-soni/openmausbot-releases/releases/download/v0.1.37/OpenMausBot-amd64.deb) · [OpenMausBot.AppImage](https://github.com/milind-soni/openmausbot-releases/releases/download/v0.1.37/OpenMausBot.AppImage) | Install the `.deb` with APT (recommended), or make the AppImage executable and run it. Beta; GNOME is the supported desktop. |
-
-See the [Ubuntu Desktop guide](docs/linux-desktop.md) for installation, capabilities, and troubleshooting.
+This fork does not publish binaries. For official upstream builds, use the [upstream releases](https://github.com/milind-soni/openmausbot-releases). For this fork, follow the source setup below. See the [Ubuntu Desktop guide](docs/linux-desktop.md) for source-build capabilities and troubleshooting.
 
 **From source:**
 
 ```sh
-git clone https://github.com/milind-soni/OpenMausBot && cd OpenMausBot
+git clone <your-fork-url> && cd OpenMausBot-custom
 pnpm install
 
 pnpm dev:server    # harness server → 127.0.0.1:8799

@@ -2,8 +2,9 @@
 
 This directory is an isolated Cloudflare Worker for cloud account identity,
 installation ownership, and per-installation managed companion endpoints. It
-does **not** store or move local bots, chats, desktop SQLite state, prompts, or
-tool output.
+does **not** store or move local bots, chats, desktop SQLite state, or tool
+output. The only bot content it stores is a package the owner explicitly
+publishes through the BotMRR share API described below.
 
 ## What is included
 
@@ -17,6 +18,9 @@ tool output.
   installation credentials, or vice versa.
 - Exact-origin CORS, bounded JSON bodies, redacted errors, and `no-store` on
   every response.
+- Owner-scoped bot shares containing canonical `openmaus.package` Markdown.
+  Shares default to unlisted, may be private, retain immutable versions, and
+  never accept installation credentials as publishing authority.
 - One remotely managed Cloudflare Tunnel per installation. Its opaque public
   hostname routes to the Electron-owned gateway at `http://127.0.0.1:8812`
   (never the reusable LAN listener on `8810`) and is followed by a mandatory
@@ -35,7 +39,9 @@ endpoint resource IDs, lifecycle state, generation leases, redacted error
 codes, and installation-scoped action limits. `0005` adds the cleanup-attempt
 counter used for scheduled retry backoff. Endpoint rows deliberately do not
 cascade away with a hard installation deletion: losing the tunnel and DNS IDs
-would make operator cleanup impossible.
+would make operator cleanup impossible. `0006` adds bot-share metadata and
+immutable canonical package versions; deleting a share tombstones its metadata
+instead of rewriting version history.
 
 ## API surface
 
@@ -49,6 +55,39 @@ would make operator cleanup impossible.
 | `DELETE` | `/v1/installations/:id` | owning account bearer |
 | `GET` | `/v1/installations/self` | installation credential |
 | `GET`, `POST`, `DELETE` | `/v1/installations/self/endpoint` | installation credential |
+| `GET`, `POST` | `/v1/bot-shares` | account bearer |
+| `POST` | `/v1/bot-shares/:id/versions` | owning account bearer |
+| `POST` | `/v1/bot-shares/:id/visibility` | owning account bearer |
+| `DELETE` | `/v1/bot-shares/:id` | owning account bearer |
+| `GET` | `/v1/bot-shares/:id/package` | none; active unlisted only |
+| `GET` | `/s/:id` | none; active unlisted only |
+
+### Bot share contract
+
+`POST /v1/bot-shares` accepts `{ packageMarkdown, visibility? }`; visibility
+defaults to `unlisted`. `packageMarkdown` must parse as the existing BotMRR
+Markdown format and is re-rendered through the canonical exporter before it is
+stored. That removes unknown fields and preserves the export boundary: no
+credentials, OAuth state, grants, local paths, transcripts, memory, provider or
+model selection, or runtime state. The UTF-8 package is limited to 1,000,000
+bytes and each version records its SHA-256 and byte size. Only the two exact
+publish routes receive a larger bounded request reader; the global API body cap
+remains 16 KiB.
+
+Updating uses `{ packageMarkdown, expectedActiveVersion }`. It inserts the next
+immutable version and advances `activeVersion` atomically. A stale expected
+version returns `409 version_conflict`; it never overwrites or edits an existing
+version. Visibility updates do not create package versions. Delete tombstones
+the share, owner lists exclude it, and retained versions remain inaccessible.
+
+Share IDs are opaque 21-character URL-safe values. Public package and landing
+routes deliberately fail closed with the same 404 for private, deleted,
+unknown, and malformed IDs. The HTML landing page contains escaped name,
+summary, active version, and one `openmausbot://install` link. It has no script
+and ships a restrictive CSP. The desktop accepts that deep link only when its
+package URL exactly matches
+`https://accounts.openmausbot.com/v1/bot-shares/<21-char-id>/package`; the
+existing GitHub package allowlist remains separate.
 
 Installation registration requires a stable `clientInstanceId`, a display
 `name`, and a `platform` of `darwin`, `windows`, or `linux`; `appVersion` is

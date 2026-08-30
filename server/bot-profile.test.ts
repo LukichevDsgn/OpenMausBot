@@ -59,4 +59,40 @@ describe("parseBotProfilePatch (both modes)", () => {
       error: "avatarCrop must be mascot, circle, rounded, or square",
     });
   });
+
+  it("accepts and clears a supported procedural avatar", () => {
+    const avatarDefinition = {
+      version: 1 as const,
+      seed: "avatar-1",
+      silhouette: "pebble" as const,
+      eyeStyle: "wide" as const,
+      mouthStyle: "soft" as const,
+      avatarPresetId: "citrus" as const,
+      restingAnimationId: "idle" as const,
+    };
+    expect(parseBotProfilePatch({ avatarDefinition }, true)).toEqual({
+      ok: true,
+      patch: { avatarDefinition },
+    });
+    expect(parseBotProfilePatch({ avatarDefinition: null }, true)).toEqual({
+      ok: true,
+      patch: { avatarDefinition: undefined },
+    });
+  });
+
+  it("refuses unsupported procedural ids with one actionable error", () => {
+    // SAFETY: intentionally violates the compile-time preset union to exercise the runtime boundary.
+    expect(parseBotProfilePatch({
+      avatarDefinition: {
+        version: 1,
+        seed: "avatar-1",
+        silhouette: "raw-svg",
+        eyeStyle: "wide",
+        mouthStyle: "soft",
+      },
+    } as never, true)).toEqual({
+      ok: false,
+      error: "avatarDefinition must use version 1 and supported seed, silhouette, eye, and mouth presets",
+    });
+  });
 });

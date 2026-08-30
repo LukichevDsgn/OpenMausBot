@@ -18,7 +18,9 @@ big changes should have an issue agreeing on the approach before code.
 ## Checklist
 
 - [ ] `pnpm typecheck` and `pnpm test` pass locally
+- [ ] `pnpm check:secrets` passes locally
 - [ ] Server behavior changes come with tests (see CONTRIBUTING.md → Tests)
 - [ ] No `dist-server/` edits (it's build output)
 - [ ] macOS-only code is platform-gated; no `shell: true` / cmd.exe string-building
 - [ ] No secrets in logs, responses, events, or argv
+- [ ] No runtime/config files, release output, signing material, or provider credentials are included

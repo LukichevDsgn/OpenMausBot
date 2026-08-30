@@ -1,13 +1,16 @@
 import { z } from "zod";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
+import { botProceduralAvatarSchema } from "../shared/bot-avatar.ts";
 import { schemaIssue, type JsonValue } from "./schema.ts";
 import type { MausColor } from "./store.ts";
-import type { TeamManifestMember } from "./team-manifest.ts";
+import { BOT_INSTRUCTIONS_MAX_CHARS, type TeamManifestMember } from "./team-manifest.ts";
+import { MAX_MANUAL_SKILLS } from "./skill-library.ts";
 
 export const BOT_PACKAGE_FORMAT = "openmaus.package" as const;
 export const BOT_PACKAGE_VERSION = 1 as const;
 export const BOTMRR_MARKDOWN_VERSION = 1 as const;
+export const BOT_PACKAGE_SKILLS_VERSION = 1 as const;
 
 const COLORS = [
   "green",
@@ -32,8 +35,39 @@ const optionalText = (max: number) =>
     .refine((value) => value === undefined || value.length <= max, { message: "is too long" })
     .optional();
 
+const portableSource = optionalText(2_000).refine(
+  (value) => value === undefined || !/^(?:[a-z]:[\\/]|[\\/]|\\\\|file:)/i.test(value),
+  { message: "must not be an absolute path" },
+);
+
 const key = requiredText(64).regex(/^[a-z0-9][a-z0-9_-]*$/, {
   message: "may only contain lowercase letters, numbers, - and _",
+});
+
+const skillId = requiredText(64).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, {
+  message: "must be a lowercase skill id",
+});
+
+const skillInstructions = z.string({ error: "must be text" })
+  .min(1, { message: "is required" })
+  .max(256 * 1024, { message: "is too long" })
+  .refine((value) => Buffer.byteLength(value, "utf8") <= 256 * 1024, { message: "is too large" })
+  .refine((value) => /^---\r?\n/.test(value), { message: "must start with SKILL.md frontmatter" });
+
+const portableSkillSchema = z.object({
+  id: skillId,
+  name: requiredText(100),
+  version: requiredText(30).regex(/^\d+\.\d+\.\d+$/, { message: "must be semantic versioning" }),
+  description: requiredText(1_024),
+  defaultEnabled: z.boolean(),
+  triggerTerms: z.array(requiredText(120)).min(1).max(30),
+  requiredCapabilities: z.array(requiredText(120)).max(30),
+  tools: z.array(requiredText(120).regex(/^[a-z0-9]+(?:[-_][a-z0-9]+)*$/, { message: "must be a tool id" })).max(30),
+  dependencies: z.array(skillId).max(MAX_MANUAL_SKILLS).optional(),
+  origin: z.enum(["built-in", "recorded", "imported"]),
+  source: portableSource,
+  importedAt: optionalText(80),
+  instructions: skillInstructions,
 });
 
 const packageSchema = z.object({
@@ -66,12 +100,14 @@ const packageSchema = z.object({
       key,
       name: requiredText(100),
       title: optionalText(200),
-      description: optionalText(4_000),
+      description: optionalText(BOT_INSTRUCTIONS_MAX_CHARS),
       appearance: z.object({
         color: z.enum(COLORS, { error: "is not supported" }),
         mascotExpression: optionalText(80),
+        avatarDefinition: botProceduralAvatarSchema.optional(),
       }),
       playbooks: z.array(key).max(40).optional(),
+       skillIds: z.array(skillId).max(MAX_MANUAL_SKILLS).optional(),
     })).min(1).max(200),
     chiefOfStaff: key.optional(),
     rooms: z.array(z.object({
@@ -92,6 +128,7 @@ const packageSchema = z.object({
       prompt: requiredText(20_000),
       runOn: z.enum(["maus", "cloud"]),
       schedule: z.discriminatedUnion("type", [
+        z.object({ type: z.literal("manual") }),
         z.object({ type: z.literal("once"), at: z.number().int() }),
         z.object({
           type: z.literal("daily"),
@@ -109,6 +146,10 @@ const packageSchema = z.object({
       triggers: z.array(requiredText(100)).min(1).max(30),
       instructions: requiredText(24_000),
     })).max(80).optional(),
+    skills: z.object({
+      version: z.literal(BOT_PACKAGE_SKILLS_VERSION),
+      entries: z.array(portableSkillSchema).min(1).max(MAX_MANUAL_SKILLS),
+    }).optional(),
     examples: z.array(z.object({
       title: requiredText(120),
       input: requiredText(4_000),
@@ -121,6 +162,7 @@ export type ParsedBotPackage = z.infer<typeof packageSchema>;
 export type BotPackageDefinition = ParsedBotPackage["package"];
 export type BotPackageAgent = BotPackageDefinition["agents"][number];
 export type BotPackagePlaybook = NonNullable<BotPackageDefinition["playbooks"]>[number];
+export type BotPackageSkill = NonNullable<BotPackageDefinition["skills"]>["entries"][number];
 
 export function isBotPackage(value: unknown): boolean {
   if (typeof value === "string") return /^---\r?\n[\s\S]*?\bbotmrr:\s*1\b/m.test(value);
@@ -172,8 +214,20 @@ export function parseBotPackage(value: JsonValue | ParsedBotPackage): ParsedBotP
   };
   const agents = unique(pkg.agents.map((agent) => agent.key), "agent");
   const playbooks = unique((pkg.playbooks ?? []).map((playbook) => playbook.key), "playbook");
+  const skills = unique((pkg.skills?.entries ?? []).map((skill) => skill.id), "skill");
   unique((pkg.rooms ?? []).map((room) => room.key), "room");
   unique((pkg.routines ?? []).map((routine) => routine.key), "routine");
+  const referencedSkills = new Set<string>();
+
+  for (const skill of pkg.skills?.entries ?? []) {
+    const dependencies = skill.dependencies ?? [];
+    if (new Set(dependencies).size !== dependencies.length) {
+      throw new Error(`Duplicate dependency in skill ${skill.id}: ${skill.id}`);
+    }
+    if (dependencies.includes(skill.id)) {
+      throw new Error(`Skill ${skill.id} cannot depend on itself`);
+    }
+  }
 
   if (pkg.chiefOfStaff && !agents.has(pkg.chiefOfStaff)) {
     throw new Error(`Unknown Chief of Staff: ${pkg.chiefOfStaff}`);
@@ -182,6 +236,14 @@ export function parseBotPackage(value: JsonValue | ParsedBotPackage): ParsedBotP
     for (const playbook of agent.playbooks ?? []) {
       if (!playbooks.has(playbook)) throw new Error(`Agent ${agent.key} references unknown playbook: ${playbook}`);
     }
+    const agentSkills = unique(agent.skillIds ?? [], `skill in agent ${agent.key}`);
+    for (const skill of agentSkills) {
+      if (!skills.has(skill)) throw new Error(`Agent ${agent.key} references unknown skill: ${skill}`);
+      referencedSkills.add(skill);
+    }
+  }
+  for (const skill of skills) {
+    if (!referencedSkills.has(skill)) throw new Error(`Skill ${skill} is not referenced by an agent`);
   }
   for (const room of pkg.rooms ?? []) {
     const members = unique(room.members, `member in room ${room.key}`);
@@ -223,7 +285,7 @@ export function renderBotPackageMarkdown(document: ParsedBotPackage): string {
   const routines = (pkg.routines ?? []).map((routine) => [
     `### ${routine.name}`,
     `**Owner:** \`${routine.agent}\`  `,
-    `**Schedule:** ${routine.schedule.type === "daily" ? `${routine.schedule.time} on weekdays ${routine.schedule.weekdays.join(", ")}` : `once at ${routine.schedule.at}`}  `,
+    `**Schedule:** ${routine.schedule.type === "manual" ? "manual only" : routine.schedule.type === "daily" ? `${routine.schedule.time} on weekdays ${routine.schedule.weekdays.join(", ")}` : `once at ${routine.schedule.at}`}  `,
     "**Initial state:** paused — the user must enable it",
     "",
     routine.prompt,
@@ -255,14 +317,14 @@ export function renderBotPackageMarkdown(document: ParsedBotPackage): string {
 }
 
 export function packageAgentAsMember(agent: BotPackageAgent): TeamManifestMember {
+  const appearance: TeamManifestMember["appearance"] = { color: agent.appearance.color };
+  if (agent.appearance.mascotExpression) appearance.mascotExpression = agent.appearance.mascotExpression;
+  if (agent.appearance.avatarDefinition) appearance.avatarDefinition = agent.appearance.avatarDefinition;
   return {
     key: agent.key,
     name: agent.name,
     title: agent.title ?? "",
     description: agent.description ?? "",
-    appearance: {
-      color: agent.appearance.color,
-      ...(agent.appearance.mascotExpression ? { mascotExpression: agent.appearance.mascotExpression } : {}),
-    },
+    appearance,
   };
 }

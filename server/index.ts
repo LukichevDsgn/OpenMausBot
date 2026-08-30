@@ -168,6 +168,7 @@ import {
   listSkills,
   readSkillFile,
   removeSkill,
+  isSkillName,
   setSkillEnabled,
   syncSkillLinks,
 } from "./skills.ts";
@@ -178,11 +179,17 @@ import { LocalVmLease, LocalVmLeasePool } from "./local-vm-lease.ts";
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import { redactSecretsInText } from "./redact.ts";
 import * as vps from "./vps-computer.ts";
-import { RoutineManager, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
+import { RoutineManager, type RoutineRunOn, type RoutineRunTrigger, type ScheduledRoutine } from "./routines.ts";
 import { RoutineRequestService } from "./routine-requests.ts";
 import { fetchBotDirectory, matchDirectoryBots, type MatchedDirectoryBot } from "./bot-directory.ts";
 import { scoutProject, suggestTeam } from "./project-scout.ts";
-import { fetchGithubTeam, fetchLibraryTeam, fetchTeamCatalog } from "./team-library.ts";
+import { fetchGithubTeam, fetchLibraryTeam, fetchSharedBotPackage, fetchTeamCatalog } from "./team-library.ts";
+import {
+  fetchGrokBotPackage,
+  GROK_BOT_RECIPE_MAX_BYTES,
+  grokBotRecipeToPackage,
+  isGrokBotRecipe,
+} from "./grok-bot-template.ts";
 import { isBotPackage, packageAgentAsMember, parseBotPackage, renderBotPackageMarkdown } from "./bot-package.ts";
 import { createTeamManifest, importedMemberProfile, parseTeamManifest } from "./team-manifest.ts";
 import { readThreadEvents } from "./thread-events.ts";
@@ -193,8 +200,10 @@ import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import {
   loadBundledSkills,
   enabledProviderCapabilityIds,
+  MAX_MANUAL_SKILLS,
+  removeGlobalImportedSkill,
   renderSkillInstructions,
-  selectExactSkill,
+  selectExactSkills,
   skillCatalog,
   validateSkillGrantPatch,
   type SkillSelection,
@@ -304,11 +313,11 @@ function phoneIntegration() {
 
 function skillSelectionFor(
   bot: NonNullable<ReturnType<typeof store.bot>>,
-  skillId: string | undefined,
+  skillIds: readonly string[],
   capabilities: Iterable<string>,
 ): SkillSelection {
-  return selectExactSkill(
-    skillId,
+  return selectExactSkills(
+    skillIds,
     capabilities,
     availableSkills(),
     { skillGrants: bot.skillGrants, skillToolGrants: bot.skillToolGrants },
@@ -507,6 +516,92 @@ function checkedMemberIds(value: unknown): { ok: true; memberIds: string[] } | {
   const memberIds = [...new Set(value as string[])];
   if (!memberIds.length) return { ok: false, error: "a channel needs at least one bot" };
   return { ok: true, memberIds };
+}
+
+type ExportSelection = { botIds: string[]; groupIds: string[] };
+
+function checkedExportSelection(
+  value: unknown,
+  bots: readonly { id: string; hidden?: boolean }[],
+  groups: readonly GroupRecord[],
+): { ok: true; selection: ExportSelection } | { ok: false; error: string } {
+  if (value === "all") {
+    const botIds = bots.filter((bot) => !bot.hidden).map((bot) => bot.id);
+    if (!botIds.length) return { ok: false, error: "scope selects no visible bots" };
+    return {
+      ok: true,
+      selection: {
+        botIds,
+        groupIds: groups
+          .filter((group) => !group.dm && group.memberIds.some((id) => botIds.includes(id)))
+          .map((group) => group.id),
+      },
+    };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { ok: false, error: 'scope must be "all" or an object with botIds' };
+  }
+  const scope = value as { botIds?: unknown; groupIds?: unknown };
+  if (!Array.isArray(scope.botIds) || !scope.botIds.length || scope.botIds.some((id) => typeof id !== "string" || !id.trim())) {
+    return { ok: false, error: "scope.botIds must be a non-empty list of bot IDs" };
+  }
+  const botIds = [...scope.botIds] as string[];
+  if (new Set(botIds).size !== botIds.length) return { ok: false, error: "scope.botIds must not contain duplicates" };
+  for (const id of botIds) {
+    const bot = bots.find((candidate) => candidate.id === id);
+    if (!bot) return { ok: false, error: `scope.botIds contains unknown bot ID "${id}"` };
+    if (bot.hidden) return { ok: false, error: `scope.botIds contains hidden bot ID "${id}"` };
+  }
+  let groupIds: string[] = [];
+  if (scope.groupIds !== undefined) {
+    if (!Array.isArray(scope.groupIds) || scope.groupIds.some((id) => typeof id !== "string" || !id.trim())) {
+      return { ok: false, error: "scope.groupIds must be a list of room IDs" };
+    }
+    groupIds = [...scope.groupIds] as string[];
+    if (new Set(groupIds).size !== groupIds.length) return { ok: false, error: "scope.groupIds must not contain duplicates" };
+  }
+  for (const id of groupIds) {
+    const group = groups.find((candidate) => candidate.id === id);
+    if (!group) return { ok: false, error: `scope.groupIds contains unknown room ID "${id}"` };
+    if (group.dm) return { ok: false, error: `scope.groupIds cannot include direct-message room "${id}"` };
+    if (!group.memberIds.some((memberId) => botIds.includes(memberId))) {
+      return { ok: false, error: `scope.groupIds room "${id}" has no selected visible bots` };
+    }
+  }
+  return { ok: true, selection: { botIds, groupIds } };
+}
+
+function checkedExportSkillIds(value: unknown, skills: ReturnType<typeof availableSkills>): { ok: true; ids: string[] } | { ok: false; error: string } {
+  if (value === undefined) return { ok: true, ids: [] };
+  if (!Array.isArray(value) || value.some((id) => typeof id !== "string" || !isSkillName(id))) {
+    return { ok: false, error: "skillIds must be a list of exact catalog ids" };
+  }
+  const ids = [...value] as string[];
+  if (new Set(ids).size !== ids.length) return { ok: false, error: "skillIds must not contain duplicates" };
+  if (ids.length > MAX_MANUAL_SKILLS) return { ok: false, error: `skillIds must contain at most ${MAX_MANUAL_SKILLS} ids` };
+  const known = new Set(skills.map((skill) => skill.manifest.id));
+  const unknown = ids.find((id) => !known.has(id));
+  if (unknown) return { ok: false, error: `skillIds contains unknown skill ID "${unknown}"` };
+  return { ok: true, ids };
+}
+
+function exportSkillOptions(selection: ExportSelection) {
+  const available = availableSkills();
+  const availableById = new Map(available.map((skill) => [skill.manifest.id, skill]));
+  const explicitGranted = new Set(
+    store.bots
+      .filter((bot) => selection.botIds.includes(bot.id) && !bot.hidden)
+      .flatMap((bot) => Array.isArray(bot.skillGrants) ? bot.skillGrants : []),
+  );
+  const transferable = [...explicitGranted]
+    .filter((id) => availableById.has(id))
+    .sort((a, b) => a.localeCompare(b))
+    .map((id) => availableById.get(id)!);
+  const skills = skillCatalog(transferable);
+  return {
+    skills,
+    defaultSelectedSkillIds: skills.map((skill) => skill.id),
+  };
 }
 let bootSelection = { instanceId: "", model: "" };
 const store = new Store(() => bootSelection);
@@ -1987,13 +2082,18 @@ bus.subscribe((event: RuntimeEvent) => {
 });
 
 function drainQueuedSends() {
-  drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds, skillId) =>
+  drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds, skillSelection) =>
     // A plain attended turn — no automationSource, no unattended, no comms
     // depth: exactly what typing the same words into an idle bot would run.
     // Drain just appended the held lines; userMessage keeps startTurn
     // from duplicating the last one, and excludeIds drops every drained
     // line from the transcript-replay so they are not also in `prompt`.
-    startTurn(botId, prompt, { threadId, userMessage, excludeMessageIds: excludeIds, skillId }).catch((err) => {
+    startTurn(botId, prompt, {
+      threadId,
+      userMessage,
+      excludeMessageIds: excludeIds,
+      ...(Array.isArray(skillSelection) ? { skillIds: skillSelection } : { skillId: skillSelection }),
+    }).catch((err) => {
       store.appendMessage(threadId, {
         role: "bot",
         kind: "activity",
@@ -2139,6 +2239,8 @@ async function startTurn(
      * masquerading as another message authored by the user. */
     connectorContinuation?: boolean;
     /** One exact app-wide skill manually chosen for this send. */
+    skillIds?: string[];
+    /** Legacy internal callers may still provide one scalar. */
     skillId?: string;
     cardContinuation?: boolean;
     /** Earlier text message this user turn is replying to. */
@@ -2210,7 +2312,7 @@ async function startTurn(
     bot,
     threadId,
     "direct",
-    opts?.skillId,
+    opts?.skillIds ?? (opts?.skillId ? [opts.skillId] : []),
     enabledProviderCapabilityIds(instance.adapter.capabilities),
   );
 
@@ -2748,7 +2850,7 @@ const routineRequests = new RoutineRequestService({
 });
 const ROUTINE_WEEKDAY_NAMES = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"] as const;
 const routineTimeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-const agentRoutine = (routine: ReturnType<RoutineManager["listRoutines"]>[number]) => {
+const agentRoutine = (routine: ScheduledRoutine) => {
   // Routines created in the calendar predate chat-card redaction and may
   // contain a credential in their instructions. The list result is handed
   // back to the model, so scrub the complete value before taking its preview.
@@ -2920,7 +3022,7 @@ async function runGroupMemberTurn(
   cardContinuation?: string,
   onDispatchError?: (message: string) => void,
   isCancelled?: () => boolean,
-  manualSkillId?: string,
+  manualSkillIds: readonly string[] = [],
 ): Promise<boolean> {
   if (isCancelled?.()) return false;
   const group = store.group(groupId);
@@ -2971,7 +3073,7 @@ async function runGroupMemberTurn(
       bot,
       group.threadId,
       "room",
-      manualSkillId,
+      manualSkillIds,
       enabledProviderCapabilityIds(instance.adapter.capabilities),
     );
   } catch (error) {
@@ -3226,7 +3328,7 @@ async function runGroupMemberTurn(
     for (const next of roomResponders(replyText, members, { kind: "mentions" })) {
       if (isCancelled?.()) return false;
       if (spoken.has(next.id)) continue;
-      if (!(await runGroupMemberTurn(groupId, threadId, next.id, hop + 1, spoken, undefined, undefined, isCancelled))) {
+      if (!(await runGroupMemberTurn(groupId, threadId, next.id, hop + 1, spoken, undefined, undefined, undefined, isCancelled, manualSkillIds))) {
         return false;
       }
     }
@@ -3234,7 +3336,7 @@ async function runGroupMemberTurn(
   return true;
 }
 
-function startGroupTurn(groupId: string, text: string, replyTo?: Message, skillId?: string) {
+function startGroupTurn(groupId: string, text: string, replyTo?: Message, skillIds: readonly string[] = []) {
   const group = store.group(groupId);
   if (!group) throw Object.assign(new Error("no such group"), { status: 404 });
   if (roomSetupPending(group)) {
@@ -3243,9 +3345,6 @@ function startGroupTurn(groupId: string, text: string, replyTo?: Message, skillI
   // Capture the active thread once. Every queued responder below is bound to
   // this task even if another client asks to switch later.
   const threadId = group.threadId;
-  store.appendMessage(threadId, { role: "user", kind: "text", text, replyToId: replyTo?.id });
-  if (!group.dm) store.titleGroupTaskFromFirstMessage(group.id, text, threadId);
-
   const members = group.memberIds
     .map((id) => store.bot(id))
     .filter((b): b is NonNullable<typeof b> => Boolean(b));
@@ -3261,20 +3360,27 @@ function startGroupTurn(groupId: string, text: string, replyTo?: Message, skillI
     const last = availableMembers.find((b) => b.id === lastSpeakerId) ?? availableMembers[0];
     responders = last ? [last] : [];
   }
-  if (skillId) {
+  let refusal: unknown;
+  if (skillIds.length) {
     for (const responder of responders) {
       const instance = registry.get(responder.modelSelection.instanceId);
-      if (!instance) continue;
-      manualSkillAdmission(
-        responder,
-        group.threadId,
-        "room",
-        skillId,
-        enabledProviderCapabilityIds(instance.adapter.capabilities),
-        { auditSuccess: false },
-      );
+      try {
+        manualSkillAdmission(
+          responder,
+          group.threadId,
+          "room",
+          skillIds,
+          instance ? enabledProviderCapabilityIds(instance.adapter.capabilities) : [],
+          { auditSuccess: false },
+        );
+      } catch (error) {
+        refusal ??= error;
+      }
     }
   }
+  if (refusal) throw refusal;
+  store.appendMessage(threadId, { role: "user", kind: "text", text, replyToId: replyTo?.id });
+  if (!group.dm) store.titleGroupTaskFromFirstMessage(group.id, text, threadId);
   if (mentionedArchived) {
     store.appendMessage(threadId, {
       role: "bot",
@@ -3332,7 +3438,7 @@ function startGroupTurn(groupId: string, text: string, replyTo?: Message, skillI
         undefined,
         undefined,
         () => operation.cancelled,
-        skillId,
+        skillIds,
       ))) break;
     }
   });
@@ -3835,7 +3941,7 @@ function json(res: ServerResponse, status: number, body: unknown) {
   res.end(data);
 }
 
-function readBody(req: IncomingMessage): Promise<any> {
+function readBody(req: IncomingMessage, maxBytes = 1_000_000): Promise<any> {
   return new Promise((resolve, reject) => {
     let data = "";
     let bytes = 0;
@@ -3849,7 +3955,7 @@ function readBody(req: IncomingMessage): Promise<any> {
     req.on("data", (c) => {
       if (done) return;
       bytes += typeof c === "string" ? Buffer.byteLength(c) : c.length;
-      if (bytes > 1_000_000) {
+      if (bytes > maxBytes) {
         // Keep draining the socket, but stop retaining attacker-controlled
         // bytes. Destroying the request here prevents the caller from
         // receiving the useful 413 response.
@@ -4537,7 +4643,7 @@ const server = createServer(async (req, res) => {
       const from = fromParam == null ? undefined : Number(fromParam);
       const to = toParam == null ? undefined : Number(toParam);
       return json(res, 200, {
-        routines: routines!.listRoutines(),
+        routines: routines!.listRoutines(true),
         runs: routines!.listRuns(from != null && Number.isFinite(from) ? from : undefined, to != null && Number.isFinite(to) ? to : undefined),
       });
     }
@@ -4905,6 +5011,12 @@ const server = createServer(async (req, res) => {
       const group = store.createGroup(name, memberIds, false, section, setup);
       return json(res, 201, { group: { ...publicGroupState(group), messages: [] } });
     }
+    if (method === "POST" && path === "/api/teams/export/options") {
+      const body = await readBody(req);
+      const selection = checkedExportSelection(body.scope, store.bots, store.groups);
+      if (!selection.ok) return json(res, 400, { error: selection.error });
+      return json(res, 200, exportSkillOptions(selection.selection));
+    }
     if (method === "POST" && path === "/api/teams/export") {
       const body = await readBody(req);
       const profileName = cfg.profile?.name?.trim();
@@ -4914,16 +5026,23 @@ const server = createServer(async (req, res) => {
           : profileName
             ? `${profileName}'s Team`
             : "My OpenMaus Team";
-      const memberIds = store.bots.filter((bot) => !bot.hidden).map((bot) => bot.id);
-      if (memberIds.length === 0) return json(res, 400, { error: "Create a bot before exporting your team" });
+      const selection = checkedExportSelection(body.scope, store.bots, store.groups);
+      if (!selection.ok) return json(res, 400, { error: selection.error });
+      const memberIds = selection.selection.botIds;
+      const selectedBots = store.bots.filter((bot) => memberIds.includes(bot.id));
+      const selectedGroups = store.groups.filter((group) => selection.selection.groupIds.includes(group.id));
+      const selectedSkills = checkedExportSkillIds(body.skillIds, availableSkills());
+      if (!selectedSkills.ok) return json(res, 400, { error: selectedSkills.error });
       try {
         if (body.format === "package") {
           const document = createBotPackageExport({
             name,
             authorName: profileName,
-            bots: store.bots,
-            groups: store.groups,
-            routines: routines!.listRoutines(),
+            bots: selectedBots,
+            groups: selectedGroups,
+            routines: routines!.listRoutines(true),
+            skillIds: selectedSkills.ids,
+            skills: availableSkills(),
           });
           return json(res, 200, {
             name: document.package.name,
@@ -4972,6 +5091,36 @@ const server = createServer(async (req, res) => {
       } catch (error) {
         const status = (error as { status?: number }).status === 404 ? 404 : 400;
         return json(res, status, { error: error instanceof Error ? error.message : "The GitHub team could not be loaded" });
+      }
+    }
+    if (method === "POST" && path === "/api/team-library/grok") {
+      const body = await readBody(req, GROK_BOT_RECIPE_MAX_BYTES);
+      if (isGrokBotRecipe(body)) {
+        try {
+          return json(res, 200, grokBotRecipeToPackage(body));
+        } catch (error) {
+          return json(res, 400, { error: error instanceof Error ? error.message : "The Grok Bot recipe could not be loaded" });
+        }
+      }
+      if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.url !== "string" || !body.url.trim()) {
+        return json(res, 400, { error: "A public Grok Bot URL is required" });
+      }
+      try {
+        return json(res, 200, await fetchGrokBotPackage(body.url));
+      } catch (error) {
+        return json(res, 400, { error: error instanceof Error ? error.message : "The Grok Bot could not be loaded" });
+      }
+    }
+    if (method === "POST" && path === "/api/team-library/shared") {
+      const body = await readBody(req);
+      if (typeof body.url !== "string" || !body.url.trim()) {
+        return json(res, 400, { error: "An OpenMausBot shared package URL is required" });
+      }
+      try {
+        return json(res, 200, await fetchSharedBotPackage(body.url));
+      } catch (error) {
+        const status = (error as { status?: number }).status === 404 ? 404 : 400;
+        return json(res, status, { error: error instanceof Error ? error.message : "The shared bot could not be loaded" });
       }
     }
     if (method === "GET" && path === "/api/teams/scout") {
@@ -5035,7 +5184,7 @@ const server = createServer(async (req, res) => {
           projectCwd = validated.cwd;
         }
       }
-      const body = await readBody(req);
+      const body = await readBody(req, GROK_BOT_RECIPE_MAX_BYTES);
       let packageDocument: ReturnType<typeof parseBotPackage> | null = null;
       let manifest: ReturnType<typeof parseTeamManifest> | null = null;
       try {
@@ -5047,8 +5196,43 @@ const server = createServer(async (req, res) => {
       const pkg = packageDocument?.package;
       const importName = pkg?.name ?? manifest!.team.name;
       const sourceMembers = pkg
-        ? pkg.agents.map((agent) => ({ member: packageAgentAsMember(agent), playbookKeys: agent.playbooks ?? [] }))
-        : manifest!.team.members.map((member) => ({ member, playbookKeys: [] as string[] }));
+        ? pkg.agents.map((agent) => ({
+            member: packageAgentAsMember(agent),
+            playbookKeys: agent.playbooks ?? [],
+            skillIds: agent.skillIds ?? [],
+          }))
+        : manifest!.team.members.map((member) => ({ member, playbookKeys: [] as string[], skillIds: [] as string[] }));
+
+      let installedPackageSkillIds: string[] = [];
+      if (pkg?.skills) {
+        const importedSkills = installGlobalSkillBatch(
+          globalSkillsRoot,
+          pkg.skills.entries.map((skill) => ({
+            source: skill.source ?? `package:${pkg.id}`,
+            files: [{ path: "SKILL.md", content: skill.instructions }],
+            manifest: {
+              id: skill.id,
+              name: skill.name,
+              version: skill.version,
+              description: skill.description,
+              defaultEnabled: skill.defaultEnabled,
+              triggerTerms: [...skill.triggerTerms],
+              requiredCapabilities: [...skill.requiredCapabilities],
+              tools: [...skill.tools],
+              ...(skill.dependencies ? { dependencies: [...skill.dependencies] } : {}),
+              origin: skill.origin,
+              ...(skill.source ? { source: skill.source } : {}),
+              ...(skill.importedAt ? { importedAt: skill.importedAt } : {}),
+            },
+          })),
+          { reservedIds: bundledSkills.map((skill) => skill.manifest.id) },
+        );
+        if ("error" in importedSkills) {
+          const status = importedSkills.kind === "collision" ? 409 : importedSkills.kind === "invalid" ? 400 : 500;
+          return json(res, status, { error: importedSkills.error });
+        }
+        installedPackageSkillIds = importedSkills.results.map((skill) => skill.id);
+      }
 
       // Snapshot before creating anything so replace never archives the new
       // team. Old bots are hidden only after every new bot was created; a
@@ -5085,6 +5269,7 @@ const server = createServer(async (req, res) => {
           }
         }
         const playbookByKey = new Map((pkg?.playbooks ?? []).map((playbook) => [playbook.key, playbook]));
+        const packageSkillById = new Map((pkg?.skills?.entries ?? []).map((skill) => [skill.id, skill]));
         for (const source of sourceMembers) {
           const member = source.member;
           // importedMemberProfile is the authority boundary: persona fields
@@ -5109,6 +5294,12 @@ const server = createServer(async (req, res) => {
           store.patchBot(created.id, {
             composio: false,
             ...(installedPlaybooks.length ? { playbooks: installedPlaybooks } : {}),
+            ...(pkg?.skills
+              ? {
+                  skillGrants: [...source.skillIds],
+                  skillToolGrants: [...new Set(source.skillIds.flatMap((id) => packageSkillById.get(id)?.tools ?? []))].sort(),
+                }
+              : {}),
             ...(pkg
               ? {
                   installedPackage: {
@@ -5191,7 +5382,7 @@ const server = createServer(async (req, res) => {
           archived,
           group,
           groups: createdGroups.map((created) => ({ ...created, messages: [] })),
-          routines: createdRoutineIds.flatMap((id) => routines!.listRoutines().filter((routine) => routine.id === id)),
+          routines: createdRoutineIds.flatMap((id) => routines!.listRoutines(true).filter((routine) => routine.id === id)),
         });
       } catch (error) {
         // A room of deleted members must not survive either — patchGroup can
@@ -5199,6 +5390,7 @@ const server = createServer(async (req, res) => {
         for (const routineId of createdRoutineIds) routines!.remove(routineId);
         for (const created of createdGroups) store.deleteGroup(created.id);
         for (const bot of importedBots) store.deleteBot(bot.id);
+        for (const id of installedPackageSkillIds) removeGlobalImportedSkill(globalSkillsRoot, id);
         throw error;
       }
     }
@@ -5446,8 +5638,8 @@ const server = createServer(async (req, res) => {
         return json(res, 409, { error: "the channel switched tasks before it could receive the message" });
       }
       const replyTo = resolveReplyTarget(group.threadId, body.replyToId);
-      const skillId = optionalSkillId(body.skillId);
-      startGroupTurn(group.id, text, replyTo, skillId);
+      const skillIds = optionalSkillIds(body);
+      startGroupTurn(group.id, text, replyTo, skillIds);
       return json(res, 202, { ok: true });
     }
     m = path.match(/^\/api\/groups\/([\w-]+)\/interrupt$/);
@@ -6106,23 +6298,23 @@ const server = createServer(async (req, res) => {
         return json(res, 409, { error: "the bot switched tasks before it could receive the message" });
       }
       const replyTo = resolveReplyTarget(bot.threadId, body.replyToId);
-      const skillId = optionalSkillId(body.skillId);
+      const skillIds = optionalSkillIds(body);
       // Claude can accept the message inside its live turn. If the write
       // loses a race with turn settlement, or the engine cannot steer, the
       // existing server-side queue records it atomically for the next turn.
       if (bot.busy) {
         const instance = registry.get(bot.modelSelection.instanceId);
-        if (skillId) {
+        if (skillIds.length) {
           manualSkillAdmission(
             bot,
             bot.threadId,
             "direct",
-            skillId,
+            skillIds,
             instance ? enabledProviderCapabilityIds(instance.adapter.capabilities) : [],
             { auditSuccess: false },
           );
         }
-        if (!skillId && instance?.adapter.capabilities.queueing && instance.adapter.steer) {
+        if (!skillIds.length && instance?.adapter.capabilities.queueing && instance.adapter.steer) {
           const steered = await instance.adapter
             .steer(bot.threadId, promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"))
             .catch(() => false);
@@ -6141,11 +6333,11 @@ const server = createServer(async (req, res) => {
         const queued = queueSteeredMessage(bot, text, {
           replyToId: replyTo?.id,
           prompt: promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"),
-          skillId,
+          skillIds,
         });
         return json(res, 202, { ok: true, queued: true, queueId: queued.id, threadId: bot.threadId });
       }
-      await startTurn(bot.id, text, { replyTo, skillId });
+      await startTurn(bot.id, text, { replyTo, skillIds });
       return json(res, 202, { ok: true });
     }
 
@@ -6570,6 +6762,25 @@ const server = createServer(async (req, res) => {
         results,
         skills: skillCatalog(availableSkills()),
       });
+    }
+    const importedSkillPath = path.match(/^\/api\/skills\/([^/]+)$/);
+    if (method === "DELETE" && importedSkillPath) {
+      let id: string;
+      try {
+        id = decodeURIComponent(importedSkillPath[1]!);
+      } catch {
+        return json(res, 400, { error: "invalid skill id" });
+      }
+      const catalogEntry = availableSkills().find((skill) => skill.manifest.id === id);
+      if (catalogEntry && catalogEntry.origin !== "imported") {
+        return json(res, 403, { error: "only imported skills can be removed here" });
+      }
+      const result = removeGlobalImportedSkill(globalSkillsRoot, id);
+      if ("error" in result) {
+        const status = /only imported/i.test(result.error) ? 403 : /no imported/i.test(result.error) ? 404 : 400;
+        return json(res, status, result);
+      }
+      return json(res, 200, { ok: true, skills: skillCatalog(availableSkills()) });
     }
     if (method === "GET" && path === "/api/skills/audit") {
       const rawLimit = url.searchParams.get("limit");
@@ -7279,24 +7490,52 @@ function optionalSkillId(value: unknown): string | undefined {
   return value.trim();
 }
 
+function optionalSkillIds(body: Record<string, unknown>): string[] {
+  const hasList = Object.hasOwn(body, "skillIds");
+  const hasScalar = Object.hasOwn(body, "skillId");
+  if (hasList && hasScalar) {
+    throw Object.assign(new Error("send either skillIds or legacy skillId, not both"), { status: 400 });
+  }
+  if (hasList) {
+    if (!Array.isArray(body.skillIds)) {
+      throw Object.assign(new Error("skillIds must be an array of exact catalog ids"), { status: 400 });
+    }
+    if (body.skillIds.length > MAX_MANUAL_SKILLS) {
+      throw Object.assign(new Error(`skillIds must contain at most ${MAX_MANUAL_SKILLS} ids`), { status: 400 });
+    }
+    const ids = body.skillIds.map((value) => {
+      if (typeof value !== "string" || !isSkillName(value)) {
+        throw Object.assign(new Error("skillIds must contain exact lowercase catalog ids"), { status: 400 });
+      }
+      return value;
+    });
+    if (new Set(ids).size !== ids.length) {
+      throw Object.assign(new Error("skillIds must not contain duplicates"), { status: 400 });
+    }
+    return ids;
+  }
+  const scalar = optionalSkillId(body.skillId);
+  return scalar ? [scalar] : [];
+}
+
 function manualSkillAdmission(
   bot: NonNullable<ReturnType<typeof store.bot>>,
   threadId: string,
   surface: "direct" | "room",
-  skillId: string | undefined,
+  skillIds: readonly string[],
   capabilities: Iterable<string>,
   options: { auditSuccess?: boolean } = {},
 ): SkillSelection {
-  const selection = skillSelectionFor(bot, skillId, capabilities);
-  if (!skillId) return selection;
-  const reason = selection.decisions[0]?.reason ?? "unknown";
-  if (reason === "selected") {
+  const selection = skillSelectionFor(bot, skillIds, capabilities);
+  if (!skillIds.length) return selection;
+  const refusal = selection.decisions.find((decision) => decision.reason !== "selected" && decision.reason !== "dependency");
+  if (!refusal) {
     if (options.auditSuccess !== false) auditSkillSelection(bot.id, threadId, surface, selection);
     return selection;
   }
   auditSkillSelection(bot.id, threadId, surface, selection);
-  throw Object.assign(new Error(`skill selection refused: ${reason}`), {
+  throw Object.assign(new Error(`skill selection refused: ${refusal.reason}`), {
     status: 409,
-    skillReason: reason,
+    skillReason: refusal.reason,
   });
 }

@@ -24,7 +24,12 @@ import {
   mergeRuntimePolicy,
 } from "./bot-runtime-policy.ts";
 import { scopeConflictReason } from "./handoff.ts";
-import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
+import {
+  botAvatarProfile,
+  generatedBotAvatar,
+  type BotAvatarCrop,
+  type BotProceduralAvatar,
+} from "../shared/bot-avatar.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 
 export type MausColor =
@@ -409,6 +414,8 @@ export interface BotRecord {
   avatarUrl?: string;
   /** Mascot, or the crop applied to avatarUrl. */
   avatarCrop?: BotAvatarCrop;
+  /** Versioned, app-owned parameters for the native procedural mascot. */
+  avatarDefinition?: BotProceduralAvatar;
   unread: boolean;
   modelSelection: ModelSelection;
   /** provider-native continuation per instance (e.g. claude session id) */
@@ -735,6 +742,14 @@ export class Store {
       }
       if (b.avatarCrop !== undefined && avatar.avatarCrop !== b.avatarCrop) {
         delete b.avatarCrop;
+        botsMigrated = true;
+      }
+      if (
+        b.avatarDefinition !== undefined &&
+        JSON.stringify(avatar.avatarDefinition) !== JSON.stringify(b.avatarDefinition)
+      ) {
+        if (avatar.avatarDefinition) b.avatarDefinition = avatar.avatarDefinition;
+        else delete b.avatarDefinition;
         botsMigrated = true;
       }
     }
@@ -1224,7 +1239,18 @@ export class Store {
 
   createBot(
     profile: Partial<
-      Pick<BotRecord, "name" | "title" | "description" | "color" | "mascotExpression" | "modelSelection" | "routingKey" | "section">
+      Pick<
+        BotRecord,
+        | "name"
+        | "title"
+        | "description"
+        | "color"
+        | "mascotExpression"
+        | "avatarDefinition"
+        | "modelSelection"
+        | "routingKey"
+        | "section"
+      >
     > = {},
     opts: {
       /** false = no greeting/onboarding seed. Imported bots must not open
@@ -1232,20 +1258,23 @@ export class Store {
       seedMessages?: boolean;
     } = {},
   ): BotRecord {
+    const id = newId();
+    const generatedAvatar = generatedBotAvatar(id);
     const name = profile.name?.trim() || pickBotName(this.bots.map((b) => b.name));
     const requestedRoutingKey = profile.routingKey?.trim() || defaultRoutingKey(name);
     const routingKey = requestedRoutingKey && !this.botByRoutingKey(requestedRoutingKey) ? requestedRoutingKey : undefined;
     const section = sectionKey(profile.section);
     const bot: BotRecord = {
-      id: newId(),
+      id,
       ...(routingKey ? { routingKey } : {}),
       threadId: newId(),
       name,
       title: profile.title ?? "",
       description: profile.description ?? "",
       notifications: true,
-      color: profile.color ?? COLORS[this.bots.length % COLORS.length],
-      ...(profile.mascotExpression ? { mascotExpression: profile.mascotExpression } : {}),
+      color: profile.color ?? generatedAvatar.color ?? COLORS[this.bots.length % COLORS.length],
+      mascotExpression: profile.mascotExpression ?? generatedAvatar.restingState,
+      avatarDefinition: profile.avatarDefinition ?? generatedAvatar.definition,
       unread: false,
       modelSelection: profile.modelSelection ?? this.defaultSelection(),
       chiefRuntimePolicyLocked: false,

@@ -64,6 +64,11 @@ function readyClient(overrides = {}) {
       connectorToken: CONNECTOR_TOKEN,
     })),
     listInstallations: vi.fn(async () => []),
+    listBotShares: vi.fn(async () => []),
+    createBotShare: vi.fn(async (_token, input) => ({ id: "Abcdefghijklmnopqrstu", ...input })),
+    updateBotShare: vi.fn(async (_token, shareId, input) => ({ id: shareId, ...input })),
+    setBotShareVisibility: vi.fn(async (_token, shareId, visibility) => ({ id: shareId, visibility })),
+    deleteBotShare: vi.fn(async () => {}),
     deleteEndpoint: vi.fn(async () => {}),
     revokeInstallation: vi.fn(async () => {}),
     signOut: vi.fn(async () => {}),
@@ -133,6 +138,32 @@ describe("Companion account service", () => {
       available: true,
       status: "signed-out",
     });
+  });
+
+  it("uses the stored account bearer for share actions without returning or mutating it", async () => {
+    const share = { id: "Abcdefghijklmnopqrstu", visibility: "unlisted" };
+    const client = readyClient({
+      listBotShares: vi.fn(async () => [share]),
+      createBotShare: vi.fn(async () => share),
+    });
+    const { service, store } = serviceFixture({ initial: signedCredentials(), client });
+
+    await expect(service.listBotShares()).resolves.toEqual([share]);
+    await expect(service.createBotShare({ packageMarkdown: "# safe" })).resolves.toEqual(share);
+    expect(client.listBotShares).toHaveBeenCalledWith(ACCOUNT_TOKEN);
+    expect(client.createBotShare).toHaveBeenCalledWith(ACCOUNT_TOKEN, { packageMarkdown: "# safe" });
+    expect(JSON.stringify(await service.listBotShares())).not.toContain(ACCOUNT_TOKEN);
+    expect(store.writes).toHaveLength(0);
+  });
+
+  it("fails share actions closed while signed out and never substitutes the installation credential", async () => {
+    const client = readyClient();
+    const { service } = serviceFixture({
+      initial: { [COMPANION_INSTALLATION_CREDENTIAL_FIELD]: INSTALLATION_CREDENTIAL },
+      client,
+    });
+    await expect(service.listBotShares()).rejects.toThrow("Sign in to publish");
+    expect(client.listBotShares).not.toHaveBeenCalled();
   });
 
   it("hides account onboarding until the configured control plane is healthy", async () => {

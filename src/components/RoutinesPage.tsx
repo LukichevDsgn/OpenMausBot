@@ -80,6 +80,7 @@ function niceTime(at: number) {
 }
 
 function scheduleLabel(routine: Routine) {
+  if (routine.schedule.type === "manual") return "Manual only";
   if (routine.schedule.type === "once") {
     return `${niceDate(routine.schedule.at)}, ${niceTime(routine.schedule.at)}`;
   }
@@ -94,6 +95,7 @@ function scheduleLabel(routine: Routine) {
 }
 
 function canToggleRoutine(routine: Routine) {
+  if (routine.schedule.type === "manual") return false;
   return routine.schedule.type === "daily" || routine.schedule.at > Date.now();
 }
 
@@ -159,6 +161,7 @@ function projectedItems(routines: Routine[], runs: RoutineRun[], from: number, t
 
   for (const routine of routines) {
     if (!routine.enabled) continue;
+    if (routine.schedule.type === "manual") continue;
     if (routine.schedule.type === "once") {
       const at = routine.schedule.at;
       if (at >= from && at < to && !hasReceipt(routine.id, at)) {
@@ -319,7 +322,9 @@ export function RoutineEditor({
   const [prompt, setPrompt] = useState(routine?.prompt ?? "");
   const [botId, setBotId] = useState(lockedBotId ?? routine?.botId ?? bots[0]?.id ?? "");
   const [runOn, setRunOn] = useState<RoutineRunOn>(routine?.runOn ?? defaultRunOn ?? "maus");
-  const [kind, setKind] = useState<"once" | "daily">(routine?.schedule.type ?? "daily");
+  const [kind, setKind] = useState<"once" | "daily">(
+    routine?.schedule.type === "once" ? "once" : "daily",
+  );
   const [at, setAt] = useState(
     toInputDateTime(routine?.schedule.type === "once" ? routine.schedule.at : nextHour()),
   );
@@ -547,6 +552,7 @@ function RoutineDetails({ item, bot, onClose, onEdit }: { item: CalendarItem; bo
 
 function PausedRoutines({ routines, bots, onClose, onEdit }: { routines: Routine[]; bots: Bot[]; onClose: () => void; onEdit: (routine: Routine) => void }) {
   const { dispatch } = useStore();
+  const [runningId, setRunningId] = useState<string | null>(null);
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-5 backdrop-blur-sm" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <div className="w-full max-w-[560px] overflow-hidden rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
@@ -561,7 +567,8 @@ function PausedRoutines({ routines, bots, onClose, onEdit }: { routines: Routine
               <div key={routine.id} className="flex items-center gap-3 rounded-xl border border-hairline/40 bg-inset p-3">
                 {bot ? <BotAvatar bot={bot} state="sleeping" size={44} animated={false} label={bot.name} /> : <div className="flex size-11 items-center justify-center rounded-xl bg-raised text-ink-secondary"><CalendarClock size={20} /></div>}
                 <div className="min-w-0 flex-1"><div className="truncate text-[14px] font-semibold text-ink">{routine.name}</div><div className="mt-0.5 truncate text-[11.5px] text-ink-secondary">{bot?.name ?? "Deleted MAUS"} · {scheduleLabel(routine)}</div></div>
-                {bot && <button onClick={() => dispatch({ type: "updateRoutine", routineId: routine.id, patch: { enabled: true } })} className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12px] font-medium text-white hover:brightness-110"><Play size={12} />Resume</button>}
+                {bot && routine.schedule.type === "manual" && <button disabled={runningId === routine.id} onClick={async () => { setRunningId(routine.id); try { const response = await api(`/api/routines/${routine.id}/run`, { method: "POST" }); if (response.run) dispatch({ type: "routineRunPatched", run: response.run }); } finally { setRunningId(null); } }} className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12px] font-medium text-white hover:brightness-110 disabled:opacity-40"><Play size={12} />Run now</button>}
+                {bot && routine.schedule.type !== "manual" && <button onClick={() => dispatch({ type: "updateRoutine", routineId: routine.id, patch: { enabled: true } })} className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12px] font-medium text-white hover:brightness-110"><Play size={12} />Resume</button>}
                 <button onClick={() => onEdit(routine)} className="rounded-lg px-2 py-1.5 text-[12px] text-ink-secondary hover:bg-raised hover:text-ink">Edit</button>
                 <button onClick={() => { if (!window.confirm(`Delete “${routine.name}”?`)) return; dispatch({ type: "deleteRoutine", routineId: routine.id }); }} className="rounded-lg p-2 text-ink-secondary hover:bg-danger/10 hover:text-danger" title="Delete routine"><Trash2 size={15} /></button>
               </div>
@@ -601,7 +608,7 @@ export function RoutinesPage() {
     : undefined;
   const unseenFailures = state.routineRuns.filter((run) => ["failed", "missed"].includes(run.status) && !run.seenAt).length;
   const running = state.routineRuns.filter((run) => ["queued", "running", "waiting"].includes(run.status)).length;
-  const paused = state.routines.filter((routine) => !routine.enabled && canToggleRoutine(routine));
+  const paused = state.routines.filter((routine) => !routine.enabled && (routine.schedule.type === "manual" || canToggleRoutine(routine)));
   useEffect(() => {
     if (pausedOpen && paused.length === 0) setPausedOpen(false);
   }, [pausedOpen, paused.length]);

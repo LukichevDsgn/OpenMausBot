@@ -2,8 +2,8 @@
 // disabling one does not require changing a provider driver. A future Skills
 // UI can use the same manifests; today enabled built-ins are selected by their
 // declared trigger terms and mounted capabilities.
-import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { basename, join } from "node:path";
+import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 
 export interface SkillManifest {
   id: string;
@@ -15,6 +15,8 @@ export interface SkillManifest {
   requiredCapabilities: string[];
   /** Tool ids owned by this skill. A declaration is not itself a grant. */
   tools: string[];
+  /** Lowercase skill ids that must be selected and admitted with this skill. */
+  dependencies?: string[];
 }
 
 export interface BundledSkill {
@@ -43,11 +45,16 @@ export interface SkillGrantState {
 
 export type SkillSelectionReason =
   | "selected"
+  | "dependency"
   | "unknown"
   | "trigger-mismatch"
   | "skill-denied"
   | "capability-missing"
-  | "tool-denied";
+  | "tool-denied"
+  | "dependency-missing"
+  | "dependency-cycle"
+  | "dependency-invalid"
+  | "selection-overflow";
 
 export interface SkillDecision {
   skillId: string;
@@ -71,6 +78,7 @@ export interface SkillCatalogEntry {
   triggerTerms: string[];
   requiredCapabilities: string[];
   tools: string[];
+  dependencies: string[];
   origin: SkillOrigin;
   status: "available";
   source?: string;
@@ -78,6 +86,8 @@ export interface SkillCatalogEntry {
   warnings: string[];
   skippedFiles: string[];
 }
+
+export const MAX_MANUAL_SKILLS = 8;
 
 /** Provider capability ids admitted to skill manifests. Only literal true
  * flags count; string/array capability metadata is intentionally excluded.
@@ -117,10 +127,12 @@ export function parseSkillManifest(value: unknown, directory: string): SkillMani
   let triggerTerms: string[] | null;
   let requiredCapabilities: string[] | null;
   let tools: string[] | null;
+  let dependencies: string[] | undefined;
   try {
     triggerTerms = stringList(raw.triggerTerms);
     requiredCapabilities = stringList(raw.requiredCapabilities);
     tools = stringList(raw.tools);
+    dependencies = raw.dependencies === undefined ? undefined : stringList(raw.dependencies) ?? undefined;
   } catch {
     throw new Error(`${directory}/manifest.json has duplicate list entries`);
   }
@@ -132,6 +144,11 @@ export function parseSkillManifest(value: unknown, directory: string): SkillMani
   if (!triggerTerms?.length) throw new Error(`${directory}/manifest.json has no trigger terms`);
   if (!requiredCapabilities) throw new Error(`${directory}/manifest.json has invalid capabilities`);
   if (!tools || tools.some((tool) => !SAFE_TOOL_ID.test(tool))) throw new Error(`${directory}/manifest.json has invalid tools`);
+  if (raw.dependencies !== undefined && !dependencies) throw new Error(`${directory}/manifest.json has invalid dependencies`);
+  if (dependencies?.some((dependency) => !SAFE_ID.test(dependency))) {
+    throw new Error(`${directory}/manifest.json has invalid dependencies`);
+  }
+  if (dependencies?.includes(id)) throw new Error(`${directory}/manifest.json has a self dependency`);
   return {
     id,
     name: raw.name.trim(),
@@ -141,6 +158,7 @@ export function parseSkillManifest(value: unknown, directory: string): SkillMani
     triggerTerms,
     requiredCapabilities,
     tools,
+    ...(dependencies ? { dependencies } : {}),
   };
 }
 
@@ -193,6 +211,7 @@ export function skillCatalog(skills: readonly BundledSkill[]): SkillCatalogEntry
     triggerTerms: [...manifest.triggerTerms],
     requiredCapabilities: [...manifest.requiredCapabilities],
     tools: [...manifest.tools],
+    dependencies: [...(manifest.dependencies ?? [])],
     origin,
     status: "available",
     ...(metadata?.source ? { source: metadata.source } : {}),
@@ -298,6 +317,83 @@ export function decideBundledSkills(
   };
 }
 
+export type SkillDependencyExpansionError =
+  | "unknown"
+  | "dependency-missing"
+  | "dependency-cycle"
+  | "dependency-invalid"
+  | "selection-overflow";
+
+export interface SkillDependencyExpansion {
+  /** Stable post-order: dependencies appear before the skill that requires them. */
+  ids: string[];
+  /** Dependencies encountered during traversal, excluding manual roots at use time. */
+  dependencyIds: string[];
+  error?: { reason: SkillDependencyExpansionError; skillId: string; relatedIds?: string[] };
+}
+
+/** Expand only an explicit manual selection. There is no trigger-based path
+ * here. Roots retain request order; each manifest's dependencies are visited
+ * in stable id order, yielding dependency-before-dependent instructions. */
+export function expandSkillDependencies(
+  skillIds: readonly string[],
+  skills: readonly BundledSkill[],
+  max = MAX_MANUAL_SKILLS,
+): SkillDependencyExpansion {
+  const byId = new Map(skills.map((skill) => [skill.manifest.id, skill]));
+  const ids: string[] = [];
+  const dependencyIds = new Set<string>();
+  const visited = new Set<string>();
+  const visiting = new Set<string>();
+  const stack: string[] = [];
+  let error: SkillDependencyExpansion["error"];
+
+  const visit = (id: string): void => {
+    if (error || visited.has(id)) return;
+    if (visiting.has(id)) {
+      const cycleStart = stack.indexOf(id);
+      error = { reason: "dependency-cycle", skillId: id, relatedIds: stack.slice(cycleStart) };
+      return;
+    }
+    const skill = byId.get(id);
+    if (!skill) {
+      error = { reason: "unknown", skillId: id };
+      return;
+    }
+    const dependencies = skill.manifest.dependencies ?? [];
+    if (!Array.isArray(dependencies) || new Set(dependencies).size !== dependencies.length ||
+      dependencies.some((dependency) => !SAFE_ID.test(dependency) || dependency === id)) {
+      error = { reason: "dependency-invalid", skillId: id };
+      return;
+    }
+    visiting.add(id);
+    stack.push(id);
+    for (const dependency of [...dependencies].sort(compareDeterministically)) {
+      dependencyIds.add(dependency);
+      if (!byId.has(dependency)) {
+        error = { reason: "dependency-missing", skillId: dependency, relatedIds: [id] };
+        break;
+      }
+      visit(dependency);
+      if (error) break;
+    }
+    stack.pop();
+    visiting.delete(id);
+    if (error) return;
+    visited.add(id);
+    ids.push(id);
+  };
+
+  for (const skillId of skillIds) {
+    visit(skillId);
+    if (error) break;
+  }
+  if (!error && ids.length > max) {
+    error = { reason: "selection-overflow", skillId: ids[max]!, relatedIds: ids.slice(max) };
+  }
+  return { ids, dependencyIds: [...dependencyIds].sort(compareDeterministically), ...(error ? { error } : {}) };
+}
+
 /** Exact manual selection for one send. Trigger terms deliberately do not
  * participate: ordinary text is manual-only, and an omitted id selects
  * nothing. Grants and provider capabilities remain server-authoritative. */
@@ -307,32 +403,65 @@ export function selectExactSkill(
   skills: readonly BundledSkill[],
   grants: SkillGrantState = {},
 ): SkillSelection {
-  if (!skillId) return { selectedSkills: [], mountedSkillToolIds: [], decisions: [] };
-  const skill = skills.find(({ manifest }) => manifest.id === skillId);
-  if (!skill) {
-    return {
-      selectedSkills: [],
-      mountedSkillToolIds: [],
-      decisions: [{ skillId, reason: "unknown", requiredCapabilities: [], declaredToolIds: [] }],
-    };
-  }
-  const { manifest } = skill;
+  return selectExactSkills(skillId ? [skillId] : [], capabilities, skills, grants);
+}
+
+/** Exact manual selection for a bounded batch. Dependencies are expanded in
+ * stable post-order; a refusal returns no selected skills, so a partial grant
+ * can never produce a partial send. */
+export function selectExactSkills(
+  skillIds: readonly string[],
+  capabilities: Iterable<string>,
+  skills: readonly BundledSkill[],
+  grants: SkillGrantState = {},
+): SkillSelection {
   const grantedSkills = new Set(effectiveSkillIds(skills, grants));
   const grantedTools = new Set(effectiveSkillToolIds(skills, grants));
   const available = new Set(capabilities);
-  let reason: SkillSelectionReason = "selected";
-  if (!grantedSkills.has(skillId)) reason = "skill-denied";
-  else if (!manifest.requiredCapabilities.every((capability) => available.has(capability))) reason = "capability-missing";
-  else if (!manifest.tools.every((tool) => grantedTools.has(tool))) reason = "tool-denied";
-  const decision: SkillDecision = {
-    skillId,
-    reason,
-    requiredCapabilities: [...manifest.requiredCapabilities],
-    declaredToolIds: [...manifest.tools],
+  const roots = new Set(skillIds);
+  const expansion = expandSkillDependencies(skillIds, skills);
+  const decisionIds = [...new Set([
+    ...(expansion.error ? skillIds : expansion.ids),
+    ...expansion.ids,
+    ...(expansion.error?.relatedIds ?? []),
+    ...(expansion.error ? [expansion.error.skillId] : []),
+  ])];
+  const cycleIds = new Set(expansion.error?.reason === "dependency-cycle" ? expansion.error.relatedIds : []);
+  const decisions: SkillDecision[] = decisionIds.map((skillId) => {
+    const skill = skills.find(({ manifest }) => manifest.id === skillId);
+    if (!skill) {
+      return {
+        skillId,
+        reason: expansion.error?.skillId === skillId ? expansion.error.reason : "unknown",
+        requiredCapabilities: [],
+        declaredToolIds: [],
+      };
+    }
+    const { manifest } = skill;
+    let reason: SkillSelectionReason = roots.has(skillId) ? "selected" : "dependency";
+    if (cycleIds.has(skillId)) reason = "dependency-cycle";
+    else if (expansion.error?.skillId === skillId && expansion.error.reason !== "selection-overflow") reason = expansion.error.reason;
+    else if (expansion.error?.reason === "selection-overflow" && skillId === expansion.error.skillId) reason = "selection-overflow";
+    else if (!grantedSkills.has(skillId)) reason = "skill-denied";
+    else if (!manifest.requiredCapabilities.every((capability) => available.has(capability))) reason = "capability-missing";
+    else if (!manifest.tools.every((tool) => grantedTools.has(tool))) reason = "tool-denied";
+    return {
+      skillId,
+      reason,
+      requiredCapabilities: [...manifest.requiredCapabilities],
+      declaredToolIds: [...manifest.tools],
+    };
+  });
+  if (decisions.some((decision) => decision.reason !== "selected" && decision.reason !== "dependency")) {
+    return { selectedSkills: [], mountedSkillToolIds: [], decisions };
+  }
+  const byId = new Map(skills.map((skill) => [skill.manifest.id, skill]));
+  const selectedSkills = expansion.ids.map((skillId) => byId.get(skillId)!).filter(Boolean);
+  return {
+    selectedSkills,
+    mountedSkillToolIds: sortedUnique(selectedSkills.flatMap(({ manifest }) => manifest.tools)),
+    decisions,
   };
-  return reason === "selected"
-    ? { selectedSkills: [skill], mountedSkillToolIds: [...manifest.tools], decisions: [decision] }
-    : { selectedSkills: [], mountedSkillToolIds: [], decisions: [decision] };
 }
 
 /** User-authored skills are hot-loaded on each turn so a just-recorded skill
@@ -365,6 +494,31 @@ export function mergeSkills(bundled: readonly BundledSkill[], user: readonly Bun
     if (!byId.has(skill.manifest.id)) byId.set(skill.manifest.id, skill);
   }
   return [...byId.values()];
+}
+
+/** Remove only an imported skill from the app-wide root. The origin check and
+ * real-parent check keep built-in/recorded entries and legacy bot folders out
+ * of this route, including when a hostile directory is a junction/symlink. */
+export function removeGlobalImportedSkill(root: string, id: string): { removed: true } | { error: string } {
+  if (!SAFE_ID.test(id) || id !== basename(id)) return { error: "invalid skill id" };
+  const skill = loadUserSkills(root).find((candidate) => candidate.manifest.id === id);
+  if (!skill) return { error: `no imported skill named "${id}"` };
+  if (skill.origin !== "imported") return { error: "only imported skills can be removed here" };
+  const rootPath = resolve(root);
+  const target = resolve(rootPath, id);
+  if (dirname(target) !== rootPath) return { error: "invalid skill directory" };
+  try {
+    const targetStat = lstatSync(target);
+    if (!targetStat.isDirectory() || targetStat.isSymbolicLink()) return { error: "skill directory is not safe to remove" };
+    const realRoot = realpathSync(rootPath);
+    if (realpathSync(dirname(target)) !== realRoot || dirname(realpathSync(target)) !== realRoot) {
+      return { error: "skill directory is outside the app-wide library" };
+    }
+    rmSync(target, { recursive: true, force: false });
+    return { removed: true };
+  } catch {
+    return { error: "skill directory could not be removed safely" };
+  }
 }
 
 export function skillInstructionsFor(

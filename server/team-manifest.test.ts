@@ -1,6 +1,19 @@
 import { describe, expect, it } from "vitest";
 
-import { createTeamManifest, importedMemberProfile, parseTeamManifest } from "./team-manifest.ts";
+import {
+  BOT_INSTRUCTIONS_MAX_CHARS,
+  createTeamManifest,
+  importedMemberProfile,
+  parseTeamManifest,
+} from "./team-manifest.ts";
+
+const avatarDefinition = {
+  version: 1,
+  seed: "team-avatar",
+  silhouette: "pebble",
+  eyeStyle: "wide",
+  mouthStyle: "none",
+} as const;
 
 describe("team manifests", () => {
   it("exports portable member keys without room or runtime state", () => {
@@ -17,6 +30,7 @@ describe("team manifests", () => {
           description: "Coordinates the work",
           color: "purple",
           mascotExpression: "focused",
+          avatarDefinition,
         },
         {
           id: "bot-b",
@@ -37,6 +51,7 @@ describe("team manifests", () => {
       },
     });
     expect(manifest.team).not.toHaveProperty("room");
+    expect(manifest.team.members[0]?.appearance.avatarDefinition).toEqual(avatarDefinition);
     expect(JSON.stringify(manifest)).not.toMatch(/bot-a|bot-b|thread|model|permission|message/i);
   });
 
@@ -103,6 +118,21 @@ describe("team manifests", () => {
     expect(manifest.team).not.toHaveProperty("room");
   });
 
+  it("keeps 6219-character member instructions and rejects the shared cap plus one", () => {
+    const manifest = (description: string) => ({
+      format: "openmaus.team" as const,
+      version: 2 as const,
+      team: {
+        name: "Alfred",
+        members: [{ key: "alfred", name: "Alfred", description, appearance: { color: "blue" as const } }],
+      },
+    });
+    const alfredInstructions = "A".repeat(6_219);
+    expect(parseTeamManifest(manifest(alfredInstructions)).team.members[0]?.description).toBe(alfredInstructions);
+    expect(() => parseTeamManifest(manifest("A".repeat(BOT_INSTRUCTIONS_MAX_CHARS + 1))))
+      .toThrow("members.0.description is too long");
+  });
+
   it("rejects unsupported versions and dangling member references", () => {
     expect(() => parseTeamManifest({ format: "openmaus.team", version: 99 })).toThrow("not supported");
     expect(() =>
@@ -157,6 +187,22 @@ describe("team manifests", () => {
         },
       }),
     ).toThrow("appearance.color");
+    expect(() =>
+      parseTeamManifest({
+        format: "openmaus.team",
+        version: 2,
+        team: {
+          name: "Research",
+          members: [{
+            ...member,
+            appearance: {
+              color: "green",
+              avatarDefinition: { ...avatarDefinition, version: 2 },
+            },
+          }],
+        },
+      }),
+    ).toThrow("appearance.avatarDefinition");
   });
 
   it("drops privileged fields a hand-edited file smuggles onto a member", () => {
@@ -204,7 +250,7 @@ describe("team manifests", () => {
       name: "Mira",
       title: "Lead",
       description: "Coordinates",
-      appearance: { color: "purple" as const, mascotExpression: "focused" },
+      appearance: { color: "purple" as const, mascotExpression: "focused", avatarDefinition },
     };
     const taken = new Set(["mira"]);
     // toEqual: the profile is exactly the persona — no privileged field can
@@ -215,6 +261,7 @@ describe("team manifests", () => {
       description: "Coordinates",
       color: "purple",
       mascotExpression: "focused",
+      avatarDefinition,
     });
     // the claimed name counts as taken now, case-insensitively, so the next
     // member of the same batch numbers forward instead of colliding

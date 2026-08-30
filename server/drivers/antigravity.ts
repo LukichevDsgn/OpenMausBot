@@ -50,6 +50,10 @@ const DRIVER_KIND = "antigravityAgent";
 const PRINT_TIMEOUT = "60m";
 const WATCHDOG_TIMEOUT_MS = 61 * 60_000;
 
+/** Exact reason this provider deliberately does not advertise approval review. */
+export const ANTIGRAVITY_REVIEW_UNSUPPORTED_REASON =
+  "Antigravity print mode accepts prompts only in --print argv; it has no stdin-only JSON review or isolated permission hook";
+
 export const ANTIGRAVITY_WORKSPACE_TOOL_CONTRACT = `[OpenMausBot workspace tool compatibility]
 - The directory passed with --add-dir is a normal project workspace, not an Antigravity artifact directory.
 - Never use write_to_file for a workspace path. That tool is artifact-only and rejects paths outside the Antigravity brain directory.

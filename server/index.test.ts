@@ -15,6 +15,7 @@ import { z } from "zod";
 import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
 import { openSse } from "./testing/sse.ts";
 import { IMAGE_MAX_BYTES } from "./attachments.ts";
+import { parseBotPackage } from "./bot-package.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(SERVER_DIR, "..");
@@ -356,6 +357,72 @@ describe("harness HTTP API", () => {
     expect(body.app).toBe("openmausbot");
     expect(typeof body.pid).toBe("number");
     expect(body.static).toBe(true);
+  });
+
+  it("keeps the public Grok import route behind its strict URL boundary", async () => {
+    const missing = await api("POST", "/api/team-library/grok", {});
+    expect(missing).toMatchObject({ status: 400, body: { error: "A public Grok Bot URL is required" } });
+    const rejected = await api("POST", "/api/team-library/grok", {
+      url: "https://x.ai/bot/short",
+    });
+    expect(rejected.status).toBe(400);
+    expect(rejected.body.error).toMatch(/public Grok Bot|public x\.ai/i);
+  });
+
+  it("normalizes and imports a complete Grok recipe without memory, credentials, permissions, or schedules", async () => {
+    const recipe = {
+      profile: {
+        name: "HTTP Recipe Bot",
+        description: "Use every imported instruction.",
+        title: "Research partner",
+        avatarColor: "purple",
+        avatarShape: "orb",
+      },
+      memory: [{ kind: "log", content: "HTTP PRIVATE MEMORY SENTINEL" }],
+      skills: [{
+        name: "Recipe Route Skill",
+        description: "Check evidence.",
+        content: "Keep source links and confidence.",
+      }],
+      routines: [{
+        name: "Review on request",
+        slug: "review-on-request",
+        description: "Review the findings.",
+        content: "Prepare a concise brief.",
+      }],
+      plugins: [{ name: "Drive", description: "Read approved files.", pluginId: "drive-setup" }],
+    };
+    const normalized = await api("POST", "/api/team-library/grok", recipe);
+    expect(normalized.status).toBe(200);
+    expect(normalized.body.package).toMatchObject({
+      agents: [{ skillIds: ["recipe-route-skill"] }],
+      routines: [{ schedule: { type: "manual" }, enabledAfterInstall: false }],
+      requirements: { apps: [{ slug: "drive", optional: true }] },
+    });
+    expect(JSON.stringify(normalized.body)).not.toContain("HTTP PRIVATE MEMORY SENTINEL");
+
+    const imported = await api("POST", "/api/teams/import", normalized.body);
+    expect(imported.status).toBe(201);
+    expect(imported.body.bots).toMatchObject([{
+      description: "Use every imported instruction.",
+      composio: false,
+      installedPackage: { requiredApps: [{ slug: "drive" }] },
+    }]);
+    const persisted = JSON.parse(readFileSync(join(home, ".openmausbot", "bots.json"), "utf8"));
+    expect(persisted.find((bot: { id: string }) => bot.id === imported.body.bots[0].id)).toMatchObject({
+      skillGrants: ["recipe-route-skill"],
+      skillToolGrants: [],
+    });
+    expect(imported.body.routines).toMatchObject([{
+      enabled: false,
+      nextRunAt: null,
+      schedule: { type: "manual" },
+    }]);
+    expect((await api("POST", `/api/routines/${imported.body.routines[0].id}/run`)).status).toBe(201);
+
+    await api("DELETE", `/api/routines/${imported.body.routines[0].id}`);
+    await api("DELETE", `/api/bots/${imported.body.bots[0].id}`);
+    await api("DELETE", "/api/skills/recipe-route-skill");
   });
 
   it("serves packaged UI assets and preserves API 404s", async () => {
@@ -1081,10 +1148,21 @@ describe("harness HTTP API", () => {
     const created = await api("POST", "/api/bots");
     const bot = created.body.bot;
     const avatarUrl = await uploadAvatar("image/webp");
+    const avatarDefinition = {
+      version: 1,
+      seed: "api-avatar",
+      silhouette: "gem",
+      eyeStyle: "calm",
+      mouthStyle: "soft",
+    };
 
-    const saved = await api("PATCH", `/api/bots/${bot.id}`, { avatarUrl, avatarCrop: "rounded" });
+    const saved = await api("PATCH", `/api/bots/${bot.id}`, {
+      avatarUrl,
+      avatarCrop: "rounded",
+      avatarDefinition,
+    });
     expect(saved.status).toBe(200);
-    expect(saved.body.bot).toMatchObject({ avatarUrl, avatarCrop: "rounded" });
+    expect(saved.body.bot).toMatchObject({ avatarUrl, avatarCrop: "rounded", avatarDefinition });
 
     expect((await api("PATCH", `/api/bots/${bot.id}`, {
       avatarUrl: "https://tracker.example/avatar.png",
@@ -1093,11 +1171,25 @@ describe("harness HTTP API", () => {
       avatarUrl: "/api/attachments/123e4567-e89b-12d3-a456-426614174000.webp",
     })).status).toBe(400);
     expect((await api("PATCH", `/api/bots/${bot.id}`, { avatarCrop: "hexagon" })).status).toBe(400);
+    const invalidDefinition = await api("PATCH", `/api/bots/${bot.id}`, {
+      avatarDefinition: { ...avatarDefinition, silhouette: "raw-svg" },
+    });
+    expect(invalidDefinition).toMatchObject({
+      status: 400,
+      body: {
+        error: "avatarDefinition must use version 1 and supported seed, silhouette, eye, and mouth presets",
+      },
+    });
 
-    const cleared = await api("PATCH", `/api/bots/${bot.id}`, { avatarUrl: null, avatarCrop: "mascot" });
+    const cleared = await api("PATCH", `/api/bots/${bot.id}`, {
+      avatarUrl: null,
+      avatarCrop: "mascot",
+      avatarDefinition: null,
+    });
     expect(cleared.status).toBe(200);
     expect(cleared.body.bot.avatarUrl).toBeNull();
     expect(cleared.body.bot.avatarCrop).toBe("mascot");
+    expect(cleared.body.bot.avatarDefinition).toBeUndefined();
   });
 
   it("limits paired profile writes to validated profile fields and broadcasts the result", async () => {
@@ -1114,6 +1206,13 @@ describe("harness HTTP API", () => {
         notifications: false,
         avatarUrl,
         avatarCrop: "circle",
+        avatarDefinition: {
+          version: 1,
+          seed: "paired-avatar",
+          silhouette: "spark",
+          eyeStyle: "wide",
+          mouthStyle: "none",
+        },
         voice: "voice_fixture",
         speakReplies: true,
       });
@@ -1125,6 +1224,7 @@ describe("harness HTTP API", () => {
         notifications: false,
         avatarUrl,
         avatarCrop: "circle",
+        avatarDefinition: { silhouette: "spark", eyeStyle: "wide", mouthStyle: "none" },
         voice: "voice_fixture",
         speakReplies: true,
       });
@@ -1138,6 +1238,7 @@ describe("harness HTTP API", () => {
         { avatarUrl: "https://tracker.example/avatar.png" },
         { avatarUrl: "/api/attachments/123e4567-e89b-12d3-a456-426614174000.png" },
         { avatarCrop: "hexagon" },
+        { avatarDefinition: { version: 1, seed: "bad", silhouette: "svg", eyeStyle: "wide", mouthStyle: "none" } },
         { name: 42 },
         { notifications: "yes" },
         { voice: null },
@@ -1149,6 +1250,7 @@ describe("harness HTTP API", () => {
       const cleared = await api("PATCH", `/api/bots/${bot.id}/profile`, {
         avatarUrl: null,
         avatarCrop: "mascot",
+        avatarDefinition: null,
         voice: "",
         speakReplies: false,
       });
@@ -1159,6 +1261,7 @@ describe("harness HTTP API", () => {
         voice: "",
         speakReplies: false,
       });
+      expect(cleared.body.bot.avatarDefinition).toBeUndefined();
     } finally {
       stream.close();
       await api("DELETE", `/api/bots/${bot.id}`);
@@ -1191,24 +1294,46 @@ describe("harness HTTP API", () => {
     const visibleNames = stateBefore.bots
       .filter((bot: { hidden?: boolean }) => !bot.hidden)
       .map((bot: { name: string }) => bot.name);
-    const exported = await api("POST", "/api/teams/export", { name: "Field Team" });
+    const visibleBotIds = stateBefore.bots
+      .filter((bot: { hidden?: boolean }) => !bot.hidden)
+      .map((bot: { id: string }) => bot.id);
+    const exportScope = { botIds: visibleBotIds };
+    const exported = await api("POST", "/api/teams/export", { name: "Field Team", scope: exportScope });
     expect(exported.status).toBe(200);
     expect(exported.body).toMatchObject({ format: "openmaus.team", version: 2, team: { name: "Field Team" } });
     expect(exported.body.team.members.map((member: { name: string }) => member.name)).toEqual(visibleNames);
     expect(exported.body.team.members).toEqual(expect.arrayContaining([
-      expect.objectContaining({ key: "mira", name: "Mira", title: "Project Lead", appearance: { color: "purple", mascotExpression: "focused" } }),
-      expect.objectContaining({ key: "scout", name: "Scout", title: "Researcher", appearance: { color: "cyan" } }),
+      expect.objectContaining({
+        key: "mira",
+        name: "Mira",
+        title: "Project Lead",
+        appearance: {
+          color: "purple",
+          mascotExpression: "focused",
+          avatarDefinition: first.avatarDefinition,
+        },
+      }),
+      expect.objectContaining({
+        key: "scout",
+        name: "Scout",
+        title: "Researcher",
+        appearance: {
+          color: "cyan",
+          mascotExpression: second.mascotExpression,
+          avatarDefinition: second.avatarDefinition,
+        },
+      }),
     ]));
     expect(exported.body.team).not.toHaveProperty("room");
     expect(JSON.stringify(exported.body)).not.toMatch(/Archived|autoApprove|alwaysAllow|modelSelection|threadId/);
-    const markdownExport = await api("POST", "/api/teams/export", { name: "Field Team", format: "package" });
+    const markdownExport = await api("POST", "/api/teams/export", { name: "Field Team", format: "package", scope: exportScope });
     expect(markdownExport.status).toBe(200);
     expect(markdownExport.body).toMatchObject({ name: "Field Team", members: visibleNames.length });
     expect(markdownExport.body.markdown).toContain("## Activation");
     expect(markdownExport.body.markdown).toContain("Give this file to your Chief of Staff");
     expect(markdownExport.body.markdown).not.toMatch(/Archived|autoApprove|alwaysAllow|modelSelection|threadId/);
     expect((await api("GET", "/api/bots")).body.groups).toHaveLength(roomsBefore);
-    expect((await api("POST", "/api/teams/export", {})).body.team.name).toBe("My OpenMaus Team");
+    expect((await api("POST", "/api/teams/export", { scope: "all" })).body.team.name).toBe("My OpenMaus Team");
 
     const stream = await openSse(`${BASE}/api/events`);
     try {
@@ -1287,13 +1412,144 @@ describe("harness HTTP API", () => {
     }
   });
 
+  it("enforces explicit export scope and imports selected package skills once", async () => {
+    const first = (await api("POST", "/api/bots", { name: "Scope Lead" })).body.bot;
+    const second = (await api("POST", "/api/bots", { name: "Scope Other" })).body.bot;
+    const hidden = (await api("POST", "/api/bots", { name: "Scope Hidden" })).body.bot;
+    await api("PATCH", `/api/bots/${hidden.id}`, { hidden: true });
+    const room = (await api("POST", "/api/groups", {
+      name: "Scoped room",
+      memberIds: [first.id, second.id],
+    })).body.group;
+    await api("PATCH", `/api/bots/${first.id}`, { skillGrants: ["phone-harness"] });
+    await api("PATCH", `/api/bots/${second.id}`, { skillGrants: ["phone-harness"] });
+    await api("PATCH", `/api/bots/${hidden.id}`, { skillGrants: ["phone-harness"] });
+    try {
+      expect((await api("POST", "/api/teams/export", { format: "package", name: "Missing scope" })).status).toBe(400);
+      expect((await api("POST", "/api/teams/export/options", {})).status).toBe(400);
+      expect((await api("POST", "/api/teams/export", {
+        format: "package", scope: { botIds: [hidden.id] },
+      })).status).toBe(400);
+      expect((await api("POST", "/api/teams/export/options", {
+        scope: { botIds: [hidden.id] },
+      })).status).toBe(400);
+      expect((await api("POST", "/api/teams/export", {
+        format: "package", scope: { botIds: ["missing-bot"] },
+      })).status).toBe(400);
+      expect((await api("POST", "/api/teams/export", {
+        format: "package", scope: { botIds: [first.id], groupIds: ["missing-room"] },
+      })).status).toBe(400);
+
+      const scoped = await api("POST", "/api/teams/export", {
+        format: "package",
+        name: "Scoped package",
+        scope: { botIds: [first.id], groupIds: [room.id] },
+      });
+      expect(scoped.status).toBe(200);
+      const parsed = parseBotPackage(scoped.body.markdown);
+      expect(parsed.package.agents).toHaveLength(1);
+      expect(parsed.package.rooms?.[0]?.members).toHaveLength(1);
+      expect(parsed.package.rooms?.[0]?.members).toEqual([parsed.package.agents[0].key]);
+
+      const optionsBeforeImport = await api("POST", "/api/teams/export/options", {
+        scope: { botIds: [first.id, second.id] },
+      });
+      expect(optionsBeforeImport.status).toBe(200);
+      expect(optionsBeforeImport.body.defaultSelectedSkillIds).toEqual(["phone-harness"]);
+      expect(optionsBeforeImport.body.skills).toEqual([
+        expect.objectContaining({ id: "phone-harness", origin: "built-in" }),
+      ]);
+      expect(JSON.stringify(optionsBeforeImport.body)).not.toMatch(new RegExp(`${first.id}|${second.id}|${hidden.id}`));
+      expect(optionsBeforeImport.body).not.toHaveProperty("skillGrants");
+      expect(optionsBeforeImport.body).not.toHaveProperty("mapping");
+
+      const portable = {
+        format: "openmaus.package",
+        version: 1,
+        package: {
+          id: "portable-scope-skill",
+          release: "1.0.0",
+          name: "Portable Scope Skill",
+          tagline: "A portable skill.",
+          summary: "Move one exact skill.",
+          category: "Test",
+          author: { name: "Test" },
+          license: "MIT",
+          outcomes: ["Keep the selected skill."],
+          setupMinutes: 2,
+          requirements: { apps: [], capabilities: [] },
+          agents: [{
+            key: "writer",
+            name: "Portable Writer",
+            appearance: { color: "green" },
+            skillIds: ["portable-notes"],
+          }],
+          skills: {
+            version: 1,
+            entries: [{
+              id: "portable-notes",
+              name: "Portable Notes",
+              version: "1.2.3",
+              description: "Keep notes structured.",
+              defaultEnabled: false,
+              triggerTerms: ["notes"],
+              requiredCapabilities: ["research"],
+              tools: ["notes"],
+              dependencies: ["source-check"],
+              origin: "recorded",
+              source: "github.com/example/portable-notes",
+              instructions: "---\nname: portable-notes\ndescription: Keep notes structured.\n---\nWrite concise notes.",
+            }],
+          },
+        },
+      };
+      const imported = await api("POST", "/api/teams/import", portable);
+      expect(imported.status).toBe(201);
+      const importedBot = imported.body.bots[0];
+      const persisted = JSON.parse(readFileSync(join(home, ".openmausbot", "bots.json"), "utf8"));
+      expect(persisted.find((bot: { id: string }) => bot.id === importedBot.id)).toMatchObject({
+        skillGrants: ["portable-notes"],
+        skillToolGrants: ["notes"],
+      });
+      const catalog = await api("GET", "/api/skills/catalog");
+      expect(catalog.body.skills).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: "portable-notes", origin: "imported", tools: ["notes"], requiredCapabilities: ["research"], dependencies: ["source-check"] }),
+      ]));
+      expect((await api("PATCH", `/api/bots/${second.id}`, {
+        skillGrants: ["phone-harness", "portable-notes"],
+        skillToolGrants: ["notes", "phone"],
+      })).status).toBe(200);
+      expect((await api("PATCH", `/api/bots/${hidden.id}`, { skillGrants: ["portable-notes"] })).status).toBe(200);
+      const unionOptions = await api("POST", "/api/teams/export/options", {
+        scope: { botIds: [first.id, second.id] },
+      });
+      expect(unionOptions.status).toBe(200);
+      expect(unionOptions.body.skills.map((skill: { id: string }) => skill.id)).toEqual([
+        "phone-harness",
+        "portable-notes",
+      ]);
+      expect(unionOptions.body.defaultSelectedSkillIds).toEqual(["phone-harness", "portable-notes"]);
+      expect(JSON.stringify(unionOptions.body)).not.toMatch(new RegExp(`${first.id}|${second.id}|${hidden.id}`));
+      expect(unionOptions.body).not.toHaveProperty("skillGrants");
+      expect(unionOptions.body).not.toHaveProperty("skillToolGrants");
+      const beforeCollision = (await api("GET", "/api/bots")).body.bots.length;
+      expect((await api("POST", "/api/teams/import", portable)).status).toBe(409);
+      expect((await api("GET", "/api/bots")).body.bots).toHaveLength(beforeCollision);
+      expect((await api("DELETE", "/api/skills/portable-notes")).status).toBe(200);
+      await api("DELETE", `/api/bots/${importedBot.id}`);
+    } finally {
+      await api("DELETE", `/api/groups/${room.id}`);
+      for (const bot of [first, second, hidden]) await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
   it("imports a team as a project: one room, on a folder", async () => {
     // The manifest still describes only people. Room name and folder come
     // from the CALLER, so a manifest fetched from the library cannot create
     // structure in someone's workspace — the property v2 established by
     // dropping its `room` block.
     const seed = await api("POST", "/api/bots", { name: "Planner", title: "Lead", description: "Plans", color: "purple" });
-    const exported = await api("POST", "/api/teams/export", { name: "Client XY" });
+    const exported = await api("POST", "/api/teams/export", { name: "Client XY", scope: "all" });
     expect(exported.body.team).not.toHaveProperty("room");
 
     const roomsBefore = (await api("GET", "/api/bots")).body.groups.length;
@@ -1946,6 +2202,18 @@ describe("harness HTTP API", () => {
       (await api("PATCH", `/api/bots/${bot.id}`, { localComputerAllowApps: ["C:\\Windows\\notepad.exe"] })).status,
     ).toBe(400);
     expect((await api("PATCH", `/api/bots/${bot.id}`, { localComputerAllowApps: "framer.exe" })).status).toBe(400);
+  });
+
+  it("keeps shared-link loading on the exact accounts package URL boundary", async () => {
+    const missing = await api("POST", "/api/team-library/shared", {});
+    expect(missing.status).toBe(400);
+    expect(missing.body.error).toContain("shared package URL");
+
+    const wrongHost = await api("POST", "/api/team-library/shared", {
+      url: "https://evil.example/v1/bot-shares/Abcdefghijklmnopqrstu/package",
+    });
+    expect(wrongHost.status).toBe(400);
+    expect(wrongHost.body.error).toContain("exact OpenMausBot");
   });
 
   it("stores only known approval-review modes", async () => {

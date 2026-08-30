@@ -1,6 +1,7 @@
-import { parseBotPackage, type BotPackageDefinition, type BotPackagePlaybook, type ParsedBotPackage } from "./bot-package.ts";
+import { parseBotPackage, type BotPackageDefinition, type BotPackagePlaybook, type BotPackageSkill, type ParsedBotPackage } from "./bot-package.ts";
 import type { Routine } from "./routines.ts";
 import type { BotRecord, GroupRecord, InstalledPlaybook } from "./store.ts";
+import { expandSkillDependencies, type BundledSkill } from "./skill-library.ts";
 
 function portableKey(value: string, fallback: string, used: Set<string>): string {
   const stem = value
@@ -30,6 +31,9 @@ export function createBotPackageExport(input: {
   bots: BotRecord[];
   groups: GroupRecord[];
   routines: Routine[];
+  /** Explicit export selection. Omitted means no Agent Skills are portable. */
+  skillIds?: readonly string[];
+  skills?: readonly BundledSkill[];
 }): ParsedBotPackage {
   const bots = input.bots.filter((bot) => !bot.hidden);
   if (!bots.length) throw new Error("Create a bot before exporting your package");
@@ -68,6 +72,41 @@ export function createBotPackageExport(input: {
     }
   }
 
+  const selectedSkillIds = [...(input.skillIds ?? [])];
+  if (new Set(selectedSkillIds).size !== selectedSkillIds.length) {
+    throw new Error("Duplicate skill id selection");
+  }
+  const availableSkills = input.skills ?? [];
+  const expansion = expandSkillDependencies(selectedSkillIds, availableSkills);
+  if (expansion.error) {
+    if (expansion.error.reason === "unknown") throw new Error(`Unknown skill id: ${expansion.error.skillId}`);
+    throw new Error(`Cannot export skills: ${expansion.error.reason} (${expansion.error.skillId})`);
+  }
+  const skillById = new Map(availableSkills.map((skill) => [skill.manifest.id, skill]));
+  const selectedSkills: BotPackageSkill[] = selectedSkillIds.map((id) => {
+    const skill = skillById.get(id);
+    if (!skill) throw new Error(`Unknown skill id: ${id}`);
+    const { manifest } = skill;
+    return {
+      id: manifest.id,
+      name: manifest.name,
+      version: manifest.version,
+      description: manifest.description,
+      defaultEnabled: manifest.defaultEnabled,
+      triggerTerms: [...manifest.triggerTerms].sort((a, b) => a.localeCompare(b)),
+      requiredCapabilities: [...manifest.requiredCapabilities].sort((a, b) => a.localeCompare(b)),
+      tools: [...manifest.tools].sort((a, b) => a.localeCompare(b)),
+      ...(manifest.dependencies?.length ? { dependencies: [...manifest.dependencies].sort((a, b) => a.localeCompare(b)) } : {}),
+      origin: skill.origin ?? "built-in",
+      ...(skill.metadata?.source ? { source: skill.metadata.source } : {}),
+      ...(skill.metadata?.importedAt ? { importedAt: skill.metadata.importedAt } : {}),
+      instructions: skill.instructions,
+    };
+  });
+  selectedSkills.sort((a, b) => a.id.localeCompare(b.id));
+  const selectedSet = new Set(selectedSkillIds);
+  const assignedSkillIds = new Set<string>();
+
   const roomKeys = new Set<string>();
   const rooms: NonNullable<BotPackageDefinition["rooms"]> = [];
   for (const [index, group] of input.groups.filter((group) => !group.dm).entries()) {
@@ -99,7 +138,9 @@ export function createBotPackageExport(input: {
       runOn: routine.runOn,
       schedule: routine.schedule.type === "once"
         ? { type: "once", at: routine.schedule.at }
-        : { type: "daily", time: routine.schedule.time, weekdays: [...routine.schedule.weekdays] },
+        : routine.schedule.type === "daily"
+          ? { type: "daily", time: routine.schedule.time, weekdays: [...routine.schedule.weekdays] }
+          : { type: "manual" },
       durationMinutes: routine.durationMinutes,
       enabledAfterInstall: false as const,
     }];
@@ -109,6 +150,7 @@ export function createBotPackageExport(input: {
   const agents: BotPackageDefinition["agents"] = bots.map((bot) => {
     const appearance: BotPackageDefinition["agents"][number]["appearance"] = { color: bot.color };
     if (bot.mascotExpression) appearance.mascotExpression = bot.mascotExpression;
+    if (bot.avatarDefinition) appearance.avatarDefinition = bot.avatarDefinition;
     const agent: BotPackageDefinition["agents"][number] = {
       key: idToKey.get(bot.id)!,
       name: bot.name,
@@ -116,10 +158,19 @@ export function createBotPackageExport(input: {
       description: bot.description,
       appearance,
     };
+    const assignedSkills = (bot.skillGrants ?? []).filter((id) => selectedSet.has(id));
+    if (assignedSkills.length) {
+      assignedSkills.sort((a, b) => a.localeCompare(b));
+      agent.skillIds = assignedSkills;
+      for (const id of assignedSkills) assignedSkillIds.add(id);
+    }
     const assigned = agentPlaybooks.get(bot.id);
     if (assigned?.length) agent.playbooks = assigned;
     return agent;
   });
+  for (const id of selectedSkillIds) {
+    if (!assignedSkillIds.has(id)) throw new Error(`Skill ${id} is not granted to a selected bot`);
+  }
   const definition: BotPackageDefinition = {
     id,
     release: "1.0.0",
@@ -139,6 +190,7 @@ export function createBotPackageExport(input: {
   if (rooms.length) definition.rooms = rooms;
   if (routines.length) definition.routines = routines;
   if (playbooks.length) definition.playbooks = playbooks;
+  if (selectedSkills.length) definition.skills = { version: 1, entries: selectedSkills };
   return parseBotPackage({
     format: "openmaus.package",
     version: 1,

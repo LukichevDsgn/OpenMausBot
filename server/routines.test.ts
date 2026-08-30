@@ -72,9 +72,38 @@ describe("nextOccurrence", () => {
     expect(nextOccurrence({ type: "once", at: 200 }, 100)).toBe(200);
     expect(nextOccurrence({ type: "once", at: 100 }, 100)).toBeNull();
   });
+
+  it("never invents an occurrence for a manual-only routine", () => {
+    expect(nextOccurrence({ type: "manual" }, Date.now())).toBeNull();
+  });
 });
 
 describe("RoutineManager", () => {
+  it("persists manual-only routines paused while keeping run-now available", () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Imported review",
+      prompt: "Review when asked",
+      botId: "maus-1",
+      enabled: true,
+      schedule: { type: "manual" },
+    });
+    expect(routine).toMatchObject({ enabled: false, nextRunAt: null, schedule: { type: "manual" } });
+    expect(h.manager.listRoutines()).toEqual([]);
+    expect(h.manager.listRoutines(true)).toMatchObject([{ id: routine.id, schedule: { type: "manual" } }]);
+
+    const reloaded = new RoutineManager(h.options);
+    expect(reloaded.listRoutines(true)).toMatchObject([{ id: routine.id, enabled: false, nextRunAt: null }]);
+    expect(reloaded.runNow(routine.id)).toMatchObject({ routineId: routine.id, manual: true, triggerSource: "manual" });
+
+    const scheduled = reloaded.update(routine.id, {
+      enabled: true,
+      schedule: { type: "daily", time: "09:00", weekdays: [1] },
+    });
+    expect(scheduled).toMatchObject({ enabled: true, schedule: { type: "daily" } });
+    expect(scheduled?.nextRunAt).not.toBeNull();
+  });
+
   it("persists definitions separately from permanent run receipts", async () => {
     const h = harness();
     const routine = h.manager.create({

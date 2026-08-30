@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { clearAcceptedSkill, searchSkills, selectedSkillById, skillsCommandQuery } from "./skills";
+import { clearAcceptedSkill, clearAcceptedSkills, searchSkills, selectedSkillById, selectedSkillsByIds, skillSelectionSummary, skillsCommandQuery, toggleSkillId } from "./skills";
 
 const skills = [
   { id: "phone-harness", name: "Phone Harness", description: "Control an Android phone", origin: "built-in" as const },
@@ -27,5 +27,17 @@ describe("skills composer helpers", () => {
     expect(clearAcceptedSkill("expense", "expense")).toBeNull();
     expect(clearAcceptedSkill("phone-harness", "expense")).toBe("phone-harness");
     expect(clearAcceptedSkill("expense", undefined)).toBe("expense");
+  });
+
+  it("keeps multi-selection ordered, unique, bounded, and clears only accepted ids", () => {
+    expect(toggleSkillId(["expense"], "review-pr")).toEqual(["expense", "review-pr"]);
+    expect(toggleSkillId(["expense", "review-pr"], "expense")).toEqual(["review-pr"]);
+    expect(toggleSkillId(Array.from({ length: 8 }, (_, index) => `skill-${index}`), "ninth")).toHaveLength(8);
+    expect(selectedSkillsByIds(skills, ["review-pr", "phone-harness"] as string[]).map((skill) => skill.id)).toEqual(["review-pr", "phone-harness"]);
+    expect(clearAcceptedSkills(["phone-harness", "expense"], ["expense"])).toEqual(["phone-harness"]);
+  });
+
+  it("states available, selected, and per-send maximum separately", () => {
+    expect(skillSelectionSummary(3, 2)).toBe("3 available · 2 selected · max 8 per send");
   });
 });

@@ -24,7 +24,7 @@ import { PendingApprovalActions, PendingApprovalPanel, pendingApprovals } from "
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { ReplyQuote } from "./ReplyQuote";
 import { SkillsDialog } from "./SkillsDialog";
-import { clearAcceptedSkill, selectedSkillById, skillsCommandQuery } from "@/lib/skills";
+import { clearAcceptedSkills, selectedSkillsByIds, skillsCommandQuery, toggleSkillId } from "@/lib/skills";
 
 /** The active @mention query at the caret: the text between an `@` that
  * starts a word and the caret. null = no mention being typed. */
@@ -184,8 +184,8 @@ export function Composer({
   );
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [skillsQuery, setSkillsQuery] = useState("");
-  const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
-  const selectedSkill = selectedSkillById(state.skills, selectedSkillId);
+  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
+  const selectedSkills = selectedSkillsByIds(state.skills, selectedSkillIds);
   const addAttachments = useCallback(
     (next: Attachment[]) => setAttachments((prev) => [...prev, ...next]),
     [setAttachments],
@@ -296,7 +296,7 @@ export function Composer({
   // the moment the room settles. 1:1 mid-turn sends still POST (the harness
   // queue), but stay off the transcript until drain — the chip here is the
   // pending row so they cannot become the active leaf mid-turn.
-  const [queued, setQueued] = useState<{ text: string; replyToId?: string; skillId?: string } | null>(null);
+  const [queued, setQueued] = useState<{ text: string; replyToId?: string; skillIds: string[] } | null>(null);
   const pendingChip = group
     ? queued?.text
     : bot
@@ -342,20 +342,20 @@ export function Composer({
     }
     const t = composeMessage(text, attachments);
     if (!t) return;
-    const sentSkillId = selectedSkill?.id;
-    const onAccepted = () => setSelectedSkillId((current) => clearAcceptedSkill(current, sentSkillId));
+    const sentSkillIds = [...selectedSkillIds];
+    const onAccepted = () => setSelectedSkillIds((current) => clearAcceptedSkills(current, sentSkillIds));
     if (busy && group) {
-      setQueued({ text: t, replyToId: replyTo?.id, skillId: sentSkillId });
+      setQueued({ text: t, replyToId: replyTo?.id, skillIds: sentSkillIds });
       setText("");
       setAttachments([]);
       onClearReply?.();
       return;
     }
     if (group) {
-      dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id, skillId: sentSkillId, onAccepted });
+      dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id, skillIds: sentSkillIds, onAccepted });
       track("message_sent", { room: true });
     } else if (bot) {
-      dispatch({ type: "send", botId: bot.id, text: t, replyToId: replyTo?.id, skillId: sentSkillId, onAccepted });
+      dispatch({ type: "send", botId: bot.id, text: t, replyToId: replyTo?.id, skillIds: sentSkillIds, onAccepted });
       track("message_sent", { driver: bot.modelSelection?.instanceId, queued: busy && !canSteer });
     }
     setText("");
@@ -370,14 +370,14 @@ export function Composer({
         setQueued(null);
         return;
       }
-      const queuedSkillId = queued.skillId;
+      const queuedSkillIds = queued.skillIds;
       dispatch({
         type: "sendGroup",
         groupId: group.id,
         text: queued.text,
         replyToId: queued.replyToId,
-        skillId: queuedSkillId,
-        onAccepted: () => setSelectedSkillId((current) => clearAcceptedSkill(current, queuedSkillId)),
+        skillIds: queuedSkillIds,
+        onAccepted: () => setSelectedSkillIds((current) => clearAcceptedSkills(current, queuedSkillIds)),
       });
       track("message_sent", { room: true, queued: true });
     }
@@ -428,13 +428,14 @@ export function Composer({
   };
 
   return (
-    <div className="px-5 pb-3 pt-1">
-      {speechError && (
+    <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 bg-gradient-to-t from-app via-app/90 to-transparent px-5 pb-3 pt-12">
+      <div className="pointer-events-auto">
+        {speechError && (
         <div className="mb-2 w-full rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[12px] text-warning">
           {speechError}
         </div>
       )}
-      <div className="relative w-full">
+        <div className="relative w-full">
         {pendingChip && (
           <div className="mb-2 flex items-center gap-2 rounded-lg border border-hairline/40 bg-panel px-3 py-2 text-[12.5px] text-ink-secondary">
             <Clock size={13} className="shrink-0" />
@@ -482,6 +483,7 @@ export function Composer({
                 {peer.bot ? (
                   <MausAvatar
                     color={peer.bot.color}
+                    avatarDefinition={peer.bot.avatarDefinition}
                     state={normalizeState(peer.bot.mascotExpression) ?? "happy"}
                     size={24}
                   />
@@ -521,16 +523,20 @@ export function Composer({
             />
           </div>
         )}
-        {selectedSkill ? (
+        {selectedSkills.length ? (
           <div className="mb-2 flex items-center gap-2 px-1">
-            <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-accent/25 bg-accent/10 px-2.5 py-1 text-[12px] text-ink">
-              <BookOpen size={12} className="shrink-0 text-accent" aria-hidden="true" />
-              <span className="truncate">{selectedSkill.name}</span>
-              <button type="button" onClick={() => setSelectedSkillId(null)} aria-label={`Remove ${selectedSkill.name} from the next message`} className="rounded-full p-0.5 text-ink-secondary hover:bg-control hover:text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">
-                <X size={11} />
-              </button>
-            </span>
-            <span className="text-[11.5px] text-ink-secondary">Next message only</span>
+            <div className="flex min-w-0 flex-wrap gap-1.5">
+              {selectedSkills.map((skill) => (
+                <span key={skill.id} className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-accent/25 bg-accent/10 px-2.5 py-1 text-[12px] text-ink">
+                  <BookOpen size={12} className="shrink-0 text-accent" aria-hidden="true" />
+                  <span className="truncate">{skill.name}</span>
+                  <button type="button" onClick={() => setSelectedSkillIds((current) => current.filter((id) => id !== skill.id))} aria-label={`Remove ${skill.name} from the next message`} className="rounded-full p-0.5 text-ink-secondary hover:bg-control hover:text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">
+                    <X size={11} />
+                  </button>
+                </span>
+              ))}
+            </div>
+            <span className="shrink-0 text-[11.5px] text-ink-secondary">Next message only</span>
           </div>
         ) : null}
         <ComposerAttachments
@@ -575,7 +581,7 @@ export function Composer({
                 title="Skills (/skills)"
                 className={cn(
                   "flex size-8 shrink-0 items-center justify-center rounded-full hover:bg-control hover:text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent",
-                  selectedSkill ? "text-accent" : "text-ink-secondary",
+                  selectedSkills.length ? "text-accent" : "text-ink-secondary",
                 )}
               >
                 <BookOpen size={17} />
@@ -745,15 +751,17 @@ export function Composer({
       <SkillsDialog
         open={skillsOpen}
         skills={state.skills}
-        selectedId={selectedSkillId}
+        selectedIds={selectedSkillIds}
         initialQuery={skillsQuery}
-        onClose={() => setSkillsOpen(false)}
-        onSelect={(skill) => {
-          setSelectedSkillId(skill.id);
+        onClose={() => {
           setSkillsOpen(false);
           requestAnimationFrame(() => inputRef.current?.focus());
         }}
+        onToggle={(skill) => {
+          setSelectedSkillIds((current) => toggleSkillId(current, skill.id));
+        }}
       />
+      </div>
     </div>
   );
 }

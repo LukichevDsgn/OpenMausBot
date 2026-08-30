@@ -12,6 +12,22 @@ import {
 const ACCOUNT = `signed.${"a".repeat(40)}`;
 const INSTALL = `omb_install_${"a".repeat(22)}.${"b".repeat(43)}`;
 const INSTALL_ID = "11111111-1111-4111-8111-111111111111";
+const SHARE_ID = "Abcdefghijklmnopqrstu";
+const sharePayload = (overrides = {}) => ({
+  id: SHARE_ID,
+  visibility: "unlisted",
+  activeVersion: 1,
+  name: "Research Team",
+  summary: "A portable team.",
+  sha256: "a".repeat(64),
+  byteSize: 123,
+  createdAt: 1,
+  updatedAt: 1,
+  versionCreatedAt: 1,
+  shareUrl: `https://accounts.openmausbot.com/s/${SHARE_ID}`,
+  packageUrl: `https://accounts.openmausbot.com/v1/bot-shares/${SHARE_ID}/package`,
+  ...overrides,
+});
 const jsonResponse = (body, init = {}) =>
   new Response(JSON.stringify(body), {
     status: init.status ?? 200,
@@ -221,6 +237,64 @@ describe("control-plane desktop client", () => {
       platform: "darwin",
       appVersion: "1.0.0",
     }]);
+  });
+
+  it("validates bot-share responses and keeps the account bearer out of returned data", async () => {
+    const fetchImpl = vi.fn(async (url, init) => {
+      expect(init.headers.get("authorization")).toBe(`Bearer ${ACCOUNT}`);
+      if (url.endsWith("/v1/bot-shares") && init.method === "POST") {
+        expect(JSON.parse(init.body)).toEqual({ packageMarkdown: "# safe", visibility: "unlisted" });
+        return jsonResponse({ share: sharePayload() }, { status: 201 });
+      }
+      return jsonResponse({ shares: [sharePayload()] });
+    });
+    const client = createControlPlaneClient({ baseURL: "https://accounts.openmausbot.com", fetchImpl });
+
+    const listed = await client.listBotShares(ACCOUNT);
+    const created = await client.createBotShare(ACCOUNT, { packageMarkdown: "# safe" });
+    expect(listed).toEqual([sharePayload()]);
+    expect(created).toEqual(sharePayload());
+    expect(JSON.stringify({ listed, created })).not.toContain(ACCOUNT);
+  });
+
+  it("rejects malformed share metadata, ids, and oversized packages before exposing or sending them", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ shares: [sharePayload({ packageUrl: "https://evil.example/bot.md" })] }));
+    const client = createControlPlaneClient({ baseURL: "https://accounts.openmausbot.com", fetchImpl });
+    await expect(client.listBotShares(ACCOUNT)).rejects.toMatchObject({ code: "invalid_response" });
+    await expect(client.updateBotShare(ACCOUNT, "../bad", {
+      packageMarkdown: "# safe",
+      expectedActiveVersion: 1,
+    })).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(client.createBotShare(ACCOUNT, {
+      packageMarkdown: "x".repeat(1_000_001),
+    })).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(client.listBotShares(INSTALL)).rejects.toMatchObject({ code: "signed_out" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses compare-and-swap, visibility, and delete share routes with the account bearer", async () => {
+    const fetchImpl = vi.fn(async (url, init) => {
+      expect(init.headers.get("authorization")).toBe(`Bearer ${ACCOUNT}`);
+      if (init.method === "DELETE") return new Response(null, { status: 204 });
+      return jsonResponse({ share: sharePayload({
+        activeVersion: url.endsWith("/versions") ? 2 : 1,
+        visibility: url.endsWith("/visibility") ? "private" : "unlisted",
+      }) });
+    });
+    const client = createControlPlaneClient({ baseURL: "https://accounts.openmausbot.com", fetchImpl });
+
+    await expect(client.updateBotShare(ACCOUNT, SHARE_ID, {
+      packageMarkdown: "# next",
+      expectedActiveVersion: 1,
+    })).resolves.toMatchObject({ activeVersion: 2 });
+    await expect(client.setBotShareVisibility(ACCOUNT, SHARE_ID, "private"))
+      .resolves.toMatchObject({ visibility: "private" });
+    await expect(client.deleteBotShare(ACCOUNT, SHARE_ID)).resolves.toBeUndefined();
+    expect(fetchImpl.mock.calls.map(([url]) => url)).toEqual([
+      `https://accounts.openmausbot.com/v1/bot-shares/${SHARE_ID}/versions`,
+      `https://accounts.openmausbot.com/v1/bot-shares/${SHARE_ID}/visibility`,
+      `https://accounts.openmausbot.com/v1/bot-shares/${SHARE_ID}`,
+    ]);
   });
 
   it("rejects malformed installation lists instead of skipping cleanup targets", async () => {

@@ -84,6 +84,7 @@ function ClusterLabel({ bot, name, color }: { bot?: Bot; name: string; color: st
     <div className="mt-1 flex items-center gap-1.5 pl-0.5">
       <MausAvatar
         color={(bot?.color ?? color) as Bot["color"]}
+        avatarDefinition={bot?.avatarDefinition}
         state={normalizeState(bot?.mascotExpression) ?? "happy"}
         size={16}
         motion="none"
@@ -685,6 +686,7 @@ function RoomSetup({ group, members }: { group: Group; members: Bot[] }) {
                         >
                           <MausAvatar
                             color={member.color}
+                            avatarDefinition={member.avatarDefinition}
                             state={normalizeState(member.mascotExpression) ?? "happy"}
                             size={24}
                             animated={false}
@@ -982,16 +984,12 @@ export function GroupView({ group }: { group: Group }) {
         group.busyBotId === b.id && "ring-2 ring-accent/50 ring-offset-1 ring-offset-app",
       )}
     >
-      <MausAvatar color={b.color} state={normalizeState(b.mascotExpression) ?? "happy"} size={24} animated={false} />
+      <MausAvatar color={b.color} avatarDefinition={b.avatarDefinition} state={normalizeState(b.mascotExpression) ?? "happy"} size={24} animated={false} />
       {group.busyBotId === b.id && (
         <span className="absolute -right-0.5 -top-0.5 size-2 rounded-full border border-app bg-accent" />
       )}
     </span>
   ));
-
-  const isWin = window.ogb?.platform === "win32";
-  const drag = isWin ? ({ WebkitAppRegion: "drag" } as React.CSSProperties) : undefined;
-  const noDrag = isWin ? ({ WebkitAppRegion: "no-drag" } as React.CSSProperties) : undefined;
 
   return (
     <main className="relative flex h-full min-w-0 flex-1 flex-col bg-app">
@@ -1005,15 +1003,13 @@ export function GroupView({ group }: { group: Group }) {
           "flex items-center justify-between px-5 py-3",
           // Room for the drawer button, which overlays this corner below md.
           "pl-11 md:pl-5",
-          isWin && "pr-[148px]",
         )}
-        style={drag}
       >
-        <div className="flex min-w-0 items-center gap-2" style={noDrag}>
+        <div className="flex min-w-0 items-center gap-2">
           <span className="truncate text-[15px] font-semibold text-ink">{group.name}</span>
           {!setupPending && !group.dm && <GroupTaskPicker group={group} />}
         </div>
-        <div className="flex items-center gap-1.5" style={noDrag}>
+        <div className="flex items-center gap-1.5">
           <button
             type="button"
             onClick={() => setFindOpen((open) => !open)}
@@ -1129,10 +1125,12 @@ export function GroupView({ group }: { group: Group }) {
         );
       })()}
 
-      {/* Transcript */}
+      {/* Transcript and composer share a pane so the dock can float over the
+          transcript while preserving the room's scroll and queue controls. */}
+      <div className="relative min-h-0 flex-1">
       <div
         ref={scrollRef}
-        className="flex-1 overflow-x-hidden overflow-y-auto px-5 [overflow-anchor:none]"
+        className="h-full overflow-x-hidden overflow-y-auto px-5 pb-48 [overflow-anchor:none]"
         onWheel={(e) => {
           if (e.deltaY < 0) setBottomFollow(false);
           else if (atEnd()) setBottomFollow(true);
@@ -1175,6 +1173,7 @@ export function GroupView({ group }: { group: Group }) {
                   <MausAvatar
                     key={b.id}
                     color={b.color}
+                    avatarDefinition={b.avatarDefinition}
                     state="happy"
                     size={44}
                     motion="none"
@@ -1222,6 +1221,7 @@ export function GroupView({ group }: { group: Group }) {
               avatar={
                 <MausAvatar
                   color={presenceSpeaker?.color ?? "green"}
+                  avatarDefinition={presenceSpeaker?.avatarDefinition}
                   state={toolInFlight ? "working" : "thinking"}
                   size={36}
                   forward={false}
@@ -1268,6 +1268,7 @@ export function GroupView({ group }: { group: Group }) {
         replyTo={replyTo}
         onClearReply={() => setReplyTo(null)}
       />
+      </div>
     </main>
   );
 }

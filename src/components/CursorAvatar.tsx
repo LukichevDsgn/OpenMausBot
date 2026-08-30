@@ -34,6 +34,10 @@ export interface CursorSilhouette {
   clip: string
   /** Where the face sits inside the silhouette, in face-space units. */
   anchor: { x: number; y: number; scale: number }
+  /** Optional shared paint coordinates for multi-mark authored bodies. The
+   * default is intentionally absent so the original Cursor gradient markup
+   * remains byte/render equivalent. */
+  gradientSpace?: { x1: number; y1: number; x2: number; y2: number }
 }
 
 export const DEFAULT_SILHOUETTE: CursorSilhouette = {
@@ -1260,6 +1264,8 @@ export interface CursorAvatarProps {
   /** Silhouette to wear. Defaults to the baked-in mascot silhouette. */
   silhouette?: CursorSilhouette
   gradient?: [string, string, string]
+  /** Opt-in shared user-space gradient coordinates for composed silhouettes. */
+  gradientSpace?: { x1: number; y1: number; x2: number; y2: number }
   eyeColor?: string
   title?: string | null
   className?: string
@@ -1294,6 +1300,7 @@ export const CursorAvatar = React.forwardRef<CursorAvatarHandle, CursorAvatarPro
       paused = false,
       silhouette = DEFAULT_SILHOUETTE,
       gradient = DEFAULT_GRADIENT,
+      gradientSpace = silhouette.gradientSpace,
       eyeColor = "#ffffff",
       title,
       className,
@@ -1606,7 +1613,14 @@ export const CursorAvatar = React.forwardRef<CursorAvatarHandle, CursorAvatarPro
         aria-hidden={label ? undefined : true}
       >
         <defs>
-          <linearGradient id={`${uid}-grad`} x1="1" y1="0" x2="0" y2="1">
+          <linearGradient
+            id={`${uid}-grad`}
+            x1={gradientSpace?.x1 ?? 1}
+            y1={gradientSpace?.y1 ?? 0}
+            x2={gradientSpace?.x2 ?? 0}
+            y2={gradientSpace?.y2 ?? 1}
+            {...(gradientSpace ? { gradientUnits: 'userSpaceOnUse' } : {})}
+          >
             <stop offset="0%" stopColor={gradient[0]} />
             <stop offset="55%" stopColor={gradient[1]} />
             <stop offset="100%" stopColor={gradient[2]} />

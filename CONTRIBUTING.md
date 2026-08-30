@@ -1,6 +1,6 @@
-# Contributing to OpenMausBot
+# Contributing to OpenMausBot-custom
 
-Thanks for wanting to help — community PRs have already shipped in this repo, and more are welcome.
+Thanks for wanting to help. This is an unofficial source-only fork; upstream attribution and history remain intact.
 This file tells you how to get a working dev setup, what the codebase expects from a change, and what
 makes a PR easy to merge. Read it once before opening anything; it's short on purpose.
 
@@ -127,6 +127,17 @@ The SPI in [`server/contracts.ts`](server/contracts.ts) is deliberately small. A
   independent capabilities.
 - Test Ubuntu platform claims on a real GNOME session. Xvfb proves packaging and fake-driver orchestration, not
   Wayland portal behavior or real CUA inspection/input delivery.
+
+## Fork publication rules
+
+- Run `pnpm check:secrets` before every PR. It scans tracked files and untracked, non-ignored publication
+  candidates and reports only path, line, rule, and a redacted fingerprint. Use `pnpm check:secrets -- --all`
+  for the full-tree audit; the default PR gate intentionally checks only added tracked lines plus complete
+  untracked candidates.
+- Tests must use fakes and throwaway directories. Do not spend real provider quota or require a live provider account.
+- Keep changes small and single-writer: do not mix unrelated dirty work, generated output, runtime/config files,
+  release artifacts, signing material, or credentials into a PR.
+- UI changes require before/after screenshots in the PR body and a video for animated behavior.
 - Linux local control is enabled only on GNOME/Xorg after explicit opt-in. The owned daemon must start with
   `--no-overlay`: the decorative full-screen Cua cursor surface is not part of the product contract and must never
   sit between the person and their desktop. GNOME/Wayland must clear a legacy durable opt-in, report

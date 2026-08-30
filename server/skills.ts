@@ -30,6 +30,7 @@ import { workspaceDir } from "./workspace.ts";
  * folder name must equal it. The regex IS the traversal gate — no dots, no
  * slashes, no way to name a skill "..". */
 const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const PORTABLE_TOOL_ID = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/;
 export const SKILL_NAME_MAX = 64;
 export const DESCRIPTION_MAX = 1024;
 /** One SKILL.md may be at most this large; the spec recommends <5k tokens. */
@@ -178,6 +179,23 @@ export interface GlobalImportedSkillListing {
 export interface GlobalSkillImportCandidate {
   source: string;
   files: Array<{ path: string; content: string }>;
+  /** Optional portable manifest metadata supplied by a BotMRR package. */
+  manifest?: GlobalSkillManifestMetadata;
+}
+
+export interface GlobalSkillManifestMetadata {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  defaultEnabled: boolean;
+  triggerTerms: string[];
+  requiredCapabilities: string[];
+  tools: string[];
+  dependencies?: string[];
+  origin: "built-in" | "recorded" | "imported";
+  source?: string;
+  importedAt?: string;
 }
 
 export type GlobalSkillImportFailure = {
@@ -318,7 +336,7 @@ export function installGlobalSkill(
   root: string,
   source: string,
   files: Array<{ path: string; content: string }>,
-  options: { now?: () => string; reservedIds?: Iterable<string> } = {},
+  options: { now?: () => string; reservedIds?: Iterable<string>; manifest?: GlobalSkillManifestMetadata } = {},
 ): GlobalImportedSkillListing | { error: string } {
   const skillMd = files.find((file) => file.path === "SKILL.md" || file.path.endsWith("/SKILL.md"));
   if (!skillMd) return { error: "no SKILL.md found at that location" };
@@ -327,6 +345,26 @@ export function installGlobalSkill(
   }
   const parsed = parseSkillMd(skillMd.content);
   if ("error" in parsed) return parsed;
+  const suppliedManifest = options.manifest;
+  if (suppliedManifest) {
+    const validMetadata = suppliedManifest.id === parsed.name &&
+      isSkillName(suppliedManifest.id) &&
+      typeof suppliedManifest.name === "string" && suppliedManifest.name.trim().length > 0 &&
+      /^\d+\.\d+\.\d+$/.test(suppliedManifest.version) &&
+      typeof suppliedManifest.description === "string" && suppliedManifest.description.trim().length > 0 &&
+      Array.isArray(suppliedManifest.triggerTerms) && suppliedManifest.triggerTerms.length > 0 &&
+      suppliedManifest.triggerTerms.every((term) => typeof term === "string" && term.trim()) &&
+      Array.isArray(suppliedManifest.requiredCapabilities) &&
+      suppliedManifest.requiredCapabilities.every((capability) => typeof capability === "string" && capability.trim()) &&
+      Array.isArray(suppliedManifest.tools) &&
+      suppliedManifest.tools.every((tool) => PORTABLE_TOOL_ID.test(tool)) &&
+      (suppliedManifest.dependencies === undefined || (
+        suppliedManifest.dependencies.length <= 8 &&
+        new Set(suppliedManifest.dependencies).size === suppliedManifest.dependencies.length &&
+        suppliedManifest.dependencies.every((dependency) => isSkillName(dependency) && dependency !== suppliedManifest.id)
+      ));
+    if (!validMetadata) return { error: "portable skill manifest metadata is invalid" };
+  }
   const duplicate = { error: `duplicate skill id: "${parsed.name}"` };
   if (new Set(options.reservedIds).has(parsed.name)) return duplicate;
   const digest = createHash("sha256").update(skillMd.content).digest("hex");
@@ -359,14 +397,16 @@ export function installGlobalSkill(
     }
     writeFileSync(join(temporary, "manifest.json"), `${JSON.stringify({
       id: parsed.name,
-      name: parsed.name,
-      version: "1.0.0",
-      description: parsed.description,
-      defaultEnabled: true,
-      triggerTerms: [parsed.name],
-      requiredCapabilities: [],
-      tools: [],
+      name: suppliedManifest?.name ?? parsed.name,
+      version: suppliedManifest?.version ?? "1.0.0",
+      description: suppliedManifest?.description ?? parsed.description,
+      defaultEnabled: suppliedManifest?.defaultEnabled ?? true,
+      triggerTerms: suppliedManifest?.triggerTerms ?? [parsed.name],
+      requiredCapabilities: suppliedManifest?.requiredCapabilities ?? [],
+      tools: suppliedManifest?.tools ?? [],
+      ...(suppliedManifest?.dependencies ? { dependencies: suppliedManifest.dependencies } : {}),
       origin: "imported",
+      ...(suppliedManifest?.origin ? { sourceOrigin: suppliedManifest.origin } : {}),
       source,
       sha256: digest,
       importedAt,
@@ -430,9 +470,17 @@ export function installGlobalSkillBatch(
   const preflight = preflightGlobalSkillImports(root, candidates, options.reservedIds);
   if ("error" in preflight) return preflight;
   const results: GlobalImportedSkillListing[] = [];
+  const installedIds: string[] = [];
   for (const candidate of candidates) {
-    const installed = installGlobalSkill(root, candidate.source, candidate.files, { now: options.now });
-    if ("error" in installed) return { error: installed.error, kind: "write" };
+    const installed = installGlobalSkill(root, candidate.source, candidate.files, {
+      now: options.now,
+      manifest: candidate.manifest,
+    });
+    if ("error" in installed) {
+      for (const id of installedIds) rmSync(join(root, id), { recursive: true, force: true });
+      return { error: installed.error, kind: "write" };
+    }
+    installedIds.push(installed.id);
     results.push(installed);
   }
   return { results };

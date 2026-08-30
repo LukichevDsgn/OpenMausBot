@@ -125,6 +125,31 @@ describe("bot patch queue", () => {
     );
   });
 
+  it("keeps avatar shape and expression visible while their patch is debounced", async () => {
+    const sent: BotUpdatePatch[] = [];
+    const authoritative = vi.fn();
+    const next = bot({ avatarCrop: "square", mascotExpression: "proud" });
+    const queue = createBotPatchQueue({
+      send: async (_botId, patch) => {
+        sent.push(patch);
+        return next;
+      },
+      reconcile: async () => bot(),
+      onAuthoritative: authoritative,
+      onError: vi.fn(),
+    });
+
+    queue.enqueue("bot-1", { avatarCrop: "square" }, bot());
+    queue.enqueue("bot-1", { mascotExpression: "proud" }, bot());
+
+    expect(queue.overlayFor("bot-1")).toEqual({ avatarCrop: "square", mascotExpression: "proud" });
+    await vi.advanceTimersByTimeAsync(400);
+    await queue.flush("bot-1");
+
+    expect(sent).toEqual([{ avatarCrop: "square", mascotExpression: "proud" }]);
+    expect(authoritative).toHaveBeenLastCalledWith(next, {});
+  });
+
   it("reconciles a rejected optimistic profile value to the server bot", async () => {
     const authoritative = vi.fn();
     const onError = vi.fn();

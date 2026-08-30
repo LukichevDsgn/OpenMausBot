@@ -70,6 +70,46 @@ describe("Store", () => {
     expect(store.messagesFor(bot.threadId)).toHaveLength(0);
   });
 
+  it("creates one deterministic procedural avatar and preserves it across reloads", () => {
+    const store = new Store(selection);
+    const bot = store.createBot({}, { seedMessages: false });
+    expect(bot.avatarDefinition).toMatchObject({ version: 1, seed: bot.id });
+    expect(bot.color).toBeTruthy();
+    expect(bot.mascotExpression).toBeTruthy();
+
+    const reloaded = new Store(selection).bot(bot.id);
+    expect(reloaded?.avatarDefinition).toEqual(bot.avatarDefinition);
+    expect(reloaded?.color).toBe(bot.color);
+    expect(reloaded?.mascotExpression).toBe(bot.mascotExpression);
+  });
+
+  it("drops an invalid persisted procedural avatar without disturbing the bot", () => {
+    const store = new Store(selection);
+    const bot = store.createBot({}, { seedMessages: false });
+    const path = join(DATA_DIR, "bots.json");
+    const raw: Array<Omit<BotRecord, "avatarDefinition"> & {
+      avatarDefinition?: {
+        version: number;
+        seed: string;
+        silhouette: string;
+        eyeStyle: string;
+        mouthStyle: string;
+      };
+    }> = JSON.parse(readFileSync(path, "utf8"));
+    raw.find((candidate) => candidate.id === bot.id)!.avatarDefinition = {
+      version: 1,
+      seed: "bot",
+      silhouette: "injected-svg",
+      eyeStyle: "balanced",
+      mouthStyle: "soft",
+    };
+    writeFileSync(path, JSON.stringify(raw));
+
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)?.avatarDefinition).toBeUndefined();
+    expect(reloaded.bot(bot.id)?.id).toBe(bot.id);
+  });
+
   it("migrates worker descriptions away from provider-specific model labels", () => {
     const store = new Store(selection);
     const fixer = store.createBot({

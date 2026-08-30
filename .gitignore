@@ -26,3 +26,24 @@ cloudflare/control-plane/worker-configuration.d.ts
 .claude/worktrees/
 .vercel/
 .pi/
+
+# Local credentials, runtime state, and generated publication output.
+.env
+.env.*
+!.env.example
+!.env.*.example
+.npmrc
+.playwright-cli/
+output/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+config.local.json
+config.local.*
+credentials.local.json
+runtime.local.json
+local-runtime/
+local-config/
+signing/

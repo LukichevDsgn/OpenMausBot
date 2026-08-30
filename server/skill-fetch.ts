@@ -25,12 +25,108 @@ interface Target {
   path: string;
 }
 
+export interface SkillImportRequest {
+  source: string;
+  skillNames?: string[];
+}
+
+const SAFE_SKILL_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+function tokenizeSkillCommand(input: string): string[] | { error: string } {
+  const tokens: string[] = [];
+  let token = "";
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  let started = false;
+  for (const char of input) {
+    if (escaped) {
+      token += char;
+      escaped = false;
+      started = true;
+    } else if (char === "\\") {
+      escaped = true;
+      started = true;
+    } else if (quote) {
+      if (char === quote) quote = null;
+      else token += char;
+      started = true;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+      started = true;
+    } else if (/\s/.test(char)) {
+      if (started) {
+        tokens.push(token);
+        token = "";
+        started = false;
+      }
+    } else {
+      token += char;
+      started = true;
+    }
+  }
+  if (escaped || quote) return { error: "malformed quoting in skills import command" };
+  if (started) tokens.push(token);
+  return tokens;
+}
+
+/** Parse either a plain GitHub source or the safe, data-only shape of the
+ * skills CLI command. This deliberately never invokes npx or a shell. */
+export function parseSkillImportInput(input: string): SkillImportRequest | { error: string } {
+  const tokenized = tokenizeSkillCommand(input.trim());
+  if ("error" in tokenized) return tokenized;
+  if (tokenized.length === 1) return { source: tokenized[0]! };
+  const command = tokenized[0] === "npx" ? tokenized.slice(1) : tokenized;
+  if (command[0] !== "skills" || command[1] !== "add") {
+    return { error: "only `npx skills add <GitHub source> [--skill <name>]` is supported" };
+  }
+  let source: string | undefined;
+  const skillNames: string[] = [];
+  for (let index = 2; index < command.length; index += 1) {
+    const value = command[index]!;
+    if (value === "--skill" || value === "-s") {
+      const name = command[++index];
+      if (!name) return { error: `${value} requires an exact skill name` };
+      if (!SAFE_SKILL_ID.test(name)) return { error: `invalid skill name "${name}"` };
+      if (skillNames.includes(name)) return { error: `duplicate --skill name "${name}"` };
+      skillNames.push(name);
+    } else if (value.startsWith("-")) {
+      return { error: `unknown skills import flag "${value}"` };
+    } else if (source) {
+      return { error: "the skills import command accepts exactly one GitHub source" };
+    } else {
+      source = value;
+    }
+  }
+  if (!source) return { error: "the skills import command needs a GitHub source" };
+  return { source, ...(skillNames.length ? { skillNames } : {}) };
+}
+
+const GITHUB_TRACKING_QUERY_KEYS = new Set(["ysclid"]);
+
+/** Remove a tracking-only query without allowing arbitrary URL metadata into
+ * the repository parser. Unknown query keys remain invalid input. */
+function normalizeGithubTrackingQuery(text: string): string {
+  if (!/^https?:\/\/github\.com\//i.test(text)) return text;
+  try {
+    const url = new URL(text);
+    if (url.hostname.toLowerCase() !== "github.com" || !url.search) return text;
+    const keys = [...url.searchParams.keys()];
+    if (keys.length === 0 || keys.some((key) => !GITHUB_TRACKING_QUERY_KEYS.has(key.toLowerCase()))) return text;
+    return `${text.slice(0, text.indexOf("?"))}${url.hash}`;
+  } catch {
+    return text;
+  }
+}
+
 /** owner/repo, github.com/owner/repo[/tree/<ref>/<path>], or a raw/blob URL
  * straight to a SKILL.md. Anything else is refused, loudly. */
 export function parseSkillSource(input: string): Target | { rawUrl: string } | { error: string } {
-  const text = input.trim();
+  const text = normalizeGithubTrackingQuery(input.trim());
   if (!text) return { error: "paste a GitHub repository, folder, or SKILL.md URL" };
-  if (/^https?:\/\/raw\.githubusercontent\.com\/.+\/SKILL\.md$/i.test(text)) return { rawUrl: text };
+  if (/^https?:\/\/github\.com\//i.test(text) && /[?#]/.test(text)) {
+    return { error: "that does not look like a GitHub repository, folder, or SKILL.md URL" };
+  }
+  if (/^https:\/\/raw\.githubusercontent\.com\/.+\/SKILL\.md$/i.test(text)) return { rawUrl: text };
   const blob = text.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+SKILL\.md)$/i);
   if (blob) {
     return { rawUrl: `https://raw.githubusercontent.com/${blob[1]}/${blob[2]}/${blob[3]}/${blob[4]}` };
@@ -144,21 +240,55 @@ export async function fetchSkillDir(target: Target, dir: string, fetcher: typeof
   return { source: `github.com/${target.owner}/${target.repo}${ref}/${dir}`.replace(/\/$/, ""), files };
 }
 
+/** Match the installer's narrow frontmatter field semantics without coupling
+ * the fetch boundary to workspace storage: keys are case-insensitive and a
+ * later duplicate replaces an earlier value. */
+function declaredSkillName(manifest: string | undefined): string | undefined {
+  const frontmatter = manifest?.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1];
+  if (frontmatter === undefined) return undefined;
+  let name: string | undefined;
+  for (const line of frontmatter.split(/\r?\n/)) {
+    const field = line.match(/^([A-Za-z][\w-]*):\s*(.*)$/);
+    if (field?.[1]?.toLowerCase() !== "name") continue;
+    name = field[2]!.replace(/^["']|["']$/g, "").trim();
+  }
+  return name;
+}
+
 export async function fetchSkillFromSource(
   input: string,
   fetcher: typeof fetch = fetch,
 ): Promise<{ skills: FetchedSkill[] } | { error: string }> {
-  const parsed = parseSkillSource(input);
+  const request = parseSkillImportInput(input);
+  if ("error" in request) return request;
+  const parsed = parseSkillSource(request.source);
   if ("error" in parsed) return parsed;
   try {
+    let skills: FetchedSkill[];
     if ("rawUrl" in parsed) {
       const content = await fetchText(parsed.rawUrl, fetcher);
-      return { skills: [{ source: parsed.rawUrl, files: [{ path: "SKILL.md", content }] }] };
+      skills = [{ source: parsed.rawUrl, files: [{ path: "SKILL.md", content }] }];
+    } else {
+      const dirs = await discoverSkillDirs(parsed, fetcher);
+      if (!dirs.length) return { error: "no SKILL.md found there — paste a skill folder or a repo with a skills/ directory" };
+      skills = await Promise.all(dirs.map((dir) => fetchSkillDir(parsed, dir, fetcher)));
     }
-    const dirs = await discoverSkillDirs(parsed, fetcher);
-    if (!dirs.length) return { error: "no SKILL.md found there — paste a skill folder or a repo with a skills/ directory" };
-    const skills = await Promise.all(dirs.map((dir) => fetchSkillDir(parsed, dir, fetcher)));
-    return { skills };
+    if (!request.skillNames?.length) return { skills };
+    const byName = new Map<string, FetchedSkill>();
+    for (const skill of skills) {
+      const sourceName = skill.source.split("/").at(-1)?.split("@")[0];
+      const manifest = skill.files.find((file) => file.path === "SKILL.md")?.content;
+      const frontmatterName = declaredSkillName(manifest);
+      // Prefer the declared SKILL.md name when present. A directory named
+      // `lavish` must not satisfy `--skill lavish` if its manifest actually
+      // declares another id; source basename is only the fixture/legacy
+      // fallback for markdown that is validated later by the installer.
+      if (frontmatterName) byName.set(frontmatterName, skill);
+      else if (sourceName) byName.set(sourceName, skill);
+    }
+    const missing = request.skillNames.filter((name) => !byName.has(name));
+    if (missing.length) return { error: `requested skill(s) not found: ${missing.join(", ")}` };
+    return { skills: request.skillNames.map((name) => byName.get(name)!) };
   } catch (error) {
     return { error: error instanceof Error ? error.message : String(error) };
   }

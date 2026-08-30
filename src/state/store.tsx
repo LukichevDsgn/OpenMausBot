@@ -15,7 +15,7 @@ import {
 } from "react";
 import type { CloudBackend, EffortLevel } from "../../server/contracts.ts";
 import type { MausColor, MausMotion } from "@/lib/mascot";
-import type { BotAvatarCrop } from "../../shared/bot-avatar";
+import type { BotAvatarCrop, BotProceduralAvatar } from "../../shared/bot-avatar";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
 import type { Routine, RoutineInput, RoutineRun } from "@/lib/routines";
 import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib/webhooks";
@@ -235,6 +235,8 @@ export interface Bot {
   avatarUrl?: string | null;
   /** Mascot, or the crop applied to avatarUrl. */
   avatarCrop?: BotAvatarCrop;
+  /** Versioned parameters for the native procedural avatar renderer. */
+  avatarDefinition?: BotProceduralAvatar | null;
   unread: boolean;
   busy?: boolean;
   /** what the bot is doing, as the harness sees it; busy is derived from it */
@@ -285,6 +287,26 @@ export interface Bot {
   messages: Message[];
   /** leaf of the visible conversation branch (see visibleMessages) */
   activeLeafId?: string | null;
+}
+
+export function duplicateBotProfile(source: Bot) {
+  return {
+    name: `${source.name} copy`,
+    title: source.title,
+    description: source.description,
+    notifications: source.notifications,
+    modelSelection: source.modelSelection,
+    computer: source.computer,
+    cloudBackend: source.cloudBackend,
+    autoStartVps: source.autoStartVps,
+    avatarUrl: source.avatarUrl,
+    avatarCrop: source.avatarCrop,
+    // An absent definition is the classic mascot. Preserve that explicitly,
+    // otherwise POST /api/bots would leave the new generated preset in place.
+    avatarDefinition: source.avatarDefinition ?? null,
+    color: source.color,
+    mascotExpression: source.mascotExpression,
+  };
 }
 
 /** Legacy-safe UI interpretation of the user-owned Chief control guard. */
@@ -449,6 +471,7 @@ export interface SkillCatalogEntry {
   triggerTerms: string[];
   requiredCapabilities: string[];
   tools: string[];
+  dependencies: string[];
   origin: "built-in" | "recorded" | "imported";
   status: "available";
   source?: string;
@@ -544,7 +567,7 @@ export type Action =
   | { type: "groupPatched"; group: Partial<Group> & { id: string } }
   | { type: "groupDeleted"; groupId: string }
   | { type: "createGroup"; memberIds: string[]; name?: string; section?: string }
-  | { type: "sendGroup"; groupId: string; text: string; replyToId?: string; skillId?: string; onAccepted?: () => void }
+  | { type: "sendGroup"; groupId: string; text: string; replyToId?: string; skillIds?: string[]; skillId?: string; onAccepted?: () => void }
   | {
       type: "patchGroup";
       groupId: string;
@@ -561,7 +584,7 @@ export type Action =
   | { type: "skillsCatalog"; skills: SkillCatalogEntry[] }
   | { type: "configStatus"; config: ConfigStatus }
   | { type: "select"; id: string }
-  | { type: "send"; botId: string; text: string; replyToId?: string; skillId?: string; onAccepted?: () => void }
+  | { type: "send"; botId: string; text: string; replyToId?: string; skillIds?: string[]; skillId?: string; onAccepted?: () => void }
   | { type: "pendingQueued"; threadId: string; queueId: string; text: string }
   | { type: "consumePendingQueued"; threadId: string; queueId: string }
   | { type: "cancelQueued"; botId: string; queueId: string }
@@ -1082,7 +1105,10 @@ export function reducer(state: AppState, action: Action): AppState {
       const { acknowledgeLocalAuto: _ack, ...botPatch } = action.patch;
       return updateBot(next, action.botId, (b) => {
         const merged = { ...b, ...botPatch };
-        return merged.computer === "local" ? { ...merged, autoApprove: false } : merged;
+        const switchingToLocal = action.patch.computer === "local" && b.computer !== "local";
+        return switchingToLocal && action.patch.acknowledgeLocalAuto !== true
+          ? { ...merged, autoApprove: false }
+          : merged;
       });
     }
     case "threadActive": {
@@ -1471,7 +1497,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           if (quizBeforeSend) persistCard(action.botId, quizBeforeSend.id, { dismissed: true });
           void api(`/api/bots/${action.botId}/messages`, {
             method: "POST",
-            body: JSON.stringify({ text: action.text, replyToId: action.replyToId, skillId: action.skillId }),
+            body: JSON.stringify({ text: action.text, replyToId: action.replyToId, skillIds: action.skillIds, skillId: action.skillId }),
           })
             .then((body) => {
               action.onAccepted?.();
@@ -1588,18 +1614,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         case "duplicateBot": {
           const source = stateRef.current.bots.find((b) => b.id === action.botId);
           if (!source) break;
-          const duplicateProfile = {
-            name: `${source.name} copy`,
-            title: source.title,
-            description: source.description,
-            notifications: source.notifications,
-            modelSelection: source.modelSelection,
-            computer: source.computer,
-            cloudBackend: source.cloudBackend,
-            autoStartVps: source.autoStartVps,
-            avatarUrl: source.avatarUrl,
-            avatarCrop: source.avatarCrop,
-          };
+          const duplicateProfile = duplicateBotProfile(source);
           api("/api/bots", { method: "POST" })
             .then(({ bot }) =>
               api(`/api/bots/${bot.id}`, {
@@ -1646,7 +1661,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         case "sendGroup":
           api(`/api/groups/${action.groupId}/messages`, {
             method: "POST",
-            body: JSON.stringify({ text: action.text, replyToId: action.replyToId, skillId: action.skillId }),
+            body: JSON.stringify({ text: action.text, replyToId: action.replyToId, skillIds: action.skillIds, skillId: action.skillId }),
           }).then(() => action.onAccepted?.()).catch(showError);
           break;
         case "patchGroup":

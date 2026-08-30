@@ -25,7 +25,12 @@ import {
 } from "./workspace-credentials.mjs";
 import { activateExistingWindow } from "./single-instance.mjs";
 import { pollServerIdentity } from "./server-boot-probe.mjs";
-import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
+import {
+  enableGrokBotLinkHandler,
+  grokBotLinkHandlerStatus,
+  packageUrlFromCommandLine,
+  packageUrlFromDeepLink,
+} from "./package-link.mjs";
 import { defaultSaveName, withSavableFile } from "./save-file.mjs";
 import {
   ensureManagedComposioCredentials,
@@ -42,7 +47,8 @@ import {
   withoutManagedCompanionTunnelAccess,
 } from "./managed-companion-tunnel.mjs";
 import { createSecureCredentialState } from "./secure-credential-state.mjs";
-import { skinChrome, isKnownSkin } from "./skin-overlay.cjs";
+import { isKnownSkin } from "./skin-overlay.cjs";
+import { windowChromeOptions } from "./window-chrome.mjs";
 import { readSecureCredentials } from "./secure-credentials.mjs";
 import { createControlPlaneClient } from "./control-plane-client.mjs";
 import {
@@ -55,7 +61,14 @@ import capabilitiesModule from "./capabilities.cjs";
 const { desktopCapabilities, nativeDesktopActions } = capabilitiesModule;
 const nativeActions = nativeDesktopActions(process.platform);
 const require = createRequire(import.meta.url);
-const { createDisplayMediaGuard, invokeDisplayMediaCallback, selectCaptureSource } = require(
+const {
+  allowScreenFrameRequest,
+  captureScreenFrame,
+  createDisplayMediaGuard,
+  invokeDisplayMediaCallback,
+  isTrustedMainRenderer,
+  selectCaptureSource,
+} = require(
   "./screen-preview.cjs",
 );
 const { STAGE_PREFIX: APPIMAGE_CUA_STAGE_PREFIX } = require("./cua-linux-bundle.cjs");
@@ -77,9 +90,6 @@ let desktopWorkspaceManager = null;
 let desktopWorkspaceOwner = null;
 let pendingPackageInstallUrl = packageUrlFromCommandLine(process.argv);
 let mainWindow = null;
-// The active skin id, mirrored from the renderer so a window's native
-// caption-button overlay (issue #454) starts and stays on the right colours.
-let currentSkin = "midnight";
 let unreadCount = 0;
 let unreadOverlayIcon = null;
 
@@ -997,8 +1007,12 @@ function desktopWorkspaceForEvent(event, create = false) {
   return create ? ensureDesktopWorkspace(owner) : desktopWorkspaceManager;
 }
 
+function isMainRenderer(event) {
+  return isTrustedMainRenderer({ event, mainWindow });
+}
+
 ipcMain.on("screen:preview-intent", (event) => {
-  event.returnValue = displayMediaGuard.begin(event.senderFrame);
+  event.returnValue = isMainRenderer(event) && displayMediaGuard.begin(event.senderFrame);
 });
 
 ipcMain.on("desktop:unread-count", (event, value) => {
@@ -1009,8 +1023,6 @@ ipcMain.on("desktop:unread-count", (event, value) => {
 });
 
 function createWindow() {
-  const isMac = process.platform === "darwin";
-  const waitsForSkinSync = process.platform === "win32";
   const primary = screen.getPrimaryDisplay();
   const displays = [primary, ...screen.getAllDisplays().filter((display) => display.id !== primary.id)];
   const restored = resolveWindowState(readWindowState(), displays.map((display) => display.workArea));
@@ -1018,50 +1030,17 @@ function createWindow() {
     ...restored.bounds,
     minWidth: 900,
     minHeight: 600,
-    // The renderer restores its persisted skin before mounting React and
-    // mirrors it over desktop:skin. Keep Windows hidden until that handshake
-    // recolors the native caption-button overlay, otherwise a saved light
-    // skin still flashes the Midnight-black block on every cold start.
-    show: !waitsForSkinSync,
+    show: true,
     icon: APP_ICON,
     backgroundColor: "#070707",
     autoHideMenuBar: process.platform !== "darwin",
-    // macOS keeps inset traffic lights, Windows keeps its custom overlay,
-    // and Linux uses the native desktop title bar and window controls.
-    ...(isMac
-      ? { titleBarStyle: "hiddenInset", trafficLightPosition: { x: 16, y: 16 } }
-      : process.platform === "win32"
-        ? {
-            titleBarStyle: "hidden",
-            // height MUST match the ChatView/GroupView header strip (px-5 py-3
-            // around a 36px control row = 60). Windows draws the caption buttons
-            // to fill the overlay, so anything shorter leaves a dead band under
-            // them and anything taller overhangs the header.
-            // color/symbolColor follow the active skin (issue #454): the
-            // caption buttons live in this native overlay, and a light skin
-            // with a Midnight-black overlay is the "black block in the
-            // top-right corner". height stays 60 — see the note above.
-            titleBarOverlay: { ...skinChrome(currentSkin), height: 60 },
-          }
-        : {}),
+    ...windowChromeOptions(process.platform),
     webPreferences: {
       contextIsolation: true,
       preload: path.join(__dirname, "preload.cjs"),
     },
   });
   mainWindow = win;
-  if (waitsForSkinSync) {
-    // A broken renderer or preload must not strand the app as an invisible
-    // process. Normal startup shows from desktop:skin almost immediately;
-    // this is only the bounded recovery path.
-    const skinSyncFallback = setTimeout(() => {
-      if (!win.isDestroyed() && !win.isVisible()) win.show();
-    }, 5_000);
-    skinSyncFallback.unref?.();
-    const clearSkinSyncFallback = () => clearTimeout(skinSyncFallback);
-    win.once("show", clearSkinSyncFallback);
-    win.once("closed", clearSkinSyncFallback);
-  }
   installWindowStatePersistence(win);
   applyUnreadBadge(win);
   if (restored.maximized) win.maximize();
@@ -1224,13 +1203,16 @@ function createWindow() {
 
 // Local-control screen preview — served from the main process so the Screen
 // Recording permission prompt attributes to the app, never the server
-ipcMain.handle("screen:frame", async () => {
-  if (process.platform !== "darwin") return null;
-  const sources = await desktopCapturer.getSources({
-    types: ["screen"],
-    thumbnailSize: { width: 1280, height: 800 },
+ipcMain.handle("screen:frame", async (event, ...payload) => {
+  // This channel is deliberately a no-argument capability of the main app
+  // renderer only. Do not let a child viewer or a caller-supplied payload turn
+  // it into a general desktop-capture API.
+  if (!allowScreenFrameRequest({ event, mainWindow, payload })) return null;
+  return captureScreenFrame({
+    platform: process.platform,
+    getSources: (options) => desktopCapturer.getSources(options),
+    getPrimaryDisplay: () => screen.getPrimaryDisplay(),
   });
-  return sources[0]?.thumbnail.toDataURL() ?? null;
 });
 
 // Onboarding permission checks. Status reads are free; the mic request
@@ -1327,28 +1309,34 @@ ipcMain.handle("desktop:save-file", async (event, rawPath) => {
   });
 });
 
-// The renderer owns the skin (it lives in localStorage and stamps
-// [data-skin] before first paint); it tells the main process so the one
-// surface CSS cannot reach — the Windows caption-button overlay — matches.
-// Persisted in-process so a window opened later starts on the right colours.
-ipcMain.handle("desktop:skin", (event, skin) => {
-  if (!isKnownSkin(skin)) return false;
-  currentSkin = skin;
-  // The caption-button overlay is a Windows-only surface (createWindow only
-  // configures titleBarOverlay there); on macOS/Linux the renderer's CSS is
-  // the whole story and there is nothing native to recolour.
-  if (process.platform === "win32") {
-    const sender = BrowserWindow.fromWebContents(event.sender);
-    try {
-      sender?.setTitleBarOverlay({ ...skinChrome(skin), height: 60 });
-      // The first Windows window starts hidden so a persisted light skin is
-      // already applied when native chrome becomes visible.
-      if (sender && !sender.isVisible()) sender.show();
-    } catch {
-      // a window created without an overlay throws; safe to ignore
-    }
-  }
-  return true;
+// Keep the renderer's skin handshake as a safe acknowledgement for current
+// and older preload clients. Native chrome is platform-owned and does not
+// depend on skin state or a hidden-window startup handshake.
+ipcMain.handle("desktop:skin", (_event, skin) => isKnownSkin(skin));
+
+function currentGrokBotLinkHandlerState() {
+  return grokBotLinkHandlerStatus({
+    platform: process.platform,
+    packaged: app.isPackaged,
+    executablePath: process.execPath,
+    isDefaultProtocolClient: (...args) => app.isDefaultProtocolClient(...args),
+  });
+}
+
+ipcMain.handle("desktop:grok-link-handler:status", (event) => {
+  if (!isMainRenderer(event)) return { supported: false, isDefault: false };
+  return currentGrokBotLinkHandlerState();
+});
+
+ipcMain.handle("desktop:grok-link-handler:enable", (event) => {
+  if (!isMainRenderer(event)) return { supported: false, isDefault: false, registrationSucceeded: false };
+  return enableGrokBotLinkHandler({
+    platform: process.platform,
+    packaged: app.isPackaged,
+    executablePath: process.execPath,
+    isDefaultProtocolClient: (...args) => app.isDefaultProtocolClient(...args),
+    setAsDefaultProtocolClient: (...args) => app.setAsDefaultProtocolClient(...args),
+  });
 });
 
 ipcMain.handle("desktop:open-external", async (_event, rawUrl) => {
@@ -1499,6 +1487,15 @@ ipcMain.handle("companion-account:verify-code", (_event, email, code) =>
 );
 ipcMain.handle("companion-account:retry", () => ensureCompanionAccountService().retry());
 ipcMain.handle("companion-account:sign-out", () => ensureCompanionAccountService().signOut());
+ipcMain.handle("bot-shares:list", () => ensureCompanionAccountService().listBotShares());
+ipcMain.handle("bot-shares:create", (_event, input) => ensureCompanionAccountService().createBotShare(input));
+ipcMain.handle("bot-shares:update", (_event, shareId, input) =>
+  ensureCompanionAccountService().updateBotShare(shareId, input),
+);
+ipcMain.handle("bot-shares:visibility", (_event, shareId, visibility) =>
+  ensureCompanionAccountService().setBotShareVisibility(shareId, visibility),
+);
+ipcMain.handle("bot-shares:delete", (_event, shareId) => ensureCompanionAccountService().deleteBotShare(shareId));
 
 ipcMain.handle("desktop:capabilities", async () =>
   desktopCapabilities({

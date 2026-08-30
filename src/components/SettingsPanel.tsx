@@ -681,6 +681,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "mascotExpression"
         | "avatarUrl"
         | "avatarCrop"
+        | "avatarDefinition"
         | "autoApprove"
         | "autoReview"
         | "speakReplies"
