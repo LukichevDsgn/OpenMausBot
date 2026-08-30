@@ -152,6 +152,35 @@ describe("Antigravity turns (fake CLI)", () => {
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
   });
 
+  it("emits exactly one runtime.error for a non-SUCCESS result", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-agy-result-error-"));
+    const cli = join(scratch, "fake-agy-failure.mjs");
+    writeFileSync(cli, `#!/usr/bin/env node
+const out = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+out({ event: "init", conversation_id: "conv-failure" });
+out({ event: "result", result: { status: "ERROR", message: "provider quota exceeded" } });
+`);
+    chmodSync(cli, 0o755);
+    instance = await AntigravityDriver.create({
+      instanceId: "agy-result-error",
+      displayName: "Antigravity Result Error",
+      environment: { HOME: scratch, USERPROFILE: scratch },
+      enabled: true,
+      config: { cli, fullAuto: true },
+    });
+    recorder = recordEvents(instance.adapter);
+
+    await instance.adapter.sendTurn({ threadId: "t-result-error", text: "go" });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+
+    expect(done).toMatchObject({ ok: false, stopReason: "ERROR" });
+    expect(recorder.events.filter((event) => event.type === "runtime.error")).toEqual([
+      expect.objectContaining({ message: "provider quota exceeded" }),
+    ]);
+    await instance.dispose();
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
   it("respondToRequest resolves `unavailable` — no interactive permission channel, so the caller denies", async () => {
     await create();
     await expect(instance.adapter.respondToRequest("t-happy", "req-1", { behavior: "allow" })).resolves.toBe("unavailable");
