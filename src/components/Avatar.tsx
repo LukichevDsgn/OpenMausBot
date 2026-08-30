@@ -143,18 +143,20 @@ export function canonicalFaceBounds(
   {
     state = "surprised",
     gaze = { x: 0, y: 0 },
+    eyeScale = 1,
     showMouth = true,
     mouthStroke = CANONICAL_FACE_CONTRACT.mouthStrokeWidth,
   }: {
     state?: MausState;
     gaze?: Readonly<{ x: number; y: number }>;
+    eyeScale?: number;
     showMouth?: boolean;
     mouthStroke?: number;
   } = {},
 ) {
   const recipe = canonicalFaceRecipeForState(state);
-  const eyeWidth = snapHalf(CANONICAL_FACE_CONTRACT.eyeWidth * recipe.eyeScaleX);
-  const eyeHeight = snapHalf(CANONICAL_FACE_CONTRACT.eyeHeight * recipe.eyeScaleY);
+  const eyeWidth = snapHalf(CANONICAL_FACE_CONTRACT.eyeWidth * recipe.eyeScaleX * eyeScale);
+  const eyeHeight = snapHalf(CANONICAL_FACE_CONTRACT.eyeHeight * recipe.eyeScaleY * eyeScale);
   const gazeX = Math.max(-1.5, Math.min(1.5, gaze.x));
   const gazeY = Math.max(-1, Math.min(1, gaze.y));
   const left = snapHalf(50 - CANONICAL_FACE_CONTRACT.eyeGap / 2 - eyeWidth / 2 + recipe.eyeShiftX + gazeX);
@@ -282,6 +284,7 @@ function CanonicalFaceRig({
   faceScale,
   faceOffset,
   gaze,
+  eyeScale,
   showMouth,
   mouthStroke,
   animated,
@@ -291,14 +294,15 @@ function CanonicalFaceRig({
   faceScale: number;
   faceOffset: Readonly<{ x: number; y: number }>;
   gaze: Readonly<{ x: number; y: number }>;
+  eyeScale: number;
   showMouth: boolean;
   mouthStroke: number;
   animated: boolean;
   blinkKey: number;
 }) {
   const recipe = canonicalFaceRecipeForState(state);
-  const eyeWidth = snapHalf(CANONICAL_FACE_CONTRACT.eyeWidth * recipe.eyeScaleX);
-  const eyeHeight = snapHalf(CANONICAL_FACE_CONTRACT.eyeHeight * recipe.eyeScaleY);
+  const eyeWidth = snapHalf(CANONICAL_FACE_CONTRACT.eyeWidth * recipe.eyeScaleX * eyeScale);
+  const eyeHeight = snapHalf(CANONICAL_FACE_CONTRACT.eyeHeight * recipe.eyeScaleY * eyeScale);
   const gazeX = Math.max(-1.5, Math.min(1.5, gaze.x));
   const gazeY = Math.max(-1, Math.min(1, gaze.y));
   const leftX = snapHalf(50 - CANONICAL_FACE_CONTRACT.eyeGap / 2 - eyeWidth / 2 + recipe.eyeShiftX + gazeX);
@@ -476,6 +480,7 @@ function MausAvatarComponent(
             faceScale={presentation.faceScale}
             faceOffset={presentation.faceOffset}
             gaze={{ x: (gaze?.x ?? 0) + pointer.x, y: (gaze?.y ?? 0) + pointer.y }}
+            eyeScale={eyeScale ?? 1}
             showMouth={showMouth}
             mouthStroke={mouthStroke}
             animated={animated}

@@ -101,6 +101,33 @@ describe("canonical procedural avatar face", () => {
     expect(customStrokeMarkup).toContain('stroke-width="6.5"');
   });
 
+  it("applies eyeScale to the visible canonical eye geometry", () => {
+    const baseProps = {
+      animated: false,
+      color: "blue" as const,
+      size: 112,
+      state: "idle" as const,
+      trackPointer: false,
+    };
+    const readEyeGeometry = (eyeScale: number) => {
+      const markup = renderToStaticMarkup(createElement(MausAvatar, { ...baseProps, eyeScale }));
+      const faceMarkup = canonicalFaceFrom(markup);
+      return [...faceMarkup.matchAll(/<rect x="([\d.-]+)" y="([\d.-]+)" width="([\d.-]+)" height="([\d.-]+)"/g)]
+        .slice(0, 2)
+        .map((match) => match.slice(1).map(Number));
+    };
+
+    const normalEyes = readEyeGeometry(1);
+    const scaledEyes = readEyeGeometry(1.5);
+
+    expect(normalEyes).toHaveLength(2);
+    expect(scaledEyes).toHaveLength(2);
+    for (let index = 0; index < 2; index += 1) {
+      expect(scaledEyes[index][2]).toBeCloseTo(normalEyes[index][2] * 1.5, 8);
+      expect(scaledEyes[index][3]).toBeCloseTo(normalEyes[index][3] * 1.5, 8);
+    }
+  });
+
   it("keeps automatic canonical blinking active unless animation is paused", () => {
     const animatedMarkup = renderToStaticMarkup(createElement(MausAvatar, {
       color: "blue",
