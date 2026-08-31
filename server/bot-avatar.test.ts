@@ -6,6 +6,7 @@ import {
   botProceduralAvatarSchema,
   botAvatarUrlFromStoredPath,
   botAvatarUrlSchema,
+  generatedBotAvatar,
 } from "../shared/bot-avatar.ts";
 
 describe("bot avatar profile schema", () => {
@@ -41,28 +42,41 @@ describe("bot avatar profile schema", () => {
     expect(botAvatarProfile({
       avatarUrl: "https://example.test/pixel.png",
       avatarCrop: "round",
-      avatarDefinition: { version: 1, seed: "safe", silhouette: "raw-svg" },
+      avatarDefinition: { version: 1, seed: "safe", silhouette: "custom-svg" },
     }))
       .toEqual({ avatarCrop: "mascot" });
   });
 
-  it("keeps stable silhouette ids while stripping retired appearance fields", () => {
-    const stored = {
+  it("accepts only versioned procedural preset ids", () => {
+    const definition = {
       version: 1 as const,
-      seed: "bot-42",
-      silhouette: "leaf" as const,
-      restingAnimationId: "thinking",
-      expressionPreset: "side-eye",
+      seed: "bot_123",
+      silhouette: "gem" as const,
+      eyeStyle: "calm" as const,
+      mouthStyle: "none" as const,
+      expressionPreset: "side-eye" as const,
+      avatarPresetId: "freddy" as const,
+      restingAnimationId: "thinking" as const,
     };
-    expect(botProceduralAvatarSchema.parse(stored)).toEqual({
-      version: 1,
-      seed: "bot-42",
-      silhouette: "leaf",
-    });
-    expect(botAvatarProfile({ avatarDefinition: stored }).avatarDefinition).toEqual({
-      version: 1,
-      seed: "bot-42",
-      silhouette: "leaf",
-    });
+    expect(botProceduralAvatarSchema.parse(definition)).toEqual(definition);
+    for (const malformed of [
+      { ...definition, version: 2 },
+      { ...definition, seed: "<svg>" },
+      { ...definition, silhouette: "arbitrary" },
+      { ...definition, eyeStyle: "laser" },
+      { ...definition, mouthStyle: "markup" },
+      { ...definition, expressionPreset: "<path>" },
+      { ...definition, extra: "not-persisted" },
+    ]) {
+      expect(botProceduralAvatarSchema.safeParse(malformed).success).toBe(false);
+    }
+  });
+
+  it("generates a stable, schema-valid avatar from the persisted seed", () => {
+    const first = generatedBotAvatar(" bot/id ");
+    const second = generatedBotAvatar(first.definition.seed);
+    expect(first).toEqual(second);
+    expect(first.definition.seed).toBe("bot-id");
+    expect(botProceduralAvatarSchema.safeParse(first.definition).success).toBe(true);
   });
 });

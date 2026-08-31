@@ -71,6 +71,15 @@ describe("Store", () => {
     expect(store.messagesFor(bot.threadId)).toHaveLength(0);
   });
 
+  it("creates and reloads a deterministic procedural avatar definition", () => {
+    const store = new Store(selection);
+    const bot = store.createBot(undefined, { seedMessages: false });
+
+    expect(bot.avatarDefinition).toMatchObject({ version: 1, seed: bot.id });
+    expect(bot.mascotExpression).toBeTruthy();
+    expect(new Store(selection).bot(bot.id)?.avatarDefinition).toEqual(bot.avatarDefinition);
+  });
+
   it("addTaskUsage accumulates settled-turn totals per task and survives a restart", () => {
     const store = new Store(selection);
     const bot = store.createBot();
@@ -141,16 +150,18 @@ describe("Store", () => {
     expect(reloaded.bot(bot.id)?.composio).toBe(false);
   });
 
-  it("persists valid avatar definitions and sanitizes retired fields on reload", () => {
+  it("persists valid avatar definitions and accepted runtime fields on reload", () => {
     const store = new Store(selection);
     const bot = store.createBot();
     store.patchBot(bot.id, {
-      avatarDefinition: { version: 1, seed: "stored-avatar", silhouette: "shield" },
+      avatarDefinition: { version: 1, seed: "stored-avatar", silhouette: "shield", eyeStyle: "balanced", mouthStyle: "soft" },
     });
     expect(new Store(selection).bot(bot.id)?.avatarDefinition).toEqual({
       version: 1,
       seed: "stored-avatar",
       silhouette: "shield",
+      eyeStyle: "balanced",
+      mouthStyle: "soft",
     });
 
     const botsFile = join(DATA_DIR, "bots.json");
@@ -165,6 +176,10 @@ describe("Store", () => {
       version: 1,
       seed: "stored-avatar",
       silhouette: "shield",
+      eyeStyle: "balanced",
+      mouthStyle: "soft",
+      restingAnimationId: "thinking",
+      expressionPreset: "side-eye",
     });
   });
 

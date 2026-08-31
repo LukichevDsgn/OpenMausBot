@@ -16,6 +16,7 @@ import { pickBotName } from "./names.ts";
 import { redactSecretsInText } from "./redact.ts";
 import {
   botAvatarProfile,
+  generatedBotAvatar,
   type BotAvatarCrop,
   type BotProceduralAvatar,
 } from "../shared/bot-avatar.ts";
@@ -1154,7 +1155,7 @@ export class Store {
 
   createBot(
     profile: Partial<
-      Pick<BotRecord, "name" | "title" | "description" | "color" | "mascotExpression" | "modelSelection" | "section">
+      Pick<BotRecord, "name" | "title" | "description" | "color" | "mascotExpression" | "avatarDefinition" | "modelSelection" | "section">
     > = {},
     opts: {
       /** false = no greeting/onboarding seed. Imported bots must not open
@@ -1162,17 +1163,20 @@ export class Store {
       seedMessages?: boolean;
     } = {},
   ): BotRecord {
+    const id = newId();
+    const generatedAvatar = generatedBotAvatar(id);
     const name = profile.name?.trim() || pickBotName(this.bots.map((b) => b.name));
     const section = sectionKey(profile.section);
     const bot: BotRecord = {
-      id: newId(),
+      id,
       threadId: newId(),
       name,
       title: profile.title ?? "",
       description: profile.description ?? "",
       notifications: true,
-      color: profile.color ?? COLORS[this.bots.length % COLORS.length],
-      ...(profile.mascotExpression ? { mascotExpression: profile.mascotExpression } : {}),
+      color: profile.color ?? generatedAvatar.color ?? COLORS[this.bots.length % COLORS.length],
+      mascotExpression: profile.mascotExpression ?? generatedAvatar.restingState,
+      avatarDefinition: profile.avatarDefinition ?? generatedAvatar.definition,
       unread: false,
       modelSelection: profile.modelSelection ?? this.defaultSelection(),
       resumeCursors: {},

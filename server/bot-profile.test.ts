@@ -31,7 +31,6 @@ describe("parseBotProfilePatch (strict — the paired boundary)", () => {
     });
   });
 });
-
 describe("parseBotProfilePatch (both modes)", () => {
   it("lenient mode drops unknown keys instead of failing — the desktop PATCH mixes fields", () => {
     const result = parseBotProfilePatch({ name: "Mira", color: "red" } as never, false);
@@ -60,29 +59,39 @@ describe("parseBotProfilePatch (both modes)", () => {
     });
   });
 
-  it("accepts, sanitizes, and clears a procedural avatar definition", () => {
+  it("accepts and clears a supported procedural avatar", () => {
     const avatarDefinition = {
       version: 1 as const,
-      seed: "profile-avatar",
+      seed: "avatar-1",
       silhouette: "pebble" as const,
-      restingAnimationId: "thinking",
+      eyeStyle: "wide" as const,
+      mouthStyle: "soft" as const,
+      avatarPresetId: "citrus" as const,
+      restingAnimationId: "idle" as const,
     };
     expect(parseBotProfilePatch({ avatarDefinition }, true)).toEqual({
       ok: true,
-      patch: {
-        avatarDefinition: { version: 1, seed: "profile-avatar", silhouette: "pebble" },
-      },
+      patch: { avatarDefinition },
     });
     expect(parseBotProfilePatch({ avatarDefinition: null }, true)).toEqual({
       ok: true,
       patch: { avatarDefinition: undefined },
     });
-    // SAFETY: intentionally violates the silhouette union to exercise runtime validation.
+  });
+
+  it("refuses unsupported procedural ids with one actionable error", () => {
+    // SAFETY: intentionally violates the compile-time preset union to exercise the runtime boundary.
     expect(parseBotProfilePatch({
-      avatarDefinition: { version: 1, seed: "profile-avatar", silhouette: "raw-svg" },
+      avatarDefinition: {
+        version: 1,
+        seed: "avatar-1",
+        silhouette: "raw-svg",
+        eyeStyle: "wide",
+        mouthStyle: "soft",
+      },
     } as never, true)).toEqual({
       ok: false,
-      error: "avatarDefinition must use version 1, a safe seed, and a supported silhouette id",
+      error: "avatarDefinition must use version 1 and supported seed, silhouette, eye, and mouth presets",
     });
   });
 });

@@ -43,9 +43,7 @@ const profilePatchSchema = z.object({
     .optional(),
   avatarCrop: botAvatarCropSchema.optional(),
   avatarDefinition: z
-    .union([botProceduralAvatarSchema, z.null()], {
-      error: "avatarDefinition must be a supported procedural avatar",
-    })
+    .union([botProceduralAvatarSchema, z.null()], { error: "avatarDefinition must be a supported procedural avatar" })
     .optional(),
   voice: z
     .string({ error: "voice must be a string" })
@@ -98,7 +96,7 @@ export function parseBotProfilePatch(input: BotProfilePatchInput, strict = false
     if (issue?.path[0] === "avatarDefinition") {
       return {
         ok: false,
-        error: "avatarDefinition must use version 1, a safe seed, and a supported silhouette id",
+        error: "avatarDefinition must use version 1 and supported seed, silhouette, eye, and mouth presets",
       };
     }
     return { ok: false, error: issue?.message ?? "invalid profile patch" };

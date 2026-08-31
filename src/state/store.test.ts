@@ -429,6 +429,20 @@ describe("section Chiefs", () => {
     chiefOfStaff,
   });
 
+  it("restarts the mascot motion when a selected avatar shape changes", () => {
+    const source = bot("avatar", "Work");
+    const state = { ...initialState, bots: [{ ...source, messages: [] }] };
+    const next = reducer(state, {
+      type: "updateBot",
+      botId: source.id,
+      patch: {
+        avatarDefinition: { version: 1, seed: "avatar", silhouette: "gem", eyeStyle: "balanced", mouthStyle: "soft" },
+      },
+    });
+
+    expect(next.mascotMotion).toMatchObject({ botId: source.id, kind: "customize" });
+  });
+
   it("hands off only within the patched bot's section", () => {
     const workChief = bot("work-a", "Work", true);
     const workCandidate = bot("work-b", "Work");

@@ -1,295 +1,364 @@
+import { describe, expect, it } from "vitest";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
 
 import {
-  BotAvatar,
   CANONICAL_FACE_CONTRACT,
-  canonicalFaceBounds,
-  canonicalFaceRecipeForState,
+  canonicalFacePresentationForSurface,
+  blobatarEffectMode,
+  blobatarGazeOptions,
+  BotAvatar,
   MausAvatar,
+  avatarDefinitionForRegistryEntry,
+  avatarBodyFingerprintForDefinition,
+  bodyOpticalTokenForDefinition,
+  blobatarPresetGeometry,
+  nativeFaceBoundsForDefinition,
+  nativeFaceScaleForDefinition,
+  MIN_NATIVE_FACE_SCALE,
+  CANONICAL_NATIVE_FACE_SCALE,
+  BODY_OPTICAL_TOKEN,
+  SELECTABLE_AVATAR_REGISTRY,
+  SELECTABLE_AVATAR_REGISTRY_COUNT,
 } from "./Avatar";
-import {
-  DEFAULT_PROCEDURAL_AVATAR,
-  proceduralAvatarPresentation,
-  VISIBLE_PROCEDURAL_AVATAR_SILHOUETTES,
-} from "@/lib/procedural-avatar";
-import { MAUS_STATES } from "@/lib/mascot";
+import { FACE_BOX } from "./CursorAvatar";
+import { AVATAR_LAB_LIVE_PREVIEW_PROPS, AVATAR_LAB_STATIC_PREVIEW_PROPS, avatarLabPreviewDefinition, randomizeAvatarLabDraft } from "./AvatarLabDialog";
+import { type BotProceduralAvatar } from "../../shared/bot-avatar";
+import * as avatarCatalog from "@/lib/avatar-presets";
+import { DEFAULT_PROCEDURAL_AVATAR, proceduralAvatarPresentation } from "@/lib/procedural-avatar";
 
-const definition = {
-  ...DEFAULT_PROCEDURAL_AVATAR,
-  seed: "parity-avatar",
-  silhouette: "leaf" as const,
-};
+const registryEntries = SELECTABLE_AVATAR_REGISTRY;
+const definitions: BotProceduralAvatar[] = registryEntries.map((entry) => avatarDefinitionForRegistryEntry(entry, `test-${entry.id}`));
 
-const surfaceFrom = (markup: string) =>
-  markup.match(/data-avatar-surface="([^"]+)"/)?.[1];
+describe("native avatar engine", () => {
+  it("keeps pointer and reduced-motion gating deterministic", () => {
+    expect(blobatarGazeOptions(true, true)).toEqual({ travel: 3, lookAt: "pointer" });
+    expect(blobatarGazeOptions(true, false)).toEqual({ travel: undefined, lookAt: null });
+    expect(blobatarGazeOptions(true, true, true)).toEqual({ travel: undefined, lookAt: null });
+    expect(blobatarEffectMode(true, false)).toBe("animated");
+    expect(blobatarEffectMode(true, true)).toBe("static");
+  });
 
-const persistedSilhouettes = [
-  "cursor",
-  ...VISIBLE_PROCEDURAL_AVATAR_SILHOUETTES,
-  "moon",
-  "hex",
-] as const;
-
-const canonicalFaceFrom = (markup: string) =>
-  markup.slice(markup.lastIndexOf('<svg viewBox="0 0 100 100"'));
-
-describe("canonical procedural avatar face", () => {
-  it("keeps the complete upright face inside every visible shape safe zone", () => {
-    for (const silhouette of persistedSilhouettes) {
-      const presentation = proceduralAvatarPresentation({
-        ...DEFAULT_PROCEDURAL_AVATAR,
-        silhouette,
-      });
-      expect(presentation.faceScale * presentation.opticalScale, silhouette).toBeCloseTo(0.78, 6);
-      for (const state of MAUS_STATES) {
-        for (const gaze of [{ x: -1.5, y: -1 }, { x: 0, y: 0 }, { x: 1.5, y: 1 }]) {
-          const bounds = canonicalFaceBounds(
-            presentation.faceOffset,
-            presentation.faceScale,
-            presentation.opticalScale,
-            { state, gaze },
-          );
-          const scope = `${silhouette}:${state}:${gaze.x},${gaze.y}`;
-          expect(bounds.left, scope).toBeGreaterThanOrEqual(presentation.faceSafeZone.left);
-          expect(bounds.right, scope).toBeLessThanOrEqual(presentation.faceSafeZone.right);
-          expect(bounds.top, scope).toBeGreaterThanOrEqual(presentation.faceSafeZone.top);
-          expect(bounds.bottom, scope).toBeLessThanOrEqual(presentation.faceSafeZone.bottom);
-          expect(Object.values(bounds).every(Number.isFinite), scope).toBe(true);
-        }
-      }
+  it("renders every selectable shape with exactly one visible native face", () => {
+    expect(SELECTABLE_AVATAR_REGISTRY_COUNT).toBe(20);
+    expect(registryEntries).toHaveLength(SELECTABLE_AVATAR_REGISTRY_COUNT);
+    expect(new Set(registryEntries.map((entry) => entry.id)).size).toBe(SELECTABLE_AVATAR_REGISTRY_COUNT);
+    for (const [index, definition] of definitions.entries()) {
+      expect(registryEntries[index]?.kind).toMatch(/^(preset|procedural)$/);
+      const markup = renderToStaticMarkup(createElement(MausAvatar, { color: "blue", avatarDefinition: definition, state: "idle", size: 44, animated: true, trackPointer: false }));
+      expect((markup.match(/data-avatar-native-engine="CursorAvatar"/g) ?? [])).toHaveLength(1);
+      expect(markup).toContain('data-avatar-contract="native-cursor-v1"');
+      expect(markup).not.toContain("CanonicalFaceRig");
+      expect(markup).not.toContain("data-canonical-avatar-face");
+      expect(markup).not.toContain('eyeColor="transparent"');
+      expect(markup).toContain("data-avatar-native-engine=\"CursorAvatar\"");
+      expect(markup).toContain("#ffffff");
     }
   });
 
-  it("renders one white face rig and a silhouette-fitted gradient for every visible shape", () => {
-    for (const silhouette of persistedSilhouettes) {
+  it("keeps the authoritative Blobatar preset identities and exact body adapters", () => {
+    const expected = {
+      strobi: "round", freddy: "boxy", citrus: "organic", nova: "capsule", "grok-bot": "nub",
+      sunee: "cloud", kirby: "droplet", cloudee: "hexagon", cubee: "sun", onee: "triangle",
+    } as const;
+    const presetEntries = registryEntries.filter((entry) => entry.kind === "preset" && entry.avatarPresetId !== "openmaus-cursor");
+    expect(presetEntries).toHaveLength(10);
+    for (const entry of presetEntries) {
+      // SAFETY: the filtered registry excludes the sole non-Blobatar preset and all remaining ids are keys of expected.
+      const id = entry.avatarPresetId! as keyof typeof expected;
+      expect(avatarCatalog["blobatarShapeForPreset"](id)).toBe(expected[id]);
+      expect(avatarCatalog["blobatarShapePresentation"](expected[id])).toBeDefined();
+      const definition = avatarDefinitionForRegistryEntry(entry, `exact-${id}`);
+      const markup = renderToStaticMarkup(createElement(MausAvatar, { color: "green", avatarDefinition: definition, size: 44, animated: false }));
+      expect(markup).toContain(`data-avatar-silhouette="blobatar-${expected[id]}"`);
+    }
+    const fingerprints = new Set(presetEntries.map((entry) => avatarBodyFingerprintForDefinition(avatarDefinitionForRegistryEntry(entry, `exact-${entry.id}`))));
+    expect(fingerprints).toHaveLength(10);
+    expect(new Set(registryEntries.map((entry) => avatarBodyFingerprintForDefinition(avatarDefinitionForRegistryEntry(entry)))).size).toBe(20);
+  });
+
+  it("applies one registry optical token after geometric fitting, without changing face scale", () => {
+    const ids = ["strobi", "freddy", "citrus", "nova", "grok-bot", "sunee", "kirby", "cloudee", "cubee", "onee"] as const;
+    for (const id of ids) {
+      const geometry = blobatarPresetGeometry(id);
+      expect(geometry.opticalCorrection).toBe(1);
+      expect(geometry.opticalToken).toBe(BODY_OPTICAL_TOKEN[`preset:${id}`]);
+      expect(geometry.normalizedArea).toBeGreaterThanOrEqual(0.4);
+      expect(geometry.normalizedArea).toBeLessThanOrEqual(1.2);
+      expect(geometry.anchor.scale, id).toBeCloseTo(CANONICAL_NATIVE_FACE_SCALE, 6);
+      expect(geometry.anchor.scale).toBeLessThanOrEqual(1.18);
+      // Every authored mark stays a separate child (preserving overlap), while
+      // all marks reference one user-space gradient definition.
       const markup = renderToStaticMarkup(createElement(MausAvatar, {
-        color: "blue",
-        avatarDefinition: { ...DEFAULT_PROCEDURAL_AVATAR, silhouette },
-        state: "idle",
-        size: 112,
-        animated: false,
-        trackPointer: false,
+        color: "green", avatarDefinition: { ...DEFAULT_PROCEDURAL_AVATAR, avatarPresetId: id }, size: 64, animated: false,
       }));
-      expect(markup, silhouette).toContain('fill="#ffffff"');
-      expect(markup, silhouette).toContain('stroke="#ffffff"');
-      expect(markup, silhouette).toContain("linearGradient");
-      expect(markup, silhouette).toContain(`data-avatar-surface="${proceduralAvatarPresentation({ ...DEFAULT_PROCEDURAL_AVATAR, silhouette }).surface}"`);
+      const gradientPaints = markup.match(/fill="url\(#mascot[^"]+-grad\)"/g) ?? [];
+      expect(gradientPaints).toHaveLength(geometry.bodyMarkCount);
+      expect(markup).toContain('gradientUnits="userSpaceOnUse"');
+      expect(markup).toContain(`x1="${geometry.gradientSpace.x1}" y1="${geometry.gradientSpace.y1}" x2="${geometry.gradientSpace.x2}" y2="${geometry.gradientSpace.y2}"`);
+      expect(markup).not.toContain('fill-rule="evenodd"');
+    }
+    // The previously underweight triangle is explicitly inside the same
+    // audited occupancy band as its peers, while Cursor keeps its brand fit.
+    expect(blobatarPresetGeometry("onee").normalizedArea).toBeGreaterThan(0.45);
+    expect(blobatarPresetGeometry("cubee").normalizedArea).toBeGreaterThan(0.45);
+  });
+
+  it("has exactly one final body token for every selectable identity", () => {
+    expect(Object.keys(BODY_OPTICAL_TOKEN)).toHaveLength(SELECTABLE_AVATAR_REGISTRY_COUNT);
+    expect(BODY_OPTICAL_TOKEN["preset:openmaus-cursor"]).toBe(1);
+    for (const entry of registryEntries) {
+      const definition = avatarDefinitionForRegistryEntry(entry, `token-${entry.id}`);
+      const token = bodyOpticalTokenForDefinition(definition);
+      // SAFETY: registry ids are exactly the keys of BODY_OPTICAL_TOKEN by the assertion above.
+      expect(token).toBe(BODY_OPTICAL_TOKEN[entry.id as keyof typeof BODY_OPTICAL_TOKEN]);
+      expect(Number.isFinite(token)).toBe(true);
+      expect(token).toBeGreaterThan(0.9);
+      expect(token).toBeLessThan(1.6);
+      const markup = renderToStaticMarkup(createElement(MausAvatar, { color: "green", avatarDefinition: definition, size: 44, animated: false }));
+      // Optical correction belongs only to silhouette.fit; the native face
+      // anchor is serialized independently and never contains this token.
+      expect(markup).toContain('data-avatar-native-engine="CursorAvatar"');
+      expect(markup).not.toContain(`scale(${token}) translate(-114 -114) translate(114 114) scale(${token})`);
     }
   });
 
-  it("routes mouth visibility and stroke controls through the canonical face rig", () => {
-    const baseProps = {
-      animated: false,
-      color: "blue" as const,
-      size: 112,
-      trackPointer: false,
-    };
-    const defaultMarkup = renderToStaticMarkup(createElement(MausAvatar, baseProps));
-    const hiddenMarkup = renderToStaticMarkup(
-      createElement(MausAvatar, { ...baseProps, showMouth: false }),
-    );
-    const customStrokeMarkup = renderToStaticMarkup(
-      createElement(MausAvatar, { ...baseProps, mouthStroke: 6.5 }),
-    );
-
-    expect(defaultMarkup).toContain(
-      `stroke-width="${CANONICAL_FACE_CONTRACT.mouthStrokeWidth}"`,
-    );
-    expect(hiddenMarkup).not.toContain('stroke="#ffffff"');
-    expect(customStrokeMarkup).toContain('stroke-width="6.5"');
+  it("keeps the original Cursor gradient contract untouched", () => {
+    const markup = renderToStaticMarkup(createElement(MausAvatar, { color: "green", avatarDefinition: DEFAULT_PROCEDURAL_AVATAR, size: 64, animated: false }));
+    expect(markup).not.toContain('gradientUnits="userSpaceOnUse"');
+    expect(markup).toContain('x1="1" y1="0" x2="0" y2="1"');
   });
 
-  it("applies eyeScale to the visible canonical eye geometry", () => {
-    const baseProps = {
-      animated: false,
-      color: "blue" as const,
-      size: 112,
-      state: "idle" as const,
-      trackPointer: false,
-    };
-    const readEyeGeometry = (eyeScale: number) => {
-      const markup = renderToStaticMarkup(createElement(MausAvatar, { ...baseProps, eyeScale }));
-      const faceMarkup = canonicalFaceFrom(markup);
-      return [...faceMarkup.matchAll(/<rect x="([\d.-]+)" y="([\d.-]+)" width="([\d.-]+)" height="([\d.-]+)"/g)]
-        .slice(0, 2)
-        .map((match) => match.slice(1).map(Number));
-    };
+  it("keeps Avatar Lab options on the live native idle contract in the normal suite", () => {
+    expect(AVATAR_LAB_LIVE_PREVIEW_PROPS).toEqual({ state: "idle", animated: true, trackPointer: false });
+    expect(AVATAR_LAB_LIVE_PREVIEW_PROPS).not.toHaveProperty("expression");
+    expect(AVATAR_LAB_LIVE_PREVIEW_PROPS).not.toHaveProperty("autoBlink");
+    expect(AVATAR_LAB_LIVE_PREVIEW_PROPS).not.toHaveProperty("autoExpression");
+    expect(AVATAR_LAB_STATIC_PREVIEW_PROPS).toEqual({ state: "idle", animated: false, trackPointer: false, autoBlink: false, autoExpression: false, expression: 6 });
+    const savedFace = { ...DEFAULT_PROCEDURAL_AVATAR, expressionPreset: "delighted" as const };
+    expect(avatarLabPreviewDefinition(savedFace)).not.toHaveProperty("expressionPreset");
+    expect(savedFace.expressionPreset).toBe("delighted");
+  });
 
-    const normalEyes = readEyeGeometry(1);
-    const scaledEyes = readEyeGeometry(1.5);
-
-    expect(normalEyes).toHaveLength(2);
-    expect(scaledEyes).toHaveLength(2);
-    for (let index = 0; index < 2; index += 1) {
-      expect(scaledEyes[index][2]).toBeCloseTo(normalEyes[index][2] * 1.5, 8);
-      expect(scaledEyes[index][3]).toBeCloseTo(normalEyes[index][3] * 1.5, 8);
+  it("ignores legacy expression presets unless an explicit override is supplied", () => {
+    const steady = { ...DEFAULT_PROCEDURAL_AVATAR, expressionPreset: "steady" as const };
+    const legacyAngry = { ...steady, expressionPreset: "alert" as const };
+    const renderIdle = (avatarDefinition: BotProceduralAvatar) => renderToStaticMarkup(createElement(MausAvatar, {
+      color: "green", avatarDefinition, state: "idle", animated: false, trackPointer: false, size: 64,
+    }));
+    expect(renderIdle(legacyAngry)).toBe(renderIdle(steady));
+    expect(renderIdle(avatarLabPreviewDefinition(legacyAngry))).toBe(renderIdle(avatarLabPreviewDefinition(steady)));
+    for (const state of ["working", "surprised", "alerting"] as const) {
+      const markup = renderToStaticMarkup(createElement(MausAvatar, {
+        color: "green", avatarDefinition: legacyAngry, state, animated: false, trackPointer: false, size: 64,
+      }));
+      expect(markup).toContain(`data-avatar-state="${state}"`);
+      expect(markup).toContain('data-avatar-native-engine="CursorAvatar"');
     }
   });
 
-  it("keeps automatic canonical blinking active unless animation is paused", () => {
-    const animatedMarkup = renderToStaticMarkup(createElement(MausAvatar, {
-      color: "blue",
-      state: "working",
-      size: 44,
-      animated: true,
-      trackPointer: false,
-    }));
-    const pausedMarkup = renderToStaticMarkup(createElement(MausAvatar, {
-      color: "blue",
-      state: "working",
-      size: 44,
-      animated: false,
-      trackPointer: false,
-    }));
-
-    expect(animatedMarkup).toContain("data-avatar-auto-blink");
-    expect(pausedMarkup).not.toContain("data-avatar-auto-blink");
-  });
-
-  it("applies the same state, motion, gaze, and pause contract to every stored silhouette", () => {
-    for (const silhouette of persistedSilhouettes) {
-      const avatarDefinition = { ...DEFAULT_PROCEDURAL_AVATAR, silhouette };
-      const animatedMarkup = renderToStaticMarkup(createElement(MausAvatar, {
-        avatarDefinition,
-        color: "cyan",
-        state: "working",
-        motion: "surprise",
-        motionKey: 17,
-        gaze: { x: 1, y: -1 },
-        size: 44,
+  it("randomizes only body, color, and persisted eye geometry", () => {
+    const base: BotProceduralAvatar = {
+      ...DEFAULT_PROCEDURAL_AVATAR,
+      avatarPresetId: "openmaus-cursor",
+      expressionPreset: "steady",
+      mouthStyle: "soft",
+      restingAnimationId: "idle",
+    };
+    const samples = [
+      [0.01, 0.1, 0.1],
+      [0.42, 0.5, 0.5],
+      [0.84, 0.9, 0.9],
+    ] as const;
+    const results = samples.map((values) => {
+      let index = 0;
+      return randomizeAvatarLabDraft(base, "green", () => values[index++] ?? 0.1);
+    });
+    const identityKey = (definition: BotProceduralAvatar) => definition.avatarPresetId ?? `procedural:${definition.silhouette}`;
+    expect(new Set(results.map((result) => identityKey(result.definition))).size).toBeGreaterThan(1);
+    expect(new Set(results.map((result) => result.definition.eyeStyle)).size).toBeGreaterThan(1);
+    expect(new Set(results.map((result) => result.color)).size).toBeGreaterThan(1);
+    for (const result of results) {
+      expect(identityKey(result.definition)).not.toBe(identityKey(base));
+      expect(result.definition.eyeStyle).not.toBe(base.eyeStyle);
+      expect(result.color).not.toBe("green");
+      expect(result.definition.expressionPreset).toBe(base.expressionPreset);
+      expect(result.definition.mouthStyle).toBe(base.mouthStyle);
+      expect(result.definition.restingAnimationId).toBe(base.restingAnimationId);
+      const markup = renderToStaticMarkup(createElement(MausAvatar, {
+        color: result.color,
+        avatarDefinition: result.definition,
+        state: "idle",
+        motion: "none",
         animated: true,
         trackPointer: false,
+        size: 64,
       }));
-      const pausedMarkup = renderToStaticMarkup(createElement(MausAvatar, {
-        avatarDefinition,
-        color: "cyan",
-        state: "working",
-        motion: "surprise",
-        motionKey: 17,
-        gaze: { x: 1, y: -1 },
-        size: 44,
-        animated: false,
-        trackPointer: false,
-      }));
-
-      expect(animatedMarkup, silhouette).toContain('data-avatar-state="working"');
-      expect(animatedMarkup, silhouette).toContain('data-avatar-motion="surprise"');
-      expect(animatedMarkup, silhouette).toContain('data-avatar-motion-key="17"');
-      expect(animatedMarkup, silhouette).toContain('data-avatar-animated="true"');
-      expect(animatedMarkup, silhouette).toContain('data-avatar-face-state="working"');
-      expect(animatedMarkup, silhouette).toContain("data-avatar-auto-blink");
-      expect(pausedMarkup, silhouette).toContain('data-avatar-animated="false"');
-      expect(pausedMarkup, silhouette).not.toContain("data-avatar-auto-blink");
-      expect(pausedMarkup, silhouette).not.toContain("data-avatar-one-shot-blink");
+      expect(markup).toContain('data-avatar-state="idle"');
+      expect(markup).toContain('data-avatar-motion="none"');
+      expect(markup).toContain('data-avatar-native-engine="CursorAvatar"');
     }
   });
 
-  it("keeps the canonical face upright and optically equal at every app size", () => {
+  it("keeps Nova inside the rendered container and Onee face safely raised", () => {
+    const nova = blobatarPresetGeometry("nova");
+    const sourceCentreX = (nova.sourceBounds.left + nova.sourceBounds.right) / 2;
+    const sourceCentreY = (nova.sourceBounds.top + nova.sourceBounds.bottom) / 2;
+    const fitted = {
+      left: FACE_BOX / 2 + (nova.sourceBounds.left - sourceCentreX) * nova.fitScale,
+      right: FACE_BOX / 2 + (nova.sourceBounds.right - sourceCentreX) * nova.fitScale,
+      top: FACE_BOX / 2 + (nova.sourceBounds.top - sourceCentreY) * nova.fitScale,
+      bottom: FACE_BOX / 2 + (nova.sourceBounds.bottom - sourceCentreY) * nova.fitScale,
+    };
+    expect(nova.opticalToken).toBe(BODY_OPTICAL_TOKEN["preset:nova"]);
+    // Keep a deterministic inset from the SVG viewBox edge; the native
+    // Cursor viewBox has 15 units of padding, so -10..238.5 is the safe
+    // container contract for authored Blobatar bounds.
+    expect(fitted.left).toBeGreaterThanOrEqual(-10);
+    expect(fitted.right).toBeLessThanOrEqual(FACE_BOX + 10);
+    expect(fitted.top).toBeGreaterThanOrEqual(-10);
+    expect(fitted.bottom).toBeLessThanOrEqual(FACE_BOX + 10);
+
+    const onee = blobatarPresetGeometry("onee");
+    expect(onee.anchor.y).toBeLessThan(114);
+    const definition = { ...DEFAULT_PROCEDURAL_AVATAR, avatarPresetId: "onee" as const };
     for (const size of [16, 24, 32, 44, 64]) {
-      const expectedEyeWidth = CANONICAL_FACE_CONTRACT.eyeWidth * 0.78 * size / 100;
-      for (const silhouette of persistedSilhouettes) {
-        const presentation = proceduralAvatarPresentation({
-          ...DEFAULT_PROCEDURAL_AVATAR,
-          silhouette,
-        });
+      for (const state of ["idle", "surprised", "alerting"] as const) {
         const markup = renderToStaticMarkup(createElement(MausAvatar, {
-          color: "purple",
-          avatarDefinition: { ...DEFAULT_PROCEDURAL_AVATAR, silhouette },
-          state: "surprised",
-          gaze: { x: 1.5, y: -1 },
-          turn: 135,
-          size,
-          animated: false,
+          color: "green", avatarDefinition: definition, state, size, animated: true,
+          motion: state === "surprised" ? "surprise" : state === "alerting" ? "alert" : "none",
           trackPointer: false,
         }));
-        const faceMarkup = canonicalFaceFrom(markup);
-        const renderedEyeWidth = CANONICAL_FACE_CONTRACT.eyeWidth
-          * presentation.faceScale
-          * presentation.opticalScale
-          * size / 100;
-
-        expect(renderedEyeWidth, `${silhouette}:${size}`).toBeCloseTo(expectedEyeWidth, 8);
-        expect(faceMarkup, `${silhouette}:${size}`).toContain('data-canonical-avatar-face="true"');
-        expect(faceMarkup, `${silhouette}:${size}`).not.toContain("rotate(");
-        expect(faceMarkup, `${silhouette}:${size}`).not.toContain("scale(-");
+        expect(markup).toContain('data-avatar-native-engine="CursorAvatar"');
+        expect(markup).toContain(`data-avatar-state="${state}"`);
       }
     }
   });
 
-  it("derives representative reactions from runtime state", () => {
-    expect(canonicalFaceRecipeForState("idle")).not.toEqual(canonicalFaceRecipeForState("happy"));
-    expect(canonicalFaceRecipeForState("working")).toEqual(canonicalFaceRecipeForState("thinking"));
-    expect(canonicalFaceRecipeForState("alerting")).toEqual(canonicalFaceRecipeForState("angry"));
-    expect(canonicalFaceRecipeForState("sleeping")).not.toEqual(canonicalFaceRecipeForState("surprised"));
+  it("preserves the original Cursor silhouette without an outer scale", () => {
+    const markup = renderToStaticMarkup(createElement(MausAvatar, { color: "green", avatarDefinition: { ...definitions[0]!, silhouette: "cursor", avatarPresetId: undefined }, size: 64, animated: true, trackPointer: false }));
+    expect(markup).toContain('data-avatar-surface="openmaus-cursor"');
+    expect(markup).toContain('viewBox="-15 -15 258.541 258.541"');
+    expect(markup).not.toContain("transform:scale");
   });
 
-  it("uses the same definition in list-sized, profile-sized, and BotAvatar renders", () => {
-    const list = renderToStaticMarkup(createElement(MausAvatar, {
-      color: "purple",
-      avatarDefinition: definition,
-      state: "working",
-      size: 24,
-      animated: false,
-    }));
-    const profile = renderToStaticMarkup(createElement(MausAvatar, {
-      color: "purple",
-      avatarDefinition: definition,
-      state: "working",
-      size: 112,
-      animated: false,
-    }));
-    const shared = renderToStaticMarkup(createElement(BotAvatar, {
-      bot: { name: "Mira", color: "purple", avatarDefinition: definition },
-      state: "working",
-      size: 44,
-      animated: false,
-    }));
-    expect(surfaceFrom(list)).toBe("procedural:leaf");
-    expect(surfaceFrom(profile)).toBe(surfaceFrom(list));
-    expect(surfaceFrom(shared)).toBe(surfaceFrom(list));
+  it("keeps the full runtime contract for every stored silhouette and freezes when requested", () => {
+    const stored = [...definitions, ...(["moon", "hex"] as const).map((silhouette) => ({ version: 1 as const, seed: `legacy-${silhouette}`, silhouette, eyeStyle: "balanced" as const, mouthStyle: "soft" as const }))];
+    for (const avatarDefinition of stored) {
+      const live = renderToStaticMarkup(createElement(MausAvatar, { color: "cyan", avatarDefinition, state: "surprised", motion: "surprise", motionKey: 3, size: 44, animated: true, trackPointer: false }));
+      const paused = renderToStaticMarkup(createElement(MausAvatar, { color: "cyan", avatarDefinition, state: "surprised", motion: "surprise", motionKey: 3, size: 44, animated: false, trackPointer: false }));
+      expect(live).toContain('data-avatar-state="surprised"');
+      expect(live).toContain('data-avatar-motion="surprise"');
+      expect(live).toContain('data-avatar-animated="true"');
+      expect(paused).toContain('data-avatar-animated="false"');
+      expect(paused).toContain('data-avatar-native-engine="CursorAvatar"');
+      expect(live).toContain('data-avatar-contract="native-cursor-v1"');
+    }
   });
 
-  it("keeps legacy moon/orb and hex/tile surfaces identical across list, chat, profile, and preview sizes", () => {
-    for (const [legacy, canonical] of [["moon", "orb"], ["hex", "tile"]] as const) {
-      for (const size of [24, 32, 44, 64]) {
-        const legacyMarkup = renderToStaticMarkup(createElement(MausAvatar, {
-          color: "teal",
-          avatarDefinition: { ...DEFAULT_PROCEDURAL_AVATAR, silhouette: legacy },
-          state: "surprised",
-          size,
-          animated: false,
-          trackPointer: false,
-        }));
-        const canonicalMarkup = renderToStaticMarkup(createElement(MausAvatar, {
-          color: "teal",
-          avatarDefinition: { ...DEFAULT_PROCEDURAL_AVATAR, silhouette: canonical },
-          state: "surprised",
-          size,
-          animated: false,
-          trackPointer: false,
-        }));
-        expect(surfaceFrom(legacyMarkup), `${legacy}:${size}`).toBe(surfaceFrom(canonicalMarkup));
-        expect(canonicalFaceFrom(legacyMarkup), `${legacy}:${size}`)
-          .toBe(canonicalFaceFrom(canonicalMarkup));
+  it("flows mouth and eyeScale through the one native engine", () => {
+    const base = { color: "purple" as const, avatarDefinition: definitions[12]!, state: "surprised" as const, size: 64, animated: false, trackPointer: false };
+    const wide = renderToStaticMarkup(createElement(MausAvatar, { ...base, eyeScale: 1.18, mouthStroke: 6.5 }));
+    const hidden = renderToStaticMarkup(createElement(MausAvatar, { ...base, showMouth: false }));
+    expect(wide).toContain('data-avatar-eye-scale="1.18"');
+    expect(wide).toContain('stroke-width="6.5"');
+    expect(hidden).not.toContain('stroke-width="7.5"');
+    expect(hidden).not.toContain('stroke="#ffffff"');
+  });
+
+  it("enumerates the full native engine contract for every registry entry", () => {
+    for (const entry of registryEntries) {
+      const definition = avatarDefinitionForRegistryEntry(entry);
+      for (const size of [16, 24, 32, 44, 64]) {
+        const idle = renderToStaticMarkup(createElement(MausAvatar, { color: "green", avatarDefinition: definition, state: "idle", size, animated: true, trackPointer: false }));
+        const reaction = renderToStaticMarkup(createElement(MausAvatar, { color: "green", avatarDefinition: definition, state: "surprised", motion: "surprise", motionKey: 1, size, animated: true, trackPointer: false }));
+        const frozen = renderToStaticMarkup(createElement(MausAvatar, { color: "green", avatarDefinition: definition, state: "working", size, animated: false, trackPointer: false }));
+        expect(idle).toContain('data-avatar-native-engine="CursorAvatar"');
+        expect(idle).toContain('data-avatar-contract="native-cursor-v1"');
+        expect(reaction).toContain('data-avatar-state="surprised"');
+        expect(reaction).toContain('data-avatar-motion="surprise"');
+        expect(reaction).toContain('data-avatar-animated="true"');
+        expect(frozen).toContain('data-avatar-animated="false"');
+        expect(frozen).toContain('data-avatar-native-engine="CursorAvatar"');
       }
     }
   });
 
-  it("does not replace a valid uploaded avatar", () => {
-    const markup = renderToStaticMarkup(createElement(BotAvatar, {
-      bot: {
-        name: "Mira",
-        color: "purple",
-        avatarUrl: "/api/attachments/123e4567-e89b-12d3-a456-426614174000.webp",
-        avatarCrop: "circle",
-        avatarDefinition: definition,
-      },
-      size: 44,
-    }));
-    expect(markup).toContain("<img");
-    expect(markup).toContain("border-radius:50%");
-    expect(markup).not.toContain("data-avatar-surface");
+  it("keeps safe-zone bounds finite across all surfaces, sizes and eye extremes", () => {
+    const epsilon = 1e-6;
+    for (const [index, definition] of definitions.entries()) {
+      const presentation = canonicalFacePresentationForSurface(proceduralAvatarPresentation(definition).surface);
+      expect(presentation.opticalScale).toBeGreaterThanOrEqual(CANONICAL_FACE_CONTRACT.minOpticalScale);
+      expect(presentation.opticalScale).toBeLessThanOrEqual(CANONICAL_FACE_CONTRACT.maxOpticalScale);
+      for (const size of [16, 24, 32, 44, 64]) {
+        expect(size).toBeGreaterThan(0);
+        const bounds = nativeFaceBoundsForDefinition(definition);
+        const numericBounds = [bounds.left, bounds.right, bounds.top, bounds.bottom];
+        if (definition.avatarPresetId === "openmaus-cursor") {
+          expect(numericBounds.every(Number.isFinite)).toBe(true);
+          continue;
+        }
+        expect(bounds.left, `${registryEntries[index]?.id} left`).toBeGreaterThanOrEqual(bounds.faceSafeZone.left - epsilon);
+        expect(bounds.right, `${registryEntries[index]?.id} right`).toBeLessThanOrEqual(bounds.faceSafeZone.right + epsilon);
+        expect(bounds.top, `${registryEntries[index]?.id} top`).toBeGreaterThanOrEqual(bounds.faceSafeZone.top - epsilon);
+        expect(bounds.bottom, `${registryEntries[index]?.id} bottom`).toBeLessThanOrEqual(bounds.faceSafeZone.bottom + epsilon);
+        expect(numericBounds.every(Number.isFinite)).toBe(true);
+        expect(nativeFaceScaleForDefinition(definition), `${registryEntries[index]?.id} face scale`).toBeGreaterThanOrEqual(MIN_NATIVE_FACE_SCALE);
+      }
+    }
+  });
+
+  it("keeps Nova expression 0 and procedural capsule inside the exact native envelope", () => {
+    const cases = [
+      definitions.find((definition) => definition.avatarPresetId === "nova")!,
+      definitions.find((definition) => definition.silhouette === "capsule" && !definition.avatarPresetId)!,
+    ];
+    const scales = cases.map((definition) => nativeFaceScaleForDefinition(definition));
+    expect(scales[0]).toBeCloseTo(CANONICAL_NATIVE_FACE_SCALE, 6);
+    expect(scales[1]).toBeGreaterThanOrEqual(MIN_NATIVE_FACE_SCALE);
+    for (const definition of cases) {
+      const bounds = nativeFaceBoundsForDefinition(definition, { eyeScale: 1, showMouth: true, mouthStroke: 7.5 });
+      expect(bounds.left).toBeGreaterThanOrEqual(bounds.faceSafeZone.left - 1e-6);
+      expect(bounds.right).toBeLessThanOrEqual(bounds.faceSafeZone.right + 1e-6);
+      expect(bounds.top).toBeGreaterThanOrEqual(bounds.faceSafeZone.top - 1e-6);
+      expect(bounds.bottom).toBeLessThanOrEqual(bounds.faceSafeZone.bottom + 1e-6);
+    }
+  });
+
+  it("keeps two visible native eyes and mouth geometry for every Blobatar expression sample", () => {
+    const presetEntries = registryEntries.filter((entry) => entry.kind === "preset" && entry.avatarPresetId !== "openmaus-cursor");
+    for (const entry of presetEntries) {
+      for (const expression of [6, 0, 8]) {
+        const markup = renderToStaticMarkup(createElement(MausAvatar, {
+          color: "green",
+          avatarDefinition: avatarDefinitionForRegistryEntry(entry, `expression-${entry.id}-${expression}`),
+          expression,
+          size: 44,
+          animated: false,
+          trackPointer: false,
+        }));
+        // SSR leaves native paths to the CursorAvatar draw loop, but the
+        // contract must still serialize one body plus two eyes and a mouth.
+        expect((markup.match(/<path(?:\s|>)/g) ?? []).length, `${entry.id} expression ${expression}`).toBeGreaterThanOrEqual(3);
+        expect(markup).toContain('data-avatar-native-engine="CursorAvatar"');
+        expect(markup).toContain('stroke-linecap="round"');
+      }
+    }
+  });
+
+  it("keeps every Lab option card static while the large preview stays unpinned", () => {
+    expect(AVATAR_LAB_STATIC_PREVIEW_PROPS).toEqual({ state: "idle", animated: false, trackPointer: false, autoBlink: false, autoExpression: false, expression: 6 });
+    expect(AVATAR_LAB_LIVE_PREVIEW_PROPS).not.toHaveProperty("expression");
+  });
+
+  it("preserves list/profile/chat parity and uploaded avatars", () => {
+    const definition = definitions[15]!;
+    const list = renderToStaticMarkup(createElement(MausAvatar, { color: "purple", avatarDefinition: definition, state: "working", size: 24, animated: false }));
+    const profile = renderToStaticMarkup(createElement(MausAvatar, { color: "purple", avatarDefinition: definition, state: "working", size: 64, animated: false }));
+    const chat = renderToStaticMarkup(createElement(BotAvatar, { bot: { name: "Mira", color: "purple", avatarDefinition: definition }, state: "working", size: 44, animated: false }));
+    for (const markup of [list, profile, chat]) expect(markup).toContain('data-avatar-native-engine="CursorAvatar"');
+    const uploaded = renderToStaticMarkup(createElement(BotAvatar, { bot: { name: "Mira", color: "purple", avatarUrl: "/api/attachments/avatar.webp", avatarCrop: "circle", avatarDefinition: definition }, size: 44 }));
+    expect(uploaded).toContain("<img");
+    expect(uploaded).not.toContain("data-avatar-native-engine");
   });
 });

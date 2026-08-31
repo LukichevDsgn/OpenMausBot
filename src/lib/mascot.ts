@@ -1,4 +1,5 @@
-import { CURSOR_STATES, type CursorState } from "@/components/CursorAvatar";
+import { CURSOR_STATES, POOLS, type CursorState } from "@/components/CursorAvatar";
+import { BOT_AVATAR_EXPRESSION_PRESETS } from "../../shared/bot-avatar";
 
 /** The mascot's behaviour vocabulary — CursorAvatar's 39 states, under the
  * app's historical names. */
@@ -90,6 +91,16 @@ export const MAUS_MOTIONS = [
 
 export type MausMotion = "none" | (typeof MAUS_MOTIONS)[number];
 
+/** Live signals are allowed to replace a saved resting face for one render. */
+export const LIVE_MASCOT_STATES = ["alerting", "working", "notifying", "surprised"] as const satisfies MausState[];
+
+export function isLiveMascotState(state: MausState): boolean {
+  return LIVE_MASCOT_STATES.includes(state as (typeof LIVE_MASCOT_STATES)[number]);
+}
+
+/** The full named face library used by Avatar Lab; each card pins one engine face. */
+export const AVATAR_EXPRESSION_PRESETS = BOT_AVATAR_EXPRESSION_PRESETS;
+
 /**
  * The face used to be ten hand-drawn SVGs; it is now the engine's 39 states.
  * Bots saved under the old vocabulary still carry one of these ten names, so
@@ -122,6 +133,16 @@ export function normalizeState(value: string | null | undefined): MausState | nu
   return LEGACY_STATES[value] ?? null;
 }
 
+/** Explicit patch used by appearance controls so a click is persisted as the selected state. */
+export function mascotExpressionPatch(expression: MausState): { mascotExpression: MausState } {
+  return { mascotExpression: expression };
+}
+
+/** The face a static expression swatch paints. Kept beside the engine mapping. */
+export function mascotExpressionIndex(expression: MausState): number {
+  return POOLS[expression][0]!;
+}
+
 /**
  * The states worth offering in the appearance picker.
  *
@@ -132,20 +153,21 @@ export function normalizeState(value: string | null | undefined): MausState | nu
  * all rest on 3 — they differ in which faces they *drift* to, which a static
  * swatch cannot show. Offering them all gave 15 buttons showing 8 pictures.
  *
- * Across all 39 states there are only 11 distinct resting faces, so this is one
- * state per face, chosen for the clearest name. Every swatch looks different.
+ * This is one state per resting face, chosen for the clearest name. Every
+ * static swatch therefore renders a different face rather than relying on its
+ * animation drift to make duplicate previews appear distinct.
  */
 export const PICKABLE_STATES: MausState[] = [
-  "idle", // expression 0
-  "happy", // 2
-  "curious", // 3
-  "drowsy", // 4
-  "working", // 7
-  "thinking", // 8
-  "listening", // 10
-  "sleeping", // 13
-  "suspicious", // 14
-  "proud", // 15
+  "idle", // expression 6
+  "happy", // 19
+  "curious", // 21
+  "drowsy", // 22
+  "working", // 10
+  "thinking", // 17
+  "listening", // 1
+  "shy", // 24
+  "suspicious", // 5
+  "proud", // 2
 ];
 
 type MascotMessage = {
@@ -169,46 +191,12 @@ export type MascotBotProfile = {
  * visual identity stays stable while its title and description are edited.
  */
 export function stateForBot(bot: MascotBotProfile): MausState {
-  const pinned = normalizeState(bot.mascotExpression);
-  if (pinned) return pinned;
-
   const last = bot.messages?.[bot.messages.length - 1];
 
   if (last?.kind === "activity" && last.tool?.ok === false) return "alerting";
   if (bot.busy) return "working";
   if (bot.unread) return "notifying";
-  if (last?.kind === "options") return "curious";
-
-  const profile = `${bot.name} ${bot.title ?? ""} ${bot.description ?? ""}`.toLowerCase();
-  const matches = (words: RegExp) => words.test(profile);
-
-  if (matches(/\b(code|coding|developer|development|engineer|engineering|build|debug|program|software)\b/)) {
-    return "working";
-  }
-  if (matches(/\b(research|researcher|search|investigate|strategy|strategist|study|learn|knowledge)\b/)) {
-    return "searching";
-  }
-  if (matches(/\b(marketing|growth|launch|campaign|social|sales|outreach|brand)\b/)) {
-    return "excited";
-  }
-  if (matches(/\b(overnight|night|background|async|queue|batch|long-running)\b/)) {
-    return "drowsy";
-  }
-  if (matches(/\b(monitor|monitoring|incident|alert|watch|status|uptime)\b/)) {
-    return "radar";
-  }
-  if (matches(/\b(review|reviewer|audit|critic|critique|quality|qa|test|legal)\b/)) {
-    return "suspicious";
-  }
-  if (matches(/\b(security|secure|compliance|risk|privacy|finance|financial)\b/)) {
-    return "scared";
-  }
-  if (matches(/\b(design|designer|creative|brainstorm|art|illustration|music|story)\b/)) {
-    return "playful";
-  }
-  if (matches(/\b(support|help|success|onboarding|coach|teacher|guide|welcome)\b/)) {
-    return "happy";
-  }
+  if (last?.kind === "options") return "surprised";
 
   return "idle";
 }

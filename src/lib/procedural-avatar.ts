@@ -3,53 +3,41 @@ import {
   type CursorSilhouette,
 } from "@/components/CursorAvatar";
 import {
+  BOT_AVATAR_EXPRESSION_PRESETS,
   botProceduralAvatarSchema,
   type BotProceduralAvatar,
 } from "../../shared/bot-avatar";
 
 export const DEFAULT_PROCEDURAL_AVATAR: BotProceduralAvatar = {
   version: 1,
-  seed: "openmaus",
+  seed: "default",
   silhouette: "cursor",
+  eyeStyle: "balanced",
+  mouthStyle: "soft",
+  expressionPreset: "steady",
 };
 
-export const VISIBLE_PROCEDURAL_AVATAR_SILHOUETTES = [
-  "orb",
-  "tile",
-  "gem",
-  "pebble",
-  "spark",
-  "capsule",
-  "shield",
-  "leaf",
-  "drop",
-] as const satisfies readonly BotProceduralAvatar["silhouette"][];
+/** Returns a complete safe preset before applying an avatar-lab edit. */
+export function proceduralAvatarDefinition(definition?: BotProceduralAvatar | null): BotProceduralAvatar {
+  if (!definition) return DEFAULT_PROCEDURAL_AVATAR;
+  return botProceduralAvatarSchema.safeParse(definition).success ? definition : DEFAULT_PROCEDURAL_AVATAR;
+}
 
-type FaceSafeZone = Readonly<{
-  left: number;
-  right: number;
-  top: number;
-  bottom: number;
-}>;
+/** Changes only body geometry; persisted seed and face settings stay intact. */
+export function patchProceduralAvatarSilhouette(
+  definition: BotProceduralAvatar | null | undefined,
+  silhouette: BotProceduralAvatar["silhouette"],
+): BotProceduralAvatar {
+  return { ...proceduralAvatarDefinition(definition), silhouette };
+}
 
-export type ProceduralAvatarPresentation = Readonly<{
-  surface: string;
-  silhouette: CursorSilhouette;
-  opticalScale: number;
-  normalizedBounds: Readonly<{ width: number; height: number }>;
-  normalizedVisualArea: number;
-  faceScale: number;
-  faceOffset: Readonly<{ x: number; y: number }>;
-  faceSafeZone: FaceSafeZone;
-  brandedException?: true;
-}>;
-
-export const AVATAR_OPTICAL_AREA_BAND = {
-  min: 0.46,
-  max: 0.48,
-  brandedMin: 0.62,
-  brandedMax: 0.72,
-} as const;
+/** Changes only the legacy persisted face preset; visible geometry uses the shared face rig. */
+export function patchProceduralAvatarExpression(
+  definition: BotProceduralAvatar | null | undefined,
+  expressionPreset: BotProceduralAvatar["expressionPreset"],
+): BotProceduralAvatar {
+  return { ...proceduralAvatarDefinition(definition), expressionPreset };
+}
 
 const authoredSilhouette = (
   name: string,
@@ -68,7 +56,7 @@ const cursor: CursorSilhouette = {
   body: DEFAULT_SILHOUETTE.body.replace(/fill="#000000"/g, 'fill="{{GRADIENT}}"'),
 };
 
-const SILHOUETTES = {
+export const PROCEDURAL_AVATAR_SILHOUETTES = {
   cursor,
   orb: authoredSilhouette(
     "orb",
@@ -98,7 +86,7 @@ const SILHOUETTES = {
   ),
   shield: authoredSilhouette(
     "shield",
-    '<path xmlns="http://www.w3.org/2000/svg" d="M114 8 L207 43 V104 C207 158 170 198 114 220 C58 198 21 158 21 104 V43 Z" fill="currentColor"/>',
+    '<path xmlns="http://www.w3.org/2000/svg" d="M114 10 Q117 10 120 12 L193 38 Q204 42 204 53 V102 C204 157 168 194 121 215 Q114 218 107 215 C60 194 24 157 24 102 V53 Q24 42 35 38 L108 12 Q111 10 114 10 Z" fill="currentColor"/>',
     { x: 114, y: 119, scale: 0.76 },
   ),
   leaf: authoredSilhouette(
@@ -106,67 +94,84 @@ const SILHOUETTES = {
     '<path xmlns="http://www.w3.org/2000/svg" d="M205 18 C135 13 62 35 28 91 C2 134 23 190 67 211 C116 234 176 198 197 145 C211 110 210 57 205 18 Z" fill="currentColor"/>',
     { x: 112, y: 124, scale: 0.75 },
   ),
+  moon: authoredSilhouette(
+    "moon",
+    '<path xmlns="http://www.w3.org/2000/svg" d="M185 26 C157 18 128 22 104 38 C69 61 51 104 59 144 C68 190 108 218 151 215 C178 213 200 198 216 177 C179 181 143 163 130 132 C115 96 134 54 185 26 Z" fill="currentColor"/>',
+    { x: 110, y: 119, scale: 0.78 },
+  ),
+  hex: authoredSilhouette(
+    "hex",
+    '<path xmlns="http://www.w3.org/2000/svg" d="M61 12 H167 L216 64 V164 L167 216 H61 L12 164 V64 Z" fill="currentColor"/>',
+    { x: 114, y: 116, scale: 0.78 },
+  ),
   drop: authoredSilhouette(
     "drop",
     '<path xmlns="http://www.w3.org/2000/svg" d="M114 7 C114 7 28 96 28 148 C28 192 66 220 114 220 C162 220 200 192 200 148 C200 96 114 7 114 7 Z" fill="currentColor"/>',
     { x: 114, y: 121, scale: 0.76 },
   ),
-} satisfies Record<(typeof VISIBLE_PROCEDURAL_AVATAR_SILHOUETTES)[number] | "cursor", CursorSilhouette>;
+} satisfies Record<BotProceduralAvatar["silhouette"], CursorSilhouette>;
 
-const PRESENTATION = {
-  cursor: { opticalScale: 1, normalizedBounds: { width: 0.74, height: 0.9 }, faceOffset: { x: 0, y: -3 }, faceSafeZone: { left: 34, right: 66, top: 29, bottom: 72 }, brandedException: true },
-  orb: { opticalScale: 0.77, normalizedBounds: { width: 0.893, height: 0.893 }, faceOffset: { x: 0, y: 0 }, faceSafeZone: { left: 30, right: 70, top: 27, bottom: 80 } },
-  tile: { opticalScale: 0.824, normalizedBounds: { width: 0.845, height: 0.819 }, faceOffset: { x: 0, y: -1 }, faceSafeZone: { left: 29, right: 71, top: 27, bottom: 80 } },
-  gem: { opticalScale: 0.753, normalizedBounds: { width: 0.919, height: 0.901 }, faceOffset: { x: 0, y: -1 }, faceSafeZone: { left: 31, right: 69, top: 29, bottom: 78 } },
-  pebble: { opticalScale: 0.709, normalizedBounds: { width: 0.967, height: 0.967 }, faceOffset: { x: 0, y: 0 }, faceSafeZone: { left: 30, right: 70, top: 28, bottom: 80 } },
-  spark: { opticalScale: 0.727, normalizedBounds: { width: 0.923, height: 0.963 }, faceOffset: { x: 0, y: -1 }, faceSafeZone: { left: 31, right: 69, top: 28, bottom: 79 } },
-  capsule: { opticalScale: 0.855, normalizedBounds: { width: 0.691, height: 0.928 }, faceOffset: { x: 0, y: -2 }, faceSafeZone: { left: 33, right: 67, top: 27, bottom: 79 } },
-  shield: { opticalScale: 0.789, normalizedBounds: { width: 0.814, height: 0.928 }, faceOffset: { x: 0, y: -1 }, faceSafeZone: { left: 31, right: 69, top: 28, bottom: 79 } },
-  leaf: { opticalScale: 0.739, normalizedBounds: { width: 0.915, height: 0.941 }, faceOffset: { x: 1, y: 1 }, faceSafeZone: { left: 31, right: 69, top: 30, bottom: 82 } },
-  drop: { opticalScale: 0.818, normalizedBounds: { width: 0.753, height: 0.932 }, faceOffset: { x: 0, y: -4 }, faceSafeZone: { left: 32, right: 68, top: 24, bottom: 79 } },
-} as const;
+export const PROCEDURAL_AVATAR_SILHOUETTE_LABELS = {
+  cursor: "Cursor",
+  orb: "Orb",
+  tile: "Tile",
+  gem: "Gem",
+  pebble: "Pebble",
+  spark: "Spark",
+  capsule: "Capsule",
+  shield: "Shield",
+  leaf: "Leaf",
+  moon: "Moon",
+  hex: "Hex",
+  drop: "Drop",
+} satisfies Record<BotProceduralAvatar["silhouette"], string>;
 
-const RESOLVED_SILHOUETTE = {
+/**
+ * The picker has one branded Cursor surface. These legacy ids stay valid in
+ * persisted data, but are intentionally not offered as new choices.
+ */
+export const VISIBLE_PROCEDURAL_AVATAR_SILHOUETTES = [
+  "orb",
+  "tile",
+  "gem",
+  "pebble",
+  "spark",
+  "capsule",
+  "shield",
+  "leaf",
+  "drop",
+] as const satisfies readonly BotProceduralAvatar["silhouette"][];
+
+const LEGACY_PROCEDURAL_SILHOUETTE_FALLBACKS = {
   cursor: "cursor",
-  orb: "orb",
-  tile: "tile",
-  gem: "gem",
-  pebble: "pebble",
-  spark: "spark",
-  capsule: "capsule",
-  shield: "shield",
-  leaf: "leaf",
   moon: "orb",
   hex: "tile",
-  drop: "drop",
-} as const satisfies Record<BotProceduralAvatar["silhouette"], keyof typeof SILHOUETTES>;
+} as const;
 
-export function proceduralAvatarDefinition(
-  value?: BotProceduralAvatar | null,
-): BotProceduralAvatar {
-  return botProceduralAvatarSchema.safeParse(value).data ?? DEFAULT_PROCEDURAL_AVATAR;
-}
-
+/** Resolve old hidden ids for rendering without changing the stored record. */
 export function resolvedProceduralSilhouette(
   silhouette: BotProceduralAvatar["silhouette"],
-): keyof typeof SILHOUETTES {
-  return RESOLVED_SILHOUETTE[silhouette];
+): BotProceduralAvatar["silhouette"] {
+  return LEGACY_PROCEDURAL_SILHOUETTE_FALLBACKS[silhouette as keyof typeof LEGACY_PROCEDURAL_SILHOUETTE_FALLBACKS]
+    ?? silhouette;
 }
 
-export function proceduralAvatarPresentation(
-  value?: BotProceduralAvatar | null,
-): ProceduralAvatarPresentation {
-  const definition = proceduralAvatarDefinition(value);
-  const silhouette = resolvedProceduralSilhouette(definition.silhouette);
-  const metrics = PRESENTATION[silhouette];
+export function proceduralAvatarPresentation(definition?: BotProceduralAvatar | null) {
+  const avatar = proceduralAvatarDefinition(definition);
+  const resolvedSilhouette = resolvedProceduralSilhouette(avatar.silhouette);
+  const expression = BOT_AVATAR_EXPRESSION_PRESETS.find(
+    (preset) => preset.id === avatar.expressionPreset,
+  )?.expression;
   return {
-    surface: silhouette === "cursor" ? "openmaus-cursor" : `procedural:${silhouette}`,
-    silhouette: SILHOUETTES[silhouette],
-    ...metrics,
-    // Body scales vary to equalize silhouette area. Counter-scale the face so
-    // its final eye/stroke size is a constant 0.78 of the requested box.
-    faceScale: 0.78 / metrics.opticalScale,
-    normalizedVisualArea:
-      metrics.normalizedBounds.width * metrics.normalizedBounds.height * metrics.opticalScale ** 2,
+    /** Legacy cursor is the branded OpenMaus Cursor surface. */
+    surface: resolvedSilhouette === "cursor" ? "openmaus-cursor" : `procedural:${resolvedSilhouette}`,
+    sourceSilhouette: avatar.silhouette,
+    silhouette: PROCEDURAL_AVATAR_SILHOUETTES[resolvedSilhouette],
+    expression,
+    eyeScale: avatar.eyeStyle === "wide" ? 1.18 : avatar.eyeStyle === "calm" ? 0.88 : 1,
+    // Every visible mascot keeps the small white mark; the legacy "none"
+    // value remains parseable but can no longer produce an eyes-only face.
+    showMouth: true,
+    mouthStroke: avatar.mouthStyle === "bold" ? 6.5 : 4,
   };
 }

@@ -671,6 +671,26 @@ function updateBot(state: AppState, botId: string, fn: (b: Bot) => Bot): AppStat
   return { ...state, bots: state.bots.map((b) => (b.id === botId ? fn(b) : b)) };
 }
 
+export function duplicateBotProfile(source: Bot) {
+  return {
+    name: `${source.name} copy`,
+    title: source.title,
+    description: source.description,
+    notifications: source.notifications,
+    modelSelection: source.modelSelection,
+    computer: source.computer,
+    cloudBackend: source.cloudBackend,
+    autoStartVps: source.autoStartVps,
+    avatarUrl: source.avatarUrl,
+    avatarCrop: source.avatarCrop,
+    // An absent definition is the classic mascot. Preserve that explicitly,
+    // otherwise POST /api/bots would leave the new generated preset in place.
+    avatarDefinition: source.avatarDefinition ?? null,
+    color: source.color,
+    mascotExpression: source.mascotExpression,
+  };
+}
+
 function withMascotMotion(
   state: AppState,
   botId: string,
@@ -1095,7 +1115,8 @@ export function reducer(state: AppState, action: Action): AppState {
     case "updateBot": {
       const mascotChanged =
         Object.prototype.hasOwnProperty.call(action.patch, "color") ||
-        Object.prototype.hasOwnProperty.call(action.patch, "mascotExpression");
+        Object.prototype.hasOwnProperty.call(action.patch, "mascotExpression") ||
+        Object.prototype.hasOwnProperty.call(action.patch, "avatarDefinition");
       const animated = mascotChanged
         ? withMascotMotion(state, action.botId, "customize")
         : state;
@@ -1618,19 +1639,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         case "duplicateBot": {
           const source = stateRef.current.bots.find((b) => b.id === action.botId);
           if (!source) break;
-          const duplicateProfile = {
-            name: `${source.name} copy`,
-            title: source.title,
-            description: source.description,
-            notifications: source.notifications,
-            modelSelection: source.modelSelection,
-            computer: source.computer,
-            cloudBackend: source.cloudBackend,
-            autoStartVps: source.autoStartVps,
-            avatarUrl: source.avatarUrl,
-            avatarCrop: source.avatarCrop,
-            avatarDefinition: source.avatarDefinition,
-          };
+          const duplicateProfile = duplicateBotProfile(source);
           api("/api/bots", { method: "POST" })
             .then(({ bot }) =>
               api(`/api/bots/${bot.id}`, {

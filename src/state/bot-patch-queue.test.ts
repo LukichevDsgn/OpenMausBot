@@ -68,6 +68,30 @@ describe("bot patch queue", () => {
     );
   });
 
+  it("coalesces avatar shape and expression edits into one persisted patch", async () => {
+    const sent: BotUpdatePatch[] = [];
+    const queue = createBotPatchQueue({
+      send: async (_botId, patch) => {
+        sent.push(patch);
+        return bot({ ...patch });
+      },
+      reconcile: async () => bot(),
+      onAuthoritative: vi.fn(),
+      onError: vi.fn(),
+    });
+
+    queue.enqueue("bot-1", {
+      avatarDefinition: { version: 1, seed: "avatar", silhouette: "gem", eyeStyle: "balanced", mouthStyle: "soft" },
+    }, bot());
+    queue.enqueue("bot-1", { mascotExpression: "proud" }, bot());
+    await vi.advanceTimersByTimeAsync(400);
+
+    expect(sent).toEqual([{
+      avatarDefinition: { version: 1, seed: "avatar", silhouette: "gem", eyeStyle: "balanced", mouthStyle: "soft" },
+      mascotExpression: "proud",
+    }]);
+  });
+
   it("serializes in-flight profile edits and overlays only the later values", async () => {
     const first = deferredBot();
     const second = deferredBot();
