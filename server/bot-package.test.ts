@@ -51,6 +51,35 @@ const validPackage: any = {
 };
 
 describe("bot packages", () => {
+  const portableSkill = {
+    name: "source-check",
+    description: "Check sources before writing.",
+    source: "conversation:source-check",
+    instructions: "---\nname: source-check\ndescription: Check sources before writing.\n---\n\n# Source check\n",
+  };
+
+  it("round-trips portable skills and rejects dangling or mismatched references", () => {
+    const withSkill = {
+      ...validPackage,
+      package: {
+        ...validPackage.package,
+        agents: [{ ...validPackage.package.agents[0], skills: [portableSkill.name] }],
+        skills: { version: 1, entries: [portableSkill] },
+      },
+    };
+    const parsed = parseBotPackage(withSkill);
+    expect(parsed.package.agents[0]?.skills).toEqual(["source-check"]);
+    expect(parseBotPackage(renderBotPackageMarkdown(parsed)).package.skills?.entries).toEqual([portableSkill]);
+    expect(() => parseBotPackage({
+      ...withSkill,
+      package: { ...withSkill.package, agents: [{ ...withSkill.package.agents[0], skills: ["missing"] }] },
+    })).toThrow("unknown skill");
+    expect(() => parseBotPackage({
+      ...withSkill,
+      package: { ...withSkill.package, skills: { version: 1, entries: [{ ...portableSkill, description: "Different" }] } },
+    })).toThrow("does not match its description");
+  });
+
   it("parses the complete portable structure and strips authority fields", () => {
     const parsed = parseBotPackage(validPackage);
     expect(parsed.package.rooms![0]?.defaultResponder).toEqual({ kind: "agent", agent: "lead" });

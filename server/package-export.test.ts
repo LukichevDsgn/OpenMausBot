@@ -98,6 +98,15 @@ describe("package export", () => {
           updatedAt: 1,
         },
       ],
+      skillsByBot: new Map([[
+        "private-id",
+        [{
+          name: "source-check",
+          description: "Check sources.",
+          source: "conversation:source-check",
+          instructions: "---\nname: source-check\ndescription: Check sources.\n---\n\n# Source check\n",
+        }],
+      ]]),
     });
     expect(exported.package.routines).toHaveLength(2);
     expect(exported.package.routines?.[1]?.schedule).toEqual({
@@ -118,9 +127,37 @@ describe("package export", () => {
           { agent: "lead", enabledAfterInstall: false },
         ],
         playbooks: [{ key: "launch" }],
+        skills: { entries: [{ name: "source-check" }] },
+        agents: [{ skills: ["source-check"] }],
       },
     });
     expect(JSON.stringify(exported)).not.toMatch(/private-id|private-thread|private-engine|secret-model|secret-session|private\/path|private-attachment|autoApprove|alwaysAllow|nextRunAt/);
+  });
+
+  it("refuses conflicting portable skill content across selected bots", () => {
+    const bot = (id: string): BotRecord => ({
+      id,
+      threadId: `thread-${id}`,
+      name: id,
+      title: "Researcher",
+      description: "Researches leads",
+      notifications: true,
+      color: "green",
+      unread: false,
+      modelSelection: { instanceId: "engine", model: "model", effort: "medium" },
+      resumeCursors: {},
+      createdAt: 1,
+    });
+    expect(() => createBotPackageExport({
+      name: "Conflicting Skills",
+      bots: [bot("one"), bot("two")],
+      groups: [],
+      routines: [],
+      skillsByBot: new Map([
+        ["one", [{ name: "shared", description: "Shared", instructions: "---\nname: shared\ndescription: Shared\n---\none" }]],
+        ["two", [{ name: "shared", description: "Shared", instructions: "---\nname: shared\ndescription: Shared\n---\ntwo" }]],
+      ]),
+    })).toThrow("conflicting content");
   });
 
   it("shares one identical playbook definition across multiple bots", () => {

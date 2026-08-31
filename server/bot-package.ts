@@ -2,12 +2,15 @@ import { z } from "zod";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 import { schemaIssue, type JsonValue } from "./schema.ts";
+import { parseSkillMd, SKILL_FILE_MAX_BYTES } from "./skills.ts";
 import type { MausColor } from "./store.ts";
 import type { TeamManifestMember } from "./team-manifest.ts";
 
 export const BOT_PACKAGE_FORMAT = "openmaus.package" as const;
 export const BOT_PACKAGE_VERSION = 1 as const;
 export const BOTMRR_MARKDOWN_VERSION = 1 as const;
+export const BOT_PACKAGE_SKILLS_VERSION = 1 as const;
+const BOT_PACKAGE_MAX_SKILLS = 20;
 
 const COLORS = [
   "green",
@@ -34,8 +37,28 @@ const optionalText = (max: number) =>
 
 const key = requiredText(64).regex(/^[a-z0-9][a-z0-9_-]*$/, {
   message: "may only contain lowercase letters, numbers, - and _",
-});
 const MAX_DATE_MS = 8_640_000_000_000_000;
+const skillName = requiredText(64).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, {
+  message: "must be a lowercase skill name",
+});
+const portableSource = optionalText(2_000).refine(
+  (value) => value === undefined || !/^(?:[a-z]:[\\/]|[\\/]|\\\\|file:)/i.test(value),
+  { message: "must not be an absolute path" },
+);
+const skillInstructions = z
+  .string({ error: "must be text" })
+  .min(1, { message: "is required" })
+  .max(SKILL_FILE_MAX_BYTES, { message: "is too long" })
+  .refine((value) => Buffer.byteLength(value, "utf8") <= SKILL_FILE_MAX_BYTES, { message: "is too large" })
+  .refine((value) => /^---\r?\n/.test(value), { message: "must start with SKILL.md frontmatter" });
+const portableSkillSchema = z.object({
+  name: skillName,
+  description: requiredText(1_024),
+  source: portableSource,
+  license: optionalText(200),
+  compatibility: optionalText(200),
+  instructions: skillInstructions,
+});
 
 const packageSchema = z.object({
   format: z.literal(BOT_PACKAGE_FORMAT, { error: "This is not an OpenMaus package" }),
@@ -74,6 +97,7 @@ const packageSchema = z.object({
         mascotBody: optionalText(40),
       }),
       playbooks: z.array(key).max(40).optional(),
+      skills: z.array(skillName).max(BOT_PACKAGE_MAX_SKILLS).optional(),
     })).min(1).max(200),
     chiefOfStaff: key.optional(),
     rooms: z.array(z.object({
@@ -117,6 +141,10 @@ const packageSchema = z.object({
       triggers: z.array(requiredText(100)).min(1).max(30),
       instructions: requiredText(24_000),
     })).max(80).optional(),
+    skills: z.object({
+      version: z.literal(BOT_PACKAGE_SKILLS_VERSION),
+      entries: z.array(portableSkillSchema).min(1).max(BOT_PACKAGE_MAX_SKILLS),
+    }).optional(),
     examples: z.array(z.object({
       title: requiredText(120),
       input: requiredText(4_000),
@@ -129,6 +157,7 @@ export type ParsedBotPackage = z.infer<typeof packageSchema>;
 export type BotPackageDefinition = ParsedBotPackage["package"];
 export type BotPackageAgent = BotPackageDefinition["agents"][number];
 export type BotPackagePlaybook = NonNullable<BotPackageDefinition["playbooks"]>[number];
+export type BotPackageSkill = NonNullable<BotPackageDefinition["skills"]>["entries"][number];
 
 export function isBotPackage(value: unknown): boolean {
   if (typeof value === "string") return /^---\r?\n[\s\S]*?\bbotmrr:\s*1\b/m.test(value);
@@ -180,6 +209,7 @@ export function parseBotPackage(value: JsonValue | ParsedBotPackage): ParsedBotP
   };
   const agents = unique(pkg.agents.map((agent) => agent.key), "agent");
   const playbooks = unique((pkg.playbooks ?? []).map((playbook) => playbook.key), "playbook");
+  const skills = unique((pkg.skills?.entries ?? []).map((skill) => skill.name), "skill");
   unique((pkg.rooms ?? []).map((room) => room.key), "room");
   unique((pkg.routines ?? []).map((routine) => routine.key), "routine");
 
@@ -190,6 +220,18 @@ export function parseBotPackage(value: JsonValue | ParsedBotPackage): ParsedBotP
     for (const playbook of agent.playbooks ?? []) {
       if (!playbooks.has(playbook)) throw new Error(`Agent ${agent.key} references unknown playbook: ${playbook}`);
     }
+    const assignedSkills = unique(agent.skills ?? [], `skill in agent ${agent.key}`);
+    for (const skill of assignedSkills) {
+      if (!skills.has(skill)) throw new Error(`Agent ${agent.key} references unknown skill: ${skill}`);
+    }
+  }
+  const referencedSkills = new Set(pkg.agents.flatMap((agent) => agent.skills ?? []));
+  for (const skill of pkg.skills?.entries ?? []) {
+    const parsed = parseSkillMd(skill.instructions);
+    if ("error" in parsed) throw new Error(`Skill ${skill.name} is invalid: ${parsed.error}`);
+    if (parsed.name !== skill.name) throw new Error(`Skill ${skill.name} does not match its SKILL.md name`);
+    if (parsed.description !== skill.description) throw new Error(`Skill ${skill.name} does not match its description`);
+    if (!referencedSkills.has(skill.name)) throw new Error(`Skill ${skill.name} is not referenced by an agent`);
   }
   for (const room of pkg.rooms ?? []) {
     const members = unique(room.members, `member in room ${room.key}`);
