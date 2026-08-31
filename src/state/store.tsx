@@ -18,6 +18,7 @@ import type { MausColor, MausMotion } from "@/lib/mascot";
 import type { BotAvatarCrop, BotProceduralAvatar } from "../../shared/bot-avatar";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
 import type { RoutineRunCardData } from "../../shared/routine-run";
+import { reviewedSkillSha256, type SkillRequestCardData } from "../../shared/skill-request";
 import type { Routine, RoutineInput, RoutineRun } from "@/lib/routines";
 import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib/webhooks";
 import { currentCall } from "@/lib/call";
@@ -47,6 +48,8 @@ export interface OptionCardData {
   approvalScope?: "local-computer";
   /** Persisted proposal used by the server when the user confirms it. */
   routineRequest?: RoutineRequestCardData;
+  /** Staged learned skill; enabled only after the user confirms this card. */
+  skillRequest?: SkillRequestCardData;
 }
 
 export interface ConnectorCardData {
@@ -310,6 +313,9 @@ export interface ConfigStatus {
 export interface BrowserProfile {
   id: string;
   name: string;
+  /** Read-only durable Electron routing inherited from legacy profiles.
+   * Config PATCH payloads must omit it. */
+  partitionId?: string;
 }
 
 export type ConfigStatusFrame = Pick<
@@ -386,6 +392,7 @@ export interface InstanceInfo {
 
 export type AppSettingsSection =
   | "general"
+  | "experimental"
   | "connections"
   | "engines"
   | "companion"
@@ -566,6 +573,8 @@ export type Action =
       requestId: string;
       behavior: "allow" | "deny" | "answer";
       message?: string;
+      /** Exact proposal hash displayed by a current learned-skill client. */
+      reviewedSha256?: string;
       /** remember this exact grant (the server's allowKey) for the bot */
       alwaysAllow?: { botId: string; key: string };
       /** Local UI recovery hook for voice flows. Never sent to the server. */
@@ -933,6 +942,11 @@ export function reducer(state: AppState, action: Action): AppState {
       if (bot.messages.some((message) => message.id === action.message.id)) return state;
       // every server-side append chains onto (and becomes) the active leaf
       const next = updateBot(state, bot.id, (b) => {
+        // A message chains onto the leaf → it becomes the leaf (the normal
+        // append). A message parented elsewhere is a chain-insert of a late
+        // turn artifact (settle-time screenshot) — the leaf must stay put,
+        // or the follow-up send it raced would fall off the active branch.
+        const adoptsLeaf = (action.message.parentId ?? null) === (b.activeLeafId ?? null);
         let messages = [...b.messages, action.message];
         // base64 screen frames are big; a long computer-use session would
         // grow memory without bound. Keep the newest few frames' pixels and
@@ -945,7 +959,7 @@ export function reducer(state: AppState, action: Action): AppState {
             messages = messages.map((m) => (dropIds.has(m.id) ? { ...m, png: undefined } : m));
           }
         }
-        return { ...b, messages, activeLeafId: action.message.id };
+        return { ...b, messages, activeLeafId: adoptsLeaf ? action.message.id : b.activeLeafId };
       });
       const motion =
         action.message.kind === "options"
@@ -1530,6 +1544,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 requestId: action.requestId,
                 behavior: action.behavior,
                 message: action.message,
+                reviewedSha256: action.reviewedSha256,
               }),
             }).catch((error) => {
               showError(error);
@@ -1558,14 +1573,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           const bot = stateRef.current.bots.find((b) => b.id === action.botId);
           const card = bot?.messages.find((m) => m.id === action.messageId)?.card;
           if (card?.requestId) {
-            const behavior =
-              action.answer === "Allow" ? "allow" : action.answer === "Deny" ? "deny" : "answer";
+            const normalizedAnswer = action.answer.trim().toLowerCase();
+            const behavior = card.skillRequest
+              ? ["enable", "allow"].includes(normalizedAnswer) ? "allow" : "deny"
+              : action.answer === "Allow" ? "allow" : action.answer === "Deny" ? "deny" : "answer";
             api(`/api/bots/${action.botId}/respond`, {
               method: "POST",
               body: JSON.stringify({
                 requestId: card.requestId,
                 behavior,
                 message: behavior === "answer" ? action.answer : undefined,
+                reviewedSha256: behavior === "allow" && card.skillRequest
+                  ? reviewedSkillSha256(card.skillRequest)
+                  : undefined,
               }),
             }).catch(showError);
           } else {

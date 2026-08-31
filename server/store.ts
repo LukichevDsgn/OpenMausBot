@@ -2,12 +2,13 @@
 // thread→instance binding and per-instance resume cursors — upstream's
 // ProviderSessionDirectory, recipe step 6: persist the binding from day
 // one). messages-<threadId>.json holds the folded transcript.
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, mkdirSync, rmSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
 import { writeFileAtomic } from "./atomic.ts";
 import { peerAllowKey, type PeerAction } from "./peer-approval-key.ts";
-import { DATA_DIR } from "./config.ts";
+import { DATA_DIR, loadBrowserProfileIdAliases } from "./config.ts";
 import * as mdb from "./message-db.ts";
 import { workspaceDir } from "./workspace.ts";
 import { newId, type CloudBackend, type ModelSelection, type ThreadId } from "./contracts.ts";
@@ -20,6 +21,7 @@ import {
 } from "../shared/bot-avatar.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { RoutineRunCardData } from "../shared/routine-run.ts";
+import type { SkillRequestCardData } from "../shared/skill-request.ts";
 
 export type MausColor =
   | "green"
@@ -60,6 +62,9 @@ export interface OptionCardData {
   /** A durable chat-created routine proposal. The scheduler only applies it
    * after this card is explicitly confirmed by the user. */
   routineRequest?: RoutineRequestCardData;
+  /** A durable learned-skill proposal. The skill stays staged until the
+   * user confirms this card — it never rides the prompt before that. */
+  skillRequest?: SkillRequestCardData;
 }
 
 export interface ConnectorCardData {
@@ -293,6 +298,36 @@ function redactBotAuthored<T extends Omit<Message, "id" | "at"> & { at?: number 
                 },
               }
             : { ...operation },
+      };
+    }
+    if (card.skillRequest) {
+      const originalPreview = card.skillRequest.preview;
+      const preview = originalPreview === undefined
+        ? undefined
+        : redactSecretsInText(originalPreview);
+      // Current skill proposals are scrubbed before staging and their digest
+      // binds the card to the exact SKILL.md bytes that apply will install.
+      // Keep that binding only when this store-wide safety pass is a no-op and
+      // the supplied digest already matches the persisted preview. A caller
+      // that bypassed staging (or an older malformed card) is therefore
+      // safely deny-only instead of showing one document and approving
+      // another.
+      const previewSha256 = preview !== undefined && preview === originalPreview
+        ? createHash("sha256").update(preview).digest("hex")
+        : undefined;
+      const sha256 = card.skillRequest.sha256 !== undefined
+        && card.skillRequest.sha256 === previewSha256
+        ? card.skillRequest.sha256
+        : undefined;
+      card.skillRequest = {
+        ...card.skillRequest,
+        gist: redactSecretsInText(card.skillRequest.gist),
+        source: card.skillRequest.source === undefined
+          ? undefined
+          : redactSecretsInText(card.skillRequest.source),
+        preview,
+        sha256,
+        warnings: card.skillRequest.warnings.map((warning) => redactSecretsInText(warning)),
       };
     }
     out.card = card;
@@ -584,6 +619,7 @@ export class Store {
     // busy never survives a restart — no turn does either. Rooms saved
     // before default responders existed adopt their first member as lead.
     let botsMigrated = false;
+    const browserProfileAliases = loadBrowserProfileIdAliases();
     const chiefSectionsSeen = new Set<string>();
     let groupsMigrated = false;
     for (const b of this.bots) {
@@ -593,6 +629,13 @@ export class Store {
       if (b.busy || (b.activity !== undefined && b.activity !== "idle")) botsMigrated = true;
       b.busy = false;
       b.activity = "idle";
+      if (b.browserProfile) {
+        const browserProfile = browserProfileAliases.get(b.browserProfile);
+        if (browserProfile && browserProfile !== b.browserProfile) {
+          b.browserProfile = browserProfile;
+          botsMigrated = true;
+        }
+      }
       if (b.cloudBackend !== undefined && b.cloudBackend !== "box" && b.cloudBackend !== "vps") {
         delete b.cloudBackend;
         botsMigrated = true;
@@ -989,6 +1032,34 @@ export class Store {
     return full;
   }
 
+  /** Insert a message into the active chain directly after `anchorId` — the
+   * home for turn artifacts that finish AFTER the world moved on (the
+   * settle-time screen capture races a fast follow-up send, which used to
+   * leave the user's message stranded above the screenshot). When the anchor
+   * is still the leaf this is a plain append; otherwise the anchor's
+   * children are re-parented onto the inserted message, so the transcript
+   * reads turn → artifact → follow-up and the leaf stays where it was. */
+  insertMessageAfter(threadId: string, anchorId: string | undefined, message: Omit<Message, "id" | "at">): Message {
+    const t = this.thread(threadId);
+    const anchorExists = anchorId !== undefined && t.messages.some((m) => m.id === anchorId);
+    if (!anchorExists || t.activeLeafId === anchorId) return this.appendMessage(threadId, message);
+    const full: Message = { id: newId(), at: Date.now(), ...redactBotAuthored(message), parentId: anchorId };
+    const children = t.messages.filter((m) => m.parentId === anchorId);
+    t.messages.push(full);
+    mdb.appendMessage(threadId, full);
+    if (full.kind === "screen") {
+      for (const pruned of this.pruneScreenFrames(t)) {
+        mdb.updateMessage(threadId, pruned);
+        this.emit({ type: "message.patch", threadId, message: pruned });
+      }
+    }
+    this.emit({ type: "message", threadId, message: full });
+    // announced after the insert so no client ever sees two siblings
+    // claiming the same parent
+    for (const child of children) this.patchMessage(threadId, child.id, { parentId: full.id });
+    return full;
+  }
+
   /** Hide the first-run quiz on this thread, if it is still open. */
   dismissOnboardingCard(threadId: string): Message | null {
     const t = this.thread(threadId);
@@ -1063,10 +1134,14 @@ export class Store {
     const t = this.thread(threadId);
     const idx = t.messages.findIndex((m) => m.id === messageId);
     if (idx === -1) return null;
-    t.messages[idx] = { ...t.messages[idx], ...patch, card: patch.card ?? t.messages[idx].card };
-    mdb.updateMessage(threadId, t.messages[idx]);
-    this.emit({ type: "message.patch", threadId, message: t.messages[idx] });
-    return t.messages[idx];
+    const next = { ...t.messages[idx], ...patch, card: patch.card ?? t.messages[idx].card };
+    // SQLite is the durable source of truth. Persist before changing memory so
+    // a failed write cannot make this process believe a card was answered
+    // while a restart would still show it as pending.
+    mdb.updateMessage(threadId, next);
+    t.messages[idx] = next;
+    this.emit({ type: "message.patch", threadId, message: next });
+    return next;
   }
 
   bot(id: string) {
@@ -1133,6 +1208,12 @@ export class Store {
     // transcripts: deleting a bot deletes what it knew
     try {
       rmSync(workspaceDir(id), { recursive: true, force: true });
+    } catch {}
+    // Approval state deliberately lives outside the bot-writable workspace.
+    // It still belongs to the bot, so deleting the bot must remove staged
+    // proposals, manifests, and native-link ownership records with it.
+    try {
+      rmSync(join(DATA_DIR, "skill-state", id), { recursive: true, force: true });
     } catch {}
     this.saveBots();
     this.emit({ type: "bot.deleted", botId: id });
