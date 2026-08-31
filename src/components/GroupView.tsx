@@ -30,6 +30,7 @@ import { SecretRequestCard } from "./SecretRequestCard";
 import { hasRoutineExecutionTask, RoutineRunCard } from "./RoutineRunCard";
 import { AttachedImageGallery } from "./AttachmentPreview";
 import { GroupCallButton, GroupCallOverlay } from "./GroupCallView";
+import { ReactionBar, ReactionChips } from "./Reactions";
 
 import { ApprovalCard } from "./ApprovalCard";
 import { ManageMembersPanel } from "./ManageMembersPanel";
@@ -217,6 +218,7 @@ const Transcript = memo(function Transcript({
           ) : m.kind === "text" && m.text ? (
             <div className={cn("group flex w-full flex-col", user ? "items-end" : "items-start")}>
               <div className={cn("flex w-full items-end gap-1.5", user ? "justify-end" : "justify-start")}>
+                {user && <ReactionBar threadId={group.threadId} message={m} />}
                 {user && (
                   <>
                     <button
@@ -229,6 +231,7 @@ const Transcript = memo(function Transcript({
                       <MessageSquareReply size={14} />
                     </button>
                     <PinToggle group={group} message={m} />
+                    <ReactionBar threadId={group.threadId} message={m} />
                   </>
                 )}
                 <div
@@ -280,6 +283,7 @@ const Transcript = memo(function Transcript({
                   {formatTime(m.at)}
                 </span>
               </div>
+              <ReactionChips threadId={group.threadId} message={m} members={members} align={user ? "right" : "left"} />
             </div>
           ) : null;
         if (!row) return null;
