@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { packageAgentAsMember, parseBotPackage, renderBotPackageMarkdown } from "./bot-package.ts";
+import { BOT_INSTRUCTIONS_MAX_CHARS } from "./team-manifest.ts";
 
 const validPackage: any = {
   format: "openmaus.package",
@@ -173,6 +174,32 @@ describe("bot packages", () => {
         }],
       },
     })).toThrow();
+  });
+
+  it("round-trips a paused manual-only routine without inventing a schedule", () => {
+    const manual = structuredClone(validPackage);
+    manual.package.routines = [{
+      key: "manual-review",
+      name: "Manual review",
+      agent: "lead",
+      prompt: "Review when asked.",
+      runOn: "maus",
+      schedule: { type: "manual" },
+      durationMinutes: 30,
+      enabledAfterInstall: false,
+    }];
+    const parsed = parseBotPackage(manual);
+    expect(parsed.package.routines?.[0]?.schedule).toEqual({ type: "manual" });
+    expect(renderBotPackageMarkdown(parsed)).toContain("**Schedule:** manual only");
+  });
+
+  it("keeps long agent instructions within the shared portable cap", () => {
+    const accepted = structuredClone(validPackage);
+    accepted.package.agents[0].description = "A".repeat(6_219);
+    expect(parseBotPackage(accepted).package.agents[0]?.description).toHaveLength(6_219);
+    const rejected = structuredClone(validPackage);
+    rejected.package.agents[0].description = "A".repeat(BOT_INSTRUCTIONS_MAX_CHARS + 1);
+    expect(() => parseBotPackage(rejected)).toThrow("agents.0.description is too long");
   });
 
   it("rejects dangling agent, room, playbook, chief, and routine references", () => {

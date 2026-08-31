@@ -4,7 +4,7 @@ import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { schemaIssue, type JsonValue } from "./schema.ts";
 import { parseSkillMd, SKILL_FILE_MAX_BYTES } from "./skills.ts";
 import type { MausColor } from "./store.ts";
-import type { TeamManifestMember } from "./team-manifest.ts";
+import { BOT_INSTRUCTIONS_MAX_CHARS, type TeamManifestMember } from "./team-manifest.ts";
 
 export const BOT_PACKAGE_FORMAT = "openmaus.package" as const;
 export const BOT_PACKAGE_VERSION = 1 as const;
@@ -37,6 +37,7 @@ const optionalText = (max: number) =>
 
 const key = requiredText(64).regex(/^[a-z0-9][a-z0-9_-]*$/, {
   message: "may only contain lowercase letters, numbers, - and _",
+});
 const MAX_DATE_MS = 8_640_000_000_000_000;
 const skillName = requiredText(64).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, {
   message: "must be a lowercase skill name",
@@ -90,7 +91,7 @@ const packageSchema = z.object({
       key,
       name: requiredText(100),
       title: optionalText(200),
-      description: optionalText(4_000),
+      description: optionalText(BOT_INSTRUCTIONS_MAX_CHARS),
       appearance: z.object({
         color: z.enum(COLORS, { error: "is not supported" }),
         mascotExpression: optionalText(80),
@@ -118,6 +119,7 @@ const packageSchema = z.object({
       prompt: requiredText(20_000),
       runOn: z.enum(["maus", "cloud"]),
       schedule: z.discriminatedUnion("type", [
+        z.object({ type: z.literal("manual") }),
         z.object({ type: z.literal("once"), at: z.number().int() }),
         z.object({
           type: z.literal("daily"),
@@ -274,11 +276,13 @@ export function renderBotPackageMarkdown(document: ParsedBotPackage): string {
     `### ${routine.name}`,
     `**Owner:** \`${routine.agent}\`  `,
     `**Schedule:** ${
-      routine.schedule.type === "daily"
-        ? `${routine.schedule.time} on weekdays ${routine.schedule.weekdays.join(", ")}`
-        : routine.schedule.type === "interval"
-          ? `every ${routine.schedule.everyMinutes} minutes from ${new Date(routine.schedule.anchorAt).toISOString()}`
-          : `once at ${routine.schedule.at}`
+      routine.schedule.type === "manual"
+        ? "manual only"
+        : routine.schedule.type === "daily"
+          ? `${routine.schedule.time} on weekdays ${routine.schedule.weekdays.join(", ")}`
+          : routine.schedule.type === "interval"
+            ? `every ${routine.schedule.everyMinutes} minutes from ${new Date(routine.schedule.anchorAt).toISOString()}`
+            : `once at ${routine.schedule.at}`
     }  `,
     `**Run limit:** ${routine.timeoutMinutes === undefined ? "none" : `${routine.timeoutMinutes} minutes`}  `,
     "**Initial state:** paused — the user must enable it",

@@ -196,4 +196,39 @@ describe("package export", () => {
       ["qualify"],
     ]);
   });
+
+  it("exports a manual-only routine as manual and paused", () => {
+    const bot: BotRecord = {
+      id: "manual-bot",
+      threadId: "private-thread",
+      name: "Manual Bot",
+      title: "Reviewer",
+      description: "Reviews on request.",
+      notifications: true,
+      color: "green",
+      unread: false,
+      modelSelection: { instanceId: "engine", model: "model", effort: "medium" },
+      resumeCursors: {},
+      createdAt: 1,
+    };
+    const exported = createBotPackageExport({
+      name: "Manual package",
+      bots: [bot],
+      groups: [],
+      routines: [{
+        id: "private-routine",
+        name: "Review",
+        prompt: "Review now.",
+        botId: bot.id,
+        runOn: "maus",
+        enabled: false,
+        schedule: { type: "manual" },
+        durationMinutes: 30,
+        nextRunAt: null,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+    });
+    expect(exported.package.routines).toMatchObject([{ schedule: { type: "manual" }, enabledAfterInstall: false }]);
+  });
 });

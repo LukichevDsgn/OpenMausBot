@@ -127,7 +127,9 @@ export function createBotPackageExport(input: {
               everyMinutes: routine.schedule.everyMinutes,
               anchorAt: routine.schedule.anchorAt,
             }
-          : { type: "daily", time: routine.schedule.time, weekdays: [...routine.schedule.weekdays] },
+          : routine.schedule.type === "daily"
+            ? { type: "daily", time: routine.schedule.time, weekdays: [...routine.schedule.weekdays] }
+            : { type: "manual" },
       durationMinutes: routine.durationMinutes,
       ...(routine.timeoutMinutes === undefined ? {} : { timeoutMinutes: routine.timeoutMinutes }),
       enabledAfterInstall: false as const,
