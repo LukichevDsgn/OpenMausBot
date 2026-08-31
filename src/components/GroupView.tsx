@@ -231,7 +231,6 @@ const Transcript = memo(function Transcript({
                       <MessageSquareReply size={14} />
                     </button>
                     <PinToggle group={group} message={m} />
-                    <ReactionBar threadId={group.threadId} message={m} />
                   </>
                 )}
                 <div
