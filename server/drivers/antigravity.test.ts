@@ -22,6 +22,7 @@ import {
   antigravityAgentsMcpServer,
   antigravityComputerMcpServer,
   antigravityMcpServers,
+  antigravityProxyUnavailableReason,
   ensureAntigravityMcpServers,
   readAntigravityModelCatalog,
   STATIC_ANTIGRAVITY_MODELS,
@@ -283,7 +284,7 @@ describe("Antigravity snapshot", () => {
           all_proxy: `http://127.0.0.1:${port}`,
           NO_PROXY: "127.0.0.1,localhost,[::1]",
           no_proxy: "127.0.0.1,localhost,[::1]",
-          GODEBUG: "http2client=0",
+          GODEBUG: "custom=1,other=2,http2client=0",
         },
       },
     ] as const;
@@ -385,6 +386,13 @@ describe("Antigravity snapshot", () => {
       await closeServer(dropped.server);
       rmSync(dropScratch, { recursive: true, force: true });
     }
+  });
+
+  it("reports protocol default ports for explicit loopback proxy URLs", async () => {
+    await expect(antigravityProxyUnavailableReason("proxy|http://127.0.0.1:80"))
+      .resolves.toBe("Proxy unavailable: nothing is listening on 127.0.0.1:80. Start the proxy or choose TUN/Off.");
+    await expect(antigravityProxyUnavailableReason("proxy|https://127.0.0.1:443"))
+      .resolves.toBe("Proxy unavailable: nothing is listening on 127.0.0.1:443. Start the proxy or choose TUN/Off.");
   });
 });
 

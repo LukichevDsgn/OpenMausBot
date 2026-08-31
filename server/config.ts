@@ -213,7 +213,7 @@ const browserProfilesSchema = z.array(browserProfileSchema).max(20).superRefine(
 });
 export const DEFAULT_ANTIGRAVITY_PROXY_URL = "http://127.0.0.1:10808";
 export const ANTIGRAVITY_NETWORK_ROUTE_ENV = "OPENMAUSBOT_ANTIGRAVITY_NETWORK_ROUTE";
-const ANTIGRAVITY_NETWORK_ROUTE_SEPARATOR = "|";
+export const ANTIGRAVITY_NETWORK_ROUTE_SEPARATOR = "|";
 export type AntigravityNetworkMode = "off" | "tun" | "proxy";
 
 /** Normalize only an explicitly-portioned loopback HTTP(S) proxy URL. */

@@ -26,6 +26,7 @@ import { z } from "zod";
 
 import {
   ANTIGRAVITY_NETWORK_ROUTE_ENV,
+  ANTIGRAVITY_NETWORK_ROUTE_SEPARATOR,
   DATA_DIR,
   normalizeAntigravityNetworkRoute,
   stripWorkspaceCredentialEnv,
@@ -54,6 +55,7 @@ const ANTIGRAVITY_PROXY_ENV_NAMES = [
   "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy",
 ] as const;
 const ANTIGRAVITY_LOOPBACK_NO_PROXY = "127.0.0.1,localhost,[::1]";
+const ANTIGRAVITY_PROXY_ROUTE_PREFIX = `proxy${ANTIGRAVITY_NETWORK_ROUTE_SEPARATOR}`;
 const ANTIGRAVITY_PROXY_REACHABILITY_TIMEOUT_MS = 750;
 
 export interface AntigravityConfig {
@@ -97,7 +99,7 @@ function applyAntigravityNetworkRoute(env: NodeJS.ProcessEnv, rawRoute: unknown)
     else env.GODEBUG = godebug;
     return route;
   }
-  const proxyUrl = route.slice("proxy|".length);
+  const proxyUrl = route.slice(ANTIGRAVITY_PROXY_ROUTE_PREFIX.length);
   env.HTTP_PROXY = proxyUrl;
   env.http_proxy = proxyUrl;
   env.HTTPS_PROXY = proxyUrl;
@@ -106,16 +108,17 @@ function applyAntigravityNetworkRoute(env: NodeJS.ProcessEnv, rawRoute: unknown)
   env.all_proxy = proxyUrl;
   env.NO_PROXY = ANTIGRAVITY_LOOPBACK_NO_PROXY;
   env.no_proxy = ANTIGRAVITY_LOOPBACK_NO_PROXY;
-  env.GODEBUG = "http2client=0";
+  const godebug = removeAntigravityGodebugToken(env.GODEBUG);
+  env.GODEBUG = godebug === undefined ? "http2client=0" : `${godebug},http2client=0`;
   return route;
 }
 
 export function antigravityProxyUnavailableReason(rawRoute: unknown): Promise<string | null> {
   const route = normalizeAntigravityNetworkRoute(rawRoute);
-  if (!route.startsWith("proxy|")) return Promise.resolve(null);
-  const parsed = new URL(route.slice("proxy|".length));
+  if (!route.startsWith(ANTIGRAVITY_PROXY_ROUTE_PREFIX)) return Promise.resolve(null);
+  const parsed = new URL(route.slice(ANTIGRAVITY_PROXY_ROUTE_PREFIX.length));
   const host = parsed.hostname.replace(/^\[|\]$/g, "");
-  const port = Number(parsed.port);
+  const port = Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80));
   const reason = `Proxy unavailable: nothing is listening on ${host}:${port}. Start the proxy or choose TUN/Off.`;
   return new Promise((resolve) => {
     let settled = false;
