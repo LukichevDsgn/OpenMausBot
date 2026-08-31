@@ -119,6 +119,7 @@ import { RETRY_MAX_ATTEMPTS } from "./drivers/retry.ts";
 import {
   GROUP_GOAL_MAX_TURNS,
   groupGoalAssignmentKey,
+  groupGoalCompletionTurnId,
   groupGoalCoordinatorInstructions,
   groupGoalWorkerInstructions,
   parseGroupGoalDecision,
@@ -1645,6 +1646,9 @@ bus.subscribe((event: RuntimeEvent) => {
   const coordinatorTurnsForThread = groupGoalCoordinatorTurns.get(event.threadId);
   const ambiguousCoordinatorText = !event.turnId && (coordinatorTurnsForThread?.size ?? 0) > 1;
   const goalCoordinatorTurn = groupGoalCoordinatorTurnForEvent(event);
+  const completedTurnId = event.type === "turn.completed"
+    ? groupGoalCompletionTurnId(event.turnId, goalCoordinatorTurn?.turnId)
+    : event.turnId;
   if (goalCoordinatorTurn?.discard && retiredProviderTurns.has(event.turnId)) {
     removeGroupGoalCoordinatorTurn(event.threadId, goalCoordinatorTurn);
     return;
@@ -1694,7 +1698,7 @@ bus.subscribe((event: RuntimeEvent) => {
   };
 
   if (coordinatorVisibleText) {
-    pushMessage({ role: "bot", kind: "text", text: coordinatorVisibleText });
+    pushMessage({ role: "bot", kind: "text", text: coordinatorVisibleText, turnId: completedTurnId });
     lastReply.set(event.threadId, coordinatorVisibleText);
   }
 
@@ -1707,7 +1711,7 @@ bus.subscribe((event: RuntimeEvent) => {
     case "item.completed":
       if (event.itemType === "assistant_text") {
         const text = event.text;
-        pushMessage({ role: "bot", kind: "text", text });
+        pushMessage({ role: "bot", kind: "text", text, turnId: event.turnId });
         // kept so "finished" can say what it finished with, rather than
         // just that something ended
         lastReply.set(event.threadId, text);
@@ -1983,6 +1987,7 @@ bus.subscribe((event: RuntimeEvent) => {
       turnUsage.set(event.threadId, { input: event.input, output: event.output, cachedInput: event.cachedInput });
       break;
     case "turn.completed": {
+      if (completedTurnId) store.markTerminalAssistantMessage(event.threadId, completedTurnId);
       const reply = lastReply.get(event.threadId) ?? "";
       lastReply.delete(event.threadId);
       const lastReported = turnUsage.get(event.threadId);
@@ -2608,7 +2613,10 @@ async function startTurn(
       let browser: Awaited<ReturnType<typeof browserIntegration>> = null;
       const selectedSkills = selectBundledSkills(
         text,
-        instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : [],
+        [
+          ...(instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : []),
+          ...(skillAuthoring ? ["skillAuthoring"] : []),
+        ],
         availableSkills(),
       );
       if (selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("phoneMcp"))) {
@@ -3468,10 +3476,21 @@ async function runGroupMemberTurn(
   if (hop < MAX_COMMS_DEPTH && instance.adapter.capabilities.agentsMcp === true) {
     integrations.agents = agentsIntegration(bot.id, threadId, hop, skillAuthoring);
   }
-  const selectedSkills = selectBundledSkills(
-    serializeRoomContext(threadId, userName),
-    instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : [],
-    availableSkills(),
+  const latestUser = [...store.activePath(threadId)].reverse().find(
+    (message) => message.role === "user" && message.kind === "text" && message.text,
+  );
+  const skills = availableSkills();
+  const selectedSkills = mergeSkills(
+    selectBundledSkills(
+      serializeRoomContext(threadId, userName),
+      instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : [],
+      skills,
+    ),
+    selectBundledSkills(
+      latestUser?.text ?? "",
+      skillAuthoring ? ["skillAuthoring"] : [],
+      skills,
+    ),
   );
   if (selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("phoneMcp"))) {
     integrations.phone = phoneIntegration();
@@ -3586,7 +3605,6 @@ async function runGroupMemberTurn(
     .filter(Boolean)
     .join("\n");
 
-  const latestUser = [...store.activePath(threadId)].reverse().find((message) => message.role === "user" && message.kind === "text" && message.text);
   const learnTurn = skillAuthoring && latestUser?.text ? expandLearnTurnText(latestUser.text) : "";
   const learnBlock = learnTurn && learnTurn !== latestUser?.text ? `\n\n${learnTurn}` : "";
   const text = `${serializeRoomContext(threadId, userName)}\n\n(Reply to the conversation above as ${bot.name}.)${learnBlock}${cardContinuation ? `\n\n${cardContinuation}` : ""

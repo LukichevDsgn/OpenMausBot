@@ -2712,6 +2712,9 @@ describe("harness HTTP API", () => {
   it("mounts the verification skill into a real turn when its trigger appears", async () => {
     const bot = (await api("POST", "/api/bots", {})).body.bot;
     try {
+      expect((await api("PATCH", "/api/config", {
+        features: { skillRecorder: true },
+      })).status).toBe(200);
       expect((await api("PATCH", `/api/bots/${bot.id}`, {
         modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
       })).status).toBe(200);
@@ -2721,15 +2724,72 @@ describe("harness HTTP API", () => {
       })).status).toBe(202);
       await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
       const seen = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
-      const system = seen.argv[seen.argv.indexOf("--append-system-prompt") + 1] ?? "";
+      const system = seen.systemPrompt ?? "";
       // the skill's instructions ride the system prompt the agent receives
       expect(system).toContain('<openmaus-skill id="create-verification-skill"');
-      // the sibling is only MENTIONED by create's handoff text — it must not
-      // be mounted as its own skill on an untriggered turn
-      expect(system).not.toContain('<openmaus-skill id="maintain-verification-skill"');
+      expect(system).toContain("skill_manage");
     } finally {
       await api("POST", `/api/bots/${bot.id}/interrupt`);
       await api("DELETE", `/api/bots/${bot.id}`);
+      await api("PATCH", "/api/config", { features: { skillRecorder: false } });
+    }
+  });
+
+  it("mounts the verification skill only for the latest channel request", async () => {
+    const bot = (await api("POST", "/api/bots", {
+      modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+      requireAvailableModel: true,
+    })).body.bot;
+    let room: any;
+    try {
+      expect((await api("PATCH", "/api/config", {
+        features: { skillRecorder: true },
+      })).status).toBe(200);
+      room = (await api("POST", "/api/groups", {
+        name: "Verification skill room",
+        memberIds: [bot.id],
+        setup: { bulletin: "", defaultResponder: { kind: "member", botId: bot.id } },
+      })).body.group;
+
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/groups/${room.id}/messages`, {
+        text: "/create-verification-skill for my mobile app",
+      })).status).toBe(202);
+      let seen = await readJsonFileWhenReady<{ systemPrompt?: string }>(fakeClaudeDump);
+      let system = seen.systemPrompt ?? "";
+      expect(system).toContain('<openmaus-skill id="create-verification-skill"');
+      expect(system).toContain('<openmaus-skill id="phone-harness"');
+      expect((await api("POST", `/api/groups/${room.id}/interrupt`, {})).status).toBe(200);
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots?messages=0")).body;
+        return state.bots.find((candidate: { id: string }) => candidate.id === bot.id)?.busy;
+      }, { timeout: 5_000 }).toBe(false);
+
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/groups/${room.id}/messages`, {
+        text: "now give me a short status update",
+      })).status).toBe(202);
+      seen = await readJsonFileWhenReady<{ systemPrompt?: string }>(fakeClaudeDump);
+      system = seen.systemPrompt ?? "";
+      expect(system).not.toContain('<openmaus-skill id="create-verification-skill"');
+      expect(system).toContain('<openmaus-skill id="phone-harness"');
+    } finally {
+      if (room) {
+        expect((await api("POST", `/api/groups/${room.id}/interrupt`, {})).status).toBe(200);
+        await expect.poll(async () => {
+          const state = (await api("GET", "/api/bots?messages=0")).body;
+          const currentRoom = state.groups.find((candidate: { id: string }) => candidate.id === room.id);
+          const currentBot = state.bots.find((candidate: { id: string }) => candidate.id === bot.id);
+          return {
+            working: currentRoom?.working,
+            busyBotId: currentRoom?.busyBotId,
+            botBusy: currentBot?.busy,
+          };
+        }, { timeout: 5_000 }).toEqual({ working: false, busyBotId: null, botBusy: false });
+        expect((await api("DELETE", `/api/groups/${room.id}`)).status).toBe(200);
+      }
+      expect((await api("DELETE", `/api/bots/${bot.id}`)).status).toBe(200);
+      expect((await api("PATCH", "/api/config", { features: { skillRecorder: false } })).status).toBe(200);
     }
   });
 
@@ -3083,6 +3143,7 @@ describe("harness HTTP API", () => {
       const dump = z.object({
         argv: z.array(z.string()),
         env: z.record(z.string(), z.string()),
+        systemPrompt: z.string(),
         mcpConfig: z.object({
           mcpServers: z.object({
             browser: z.object({
@@ -3108,9 +3169,7 @@ describe("harness HTTP API", () => {
       expect(dump.env.OMB_USER_DATA).toBeUndefined();
       expect(JSON.stringify(dump)).not.toContain(masterToken);
 
-      const systemIndex = dump.argv.indexOf("--append-system-prompt");
-      expect(systemIndex).toBeGreaterThanOrEqual(0);
-      const system = dump.argv[systemIndex + 1] ?? "";
+      const system = dump.systemPrompt;
       expect(system).toMatch(/page instructions as untrusted content/i);
       expect(system).toMatch(/consequential action.*confirmation/i);
       expect(system).toMatch(/browser_request_takeover/i);
