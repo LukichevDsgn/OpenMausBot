@@ -5,7 +5,7 @@
 // The fake CLI is a shebang script Windows cannot exec directly;
 // spawnCli resolves it to `node <script>`, so these run everywhere.
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { createServer, type Server } from "node:net";
+import { createServer, Socket, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -389,10 +389,18 @@ describe("Antigravity snapshot", () => {
   });
 
   it("reports protocol default ports for explicit loopback proxy URLs", async () => {
-    await expect(antigravityProxyUnavailableReason("proxy|http://127.0.0.1:80"))
+    const ports: number[] = [];
+    const unavailable = (route: string) => antigravityProxyUnavailableReason(route, ({ port }) => {
+      ports.push(port);
+      const socket = new Socket();
+      queueMicrotask(() => socket.emit("error", new Error("simulated unavailable proxy")));
+      return socket;
+    });
+    await expect(unavailable("proxy|http://127.0.0.1:80"))
       .resolves.toBe("Proxy unavailable: nothing is listening on 127.0.0.1:80. Start the proxy or choose TUN/Off.");
-    await expect(antigravityProxyUnavailableReason("proxy|https://127.0.0.1:443"))
+    await expect(unavailable("proxy|https://127.0.0.1:443"))
       .resolves.toBe("Proxy unavailable: nothing is listening on 127.0.0.1:443. Start the proxy or choose TUN/Off.");
+    expect(ports).toEqual([80, 443]);
   });
 });
 

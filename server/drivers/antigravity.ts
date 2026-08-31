@@ -56,6 +56,7 @@ const ANTIGRAVITY_PROXY_ENV_NAMES = [
 ] as const;
 const ANTIGRAVITY_LOOPBACK_NO_PROXY = "127.0.0.1,localhost,[::1]";
 const ANTIGRAVITY_PROXY_ROUTE_PREFIX = `proxy${ANTIGRAVITY_NETWORK_ROUTE_SEPARATOR}`;
+type ProxyConnectionFactory = (options: { host: string; port: number }) => ReturnType<typeof createConnection>;
 const ANTIGRAVITY_PROXY_REACHABILITY_TIMEOUT_MS = 750;
 
 export interface AntigravityConfig {
@@ -113,7 +114,10 @@ function applyAntigravityNetworkRoute(env: NodeJS.ProcessEnv, rawRoute: unknown)
   return route;
 }
 
-export function antigravityProxyUnavailableReason(rawRoute: unknown): Promise<string | null> {
+export function antigravityProxyUnavailableReason(
+  rawRoute: unknown,
+  connect: ProxyConnectionFactory = createConnection,
+): Promise<string | null> {
   const route = normalizeAntigravityNetworkRoute(rawRoute);
   if (!route.startsWith(ANTIGRAVITY_PROXY_ROUTE_PREFIX)) return Promise.resolve(null);
   const parsed = new URL(route.slice(ANTIGRAVITY_PROXY_ROUTE_PREFIX.length));
@@ -129,7 +133,7 @@ export function antigravityProxyUnavailableReason(rawRoute: unknown): Promise<st
     };
     let socket: ReturnType<typeof createConnection>;
     try {
-      socket = createConnection({ host, port });
+      socket = connect({ host, port });
     } catch {
       finish(reason);
       return;
