@@ -4834,6 +4834,8 @@ function configStatus() {
     imageGen: { configured: Boolean(cfg.imageGen?.key) },
     // not a secret — the sidebar shows it
     profile: { name: cfg.profile?.name ?? "", email: cfg.profile?.email ?? "" },
+    // not a secret — the settings picker shows it; "" = follow the system
+    language: cfg.language ?? "",
     rooms: { turnTimeoutMinutes: roomTurnTimeoutMinutes(cfg) },
     localVm: {
       mode: localVmMode(cfg),
@@ -8220,7 +8222,7 @@ const server = createServer(async (req, res) => {
       // interrupt in-flight turns.
       const reloadKeys = Object.keys(patch).filter((key) => {
         if (key === "features") return patch.features?.antigravityProxy !== undefined;
-        return !["profile", "tts", "imageGen", "vps", "rooms", "localVm", "browserProfiles"].includes(key);
+        return !["profile", "language", "tts", "imageGen", "vps", "rooms", "localVm", "browserProfiles"].includes(key);
       });
       // The cleanup marker becomes committed only after both pieces of durable
       // application state agree. Commit/ACK failures are deferred until every
