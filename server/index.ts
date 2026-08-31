@@ -19,6 +19,16 @@ import {
 } from "../shared/credential-request.ts";
 
 import { approvalKey, autoVerdict } from "./auto-approve.ts";
+import {
+  activateAntigravityProfile,
+  antigravityAccountStatuses,
+  antigravityManagedQuotaRefreshRunning,
+  antigravityManagedWorkerRunning,
+  antigravityProcessRunning,
+  profileForInstance,
+  refreshAntigravityProfileQuota,
+  type AntigravityProfile,
+} from "./antigravity-accounts.ts";
 import { requestReview, resolveAutoReviewMode, shouldReview } from "./auto-review.ts";
 import {
   BrowserCleanupCoordinator,
@@ -1443,6 +1453,19 @@ bus.subscribe((event: RuntimeEvent) => {
   }
   if (event.type === "turn.completed") {
     releaseLocalVmThread(event.threadId);
+
+    // Quota cards are cache-backed so merely opening the picker never starts
+    // OAuth. Refresh the exact isolated A/B profile after its turn settles.
+    const settledBot = store.botByThread(event.threadId);
+    const settledProfile = settledBot ? profileForInstance(settledBot.modelSelection.instanceId) : null;
+    if (settledProfile) {
+      const timer = setTimeout(() => {
+        void refreshAntigravityProfileQuota(settledProfile).catch(() => {
+          // Telemetry is best-effort and must never change the turn outcome.
+        });
+      }, 1_500);
+      timer.unref?.();
+    }
   }
   broadcast({ kind: "runtime", event });
   const routineRun = routines?.handleRuntimeEvent(event) ?? null;
@@ -7222,6 +7245,38 @@ const server = createServer(async (req, res) => {
       } finally {
         providerConfigBusy = false;
       }
+    }
+
+    if (method === "GET" && path === "/api/antigravity/accounts") {
+      const refresh = url.searchParams.get("refresh") === "1";
+      // A managed Worker A/B turn owns the launcher's machine-wide credential
+      // mutex. Do not call it a standalone terminal and do not start a quota
+      // probe that may wait behind a long task. Return the last good cache;
+      // turn.completed refreshes that exact profile automatically.
+      if (refresh && antigravityManagedWorkerRunning()) {
+        return json(res, 200, {
+          accounts: await antigravityAccountStatuses(false),
+          refreshDeferred: true,
+        });
+      }
+      if (refresh && await antigravityProcessRunning() && !antigravityManagedQuotaRefreshRunning()) {
+        return json(res, 409, { error: "Close standalone Antigravity terminals before refreshing account quotas." });
+      }
+      return json(res, 200, { accounts: await antigravityAccountStatuses(refresh) });
+    }
+
+    if (method === "POST" && path === "/api/antigravity/activate") {
+      if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+        return json(res, 415, { error: "content-type must be application/json" });
+      }
+      const body = await readBody(req);
+      const profile = body?.profile as AntigravityProfile;
+      if (profile !== "a" && profile !== "b") return json(res, 400, { error: "profile must be a or b" });
+      if (providerConfigBusy || await antigravityProcessRunning()) {
+        return json(res, 409, { error: "Antigravity is busy. Wait for the current task or close its terminal." });
+      }
+      await activateAntigravityProfile(profile);
+      return json(res, 200, { accounts: await antigravityAccountStatuses(false) });
     }
 
     // ── app config (API keys — never echoed back, booleans only) ──

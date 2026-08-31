@@ -393,6 +393,21 @@ export interface InstanceInfo {
   cliCandidates?: string[];
 }
 
+export interface AntigravityQuotaWindow { remaining: number; resetsAt: string | null }
+export interface AntigravityAccountStatus {
+  profile: "a" | "b";
+  instanceId: string;
+  label: string;
+  email: string;
+  active: boolean;
+  available: boolean;
+  quota: {
+    gemini: { weekly: AntigravityQuotaWindow | null; fiveHour: AntigravityQuotaWindow | null };
+    other: { weekly: AntigravityQuotaWindow | null; fiveHour: AntigravityQuotaWindow | null };
+  };
+  error?: string;
+}
+
 export type AppSettingsSection =
   | "general"
   | "experimental"

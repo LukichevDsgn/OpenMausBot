@@ -35,6 +35,10 @@ import { computerProxyEnv } from "../container-computer.ts";
 import { augmentedPath } from "../env-path.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { injectedApiModel, mergeLocalInject } from "./local-inject.ts";
+import {
+  registerManagedAntigravityWorker,
+  unregisterManagedAntigravityWorker,
+} from "../antigravity-accounts.ts";
 
 import type { ChildProcess } from "node:child_process";
 import type {
@@ -662,6 +666,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         return { turnId };
       }
       children.add(child);
+      registerManagedAntigravityWorker(child.pid);
 
       let childClosed = false;
       let postSettleReaper: ReturnType<typeof setTimeout> | undefined;
@@ -823,11 +828,13 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       });
 
       child.on("error", (e) => {
+        unregisterManagedAntigravityWorker(child.pid);
         emit({ ...base(threadId, turnId), type: "runtime.error", ...describeSpawnFailure(e, config.cli) });
         settle(false, "spawn_error");
       });
 
       child.on("close", (code) => {
+        unregisterManagedAntigravityWorker(child.pid);
         childClosed = true;
         children.delete(child); // close is the true process-exit signal
         clearTimeout(postSettleReaper);
