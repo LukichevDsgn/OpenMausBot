@@ -159,8 +159,11 @@ describe("ClaudeDriver.decodeConfig", () => {
       expect(candidates.length).toBeGreaterThan(1);
       expect(new Set(candidates).size).toBe(candidates.length);
     } else {
-      // unlink-then-listen always wins on POSIX; one candidate suffices
-      expect(candidates).toEqual([permissionSocketPath("t-candidates")]);
+      // macOS has a small Unix-socket path limit, so a deep HOME needs a
+      // short fallback under the OS temp root.
+      expect(candidates).toHaveLength(2);
+      expect(candidates[1]).toMatch(/omb-perm-[0-9a-f]{16}\.sock$/);
+      expect(candidates[1]).not.toBe(candidates[0]);
     }
   });
 
@@ -204,6 +207,28 @@ describe("ClaudeDriver.decodeConfig", () => {
         conn.end();
       } finally {
         broker.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "rejects instead of returning an occupied path when every candidate is unavailable",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "omb-broker-unavailable-"));
+      const heldOne = join(dir, "held-one.sock");
+      const heldTwo = join(dir, "held-two.sock");
+      mkdirSync(heldOne);
+      mkdirSync(heldTwo);
+      try {
+        await expect(
+          createPermissionBroker({
+            socketPaths: [heldOne, heldTwo],
+            onAsk: () => {},
+            onResolve: () => {},
+          }),
+        ).rejects.toThrow(/could not bind a local socket/);
+      } finally {
         rmSync(dir, { recursive: true, force: true });
       }
     },
@@ -410,6 +435,43 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(JSON.stringify(seen.argv)).not.toContain("tok");
     const allowed = seen.argv[seen.argv.indexOf("--allowedTools") + 1];
     expect(allowed).toContain("mcp__agents");
+  });
+
+  it("mounts custom MCP servers without pre-allowing their tools", async () => {
+    await create();
+    const dump = join(scratch, "custom-mcp.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-custom-mcp",
+      text: "hi",
+      integrations: {
+        custom: {
+          notes: { command: "npx", args: ["-y", "@x/notes-mcp"], env: { NOTES_TOKEN: "tok-notes" } },
+        },
+        agents: {
+          command: process.execPath,
+          args: ["/fake/agents-proxy.js"],
+          env: { OMB_HARNESS_URL: "http://127.0.0.1:1", OMB_BOT_ID: "b1", OMB_COMMS_TOKEN: "tok", OMB_TURN_DEPTH: "0" },
+        },
+      },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    // the server reaches the CLI through the private mcp-config file…
+    expect(seen.mcpConfig.mcpServers.notes).toMatchObject({
+      command: "npx",
+      args: ["-y", "@x/notes-mcp"],
+      env: { NOTES_TOKEN: "tok-notes" },
+    });
+    // …but its tools are NOT pre-allowed: acceptEdits denies unlisted tools,
+    // which routes every custom call through the ogb broker into a card.
+    const allowed = seen.argv[seen.argv.indexOf("--allowedTools") + 1];
+    expect(allowed).toContain("mcp__agents");
+    expect(allowed).not.toContain("mcp__notes");
+    // and its credential value stays out of argv
+    expect(JSON.stringify(seen.argv)).not.toContain("tok-notes");
   });
 
   it("passes normalized available and denied built-in tool sets to Claude", async () => {
