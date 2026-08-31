@@ -18,6 +18,7 @@ import type { MausColor, MausMotion } from "@/lib/mascot";
 import type { BotAvatarCrop } from "../../shared/bot-avatar";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
 import type { RoutineRunCardData } from "../../shared/routine-run";
+import type { GroupGoalRunCardData } from "../../shared/group-goal-run";
 import { reviewedSkillSha256, type SkillRequestCardData } from "../../shared/skill-request";
 import type { Routine, RoutineInput, RoutineRun } from "@/lib/routines";
 import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib/webhooks";
@@ -79,13 +80,17 @@ export interface SecretRequestCardData {
 export interface Message {
   id: string;
   role: "bot" | "user";
-  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "routine.run";
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "routine.run" | "goal.run";
   text?: string;
   card?: OptionCardData;
   connector?: ConnectorCardData;
   secret?: SecretRequestCardData;
   /** Lifecycle mirror for a routine whose real work lives in a fresh task. */
   routineRun?: RoutineRunCardData;
+  /** Durable lifecycle receipt for a goal-driven channel run. */
+  goalRun?: GroupGoalRunCardData;
+  /** How a channel user message should be handled. Absent means ordinary chat. */
+  channelMode?: "chat" | "goal";
   /** activity messages: tool name + outcome. `spoken` is the server's
    * narration of the same chip ("reading a file"), used by call mode. */
   /** `setup` marks an error fixed by installing something, not by retrying. */
@@ -136,6 +141,8 @@ export interface Group {
   /** auto-created bot⇄bot channel (ask_bot exchanges mirror here) */
   dm?: boolean;
   busyBotId?: string | null;
+  /** True for the whole orchestrated run, including hand-offs between members. */
+  working?: boolean;
   /** the room's shared desk — where member turns run their shell tools,
    * overriding each member's own folder; absent = each member's own */
   cwd?: string;
@@ -549,6 +556,7 @@ export type Action =
       sendId?: string;
       replyToId?: string;
       threadId?: string;
+      mode?: "chat" | "goal";
       onError?: () => void;
     }
   | {
@@ -561,7 +569,6 @@ export type Action =
   | { type: "switchGroupTask"; groupId: string; threadId: string }
   | { type: "renameGroupTask"; groupId: string; threadId: string; title: string }
   | { type: "deleteGroupTask"; groupId: string; threadId: string }
-  | { type: "toggleReaction"; threadId: string; messageId: string; emoji: string }
   | { type: "interruptGroup"; groupId: string }
   | { type: "instances"; instances: InstanceInfo[] }
   | { type: "configStatus"; config: ConfigStatus }
@@ -1158,24 +1165,6 @@ export function reducer(state: AppState, action: Action): AppState {
         ...state,
         groups: state.groups.map((g) => (g.id === action.groupId ? { ...g, ...action.patch } : g)),
       };
-    case "toggleReaction": {
-      const toggle = (m: Message): Message => {
-        if (m.id !== action.messageId) return m;
-        const reactions = m.reactions ?? [];
-        const at = reactions.findIndex((r) => r.emoji === action.emoji && r.by === "user");
-        const next = at >= 0 ? reactions.filter((_, i) => i !== at) : [...reactions, { emoji: action.emoji, by: "user" }];
-        return { ...m, reactions: next.length ? next : undefined };
-      };
-      return {
-        ...state,
-        bots: state.bots.map((b) =>
-          b.threadId === action.threadId ? { ...b, messages: b.messages.map(toggle) } : b,
-        ),
-        groups: state.groups.map((g) =>
-          g.threadId === action.threadId ? { ...g, messages: g.messages.map(toggle) } : g,
-        ),
-      };
-    }
     // handled entirely by the async wrapper
     case "pendingQueued": {
       if (state.consumedQueueIds[action.queueId]) {
@@ -1697,7 +1686,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           const sendId = action.sendId ?? crypto.randomUUID();
           api(`/api/groups/${action.groupId}/messages`, {
             method: "POST",
-            body: JSON.stringify({ text: action.text, replyToId: action.replyToId, threadId, sendId }),
+            body: JSON.stringify({
+              text: action.text,
+              replyToId: action.replyToId,
+              threadId,
+              sendId,
+              mode: action.mode ?? "chat",
+            }),
           })
             .then((body) => {
               if (body?.message && typeof body.threadId === "string") {
@@ -1718,12 +1713,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           break;
         case "deleteGroup":
           api(`/api/groups/${action.groupId}`, { method: "DELETE" }).catch(showError);
-          break;
-        case "toggleReaction":
-          api(`/api/threads/${action.threadId}/messages/${action.messageId}/reactions`, {
-            method: "POST",
-            body: JSON.stringify({ emoji: action.emoji, by: "user" }),
-          }).catch(showError);
           break;
         case "setModel":
           api(`/api/bots/${action.botId}`, {

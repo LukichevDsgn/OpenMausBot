@@ -18,6 +18,7 @@ import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { RoutineRunCardData } from "../shared/routine-run.ts";
 import type { SkillRequestCardData } from "../shared/skill-request.ts";
+import type { GroupGoalRunCardData } from "../shared/group-goal-run.ts";
 
 export type MausColor =
   | "green"
@@ -93,7 +94,7 @@ export interface SecretRequestCardData {
 export interface Message {
   id: string;
   role: "bot" | "user";
-  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "routine.run";
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "routine.run" | "goal.run";
   text?: string;
   card?: OptionCardData;
   connector?: ConnectorCardData;
@@ -101,6 +102,8 @@ export interface Message {
   /** One idempotently updated status card in the conversation that created a
    * routine. The actual provider turn remains in its isolated task. */
   routineRun?: RoutineRunCardData;
+  /** Terminal receipt for a bounded multi-bot channel goal. */
+  goalRun?: GroupGoalRunCardData;
   /** activity messages: tool name + outcome. `spoken` is the same chip as
    * a phrase a voice can read ("reading a file") — computed once here so
    * call mode never has to re-derive it from the raw tool name, and absent
@@ -124,6 +127,8 @@ export interface Message {
   replyToId?: string;
   /** Stable client identity for at-most-once chat POST retries. */
   sendId?: string;
+  /** Per-send channel behavior. Absent is legacy quick chat. */
+  channelMode?: "chat" | "goal";
   /** group threads: which member said this (sender attribution). */
   from?: { botId: string; name: string; color: string };
   /** emoji reactions; by = "user" or a member botId. */
@@ -257,6 +262,14 @@ function redactBotAuthored<T extends Omit<Message, "id" | "at"> & { at?: number 
     if (routineRun.summary) routineRun.summary = redactSecretsInText(routineRun.summary);
     if (routineRun.error) routineRun.error = redactSecretsInText(routineRun.error);
     out.routineRun = routineRun;
+  }
+  if (out.goalRun) {
+    out.goalRun = {
+      ...out.goalRun,
+      goal: redactSecretsInText(out.goalRun.goal),
+      coordinatorName: redactSecretsInText(out.goalRun.coordinatorName),
+      detail: out.goalRun.detail ? redactSecretsInText(out.goalRun.detail) : undefined,
+    };
   }
   if (out.card) {
     const card = { ...out.card } as OptionCardData & { summary?: string };
@@ -744,8 +757,8 @@ export class Store {
     }
   }
 
-  private saveBots() {
-    writeFileAtomic(BOTS_FILE, JSON.stringify(this.bots, null, 2));
+  private saveBots(bots: BotRecord[] = this.bots) {
+    writeFileAtomic(BOTS_FILE, JSON.stringify(bots, null, 2));
   }
 
   private saveGroups() {
@@ -1213,6 +1226,54 @@ export class Store {
     this.saveBots();
     this.emit({ type: "bot", botId: id });
     return bot;
+  }
+
+  /** File visible bots into one sidebar section as a single durable write.
+   *
+   * This deliberately stages the complete next file before touching the
+   * live records. A missing/hidden target therefore changes nothing, and a
+   * failed atomic write cannot leave memory ahead of disk. A Chief collision
+   * is refused rather than silently removing somebody's coordinator role. */
+  setBotsSection(
+    botIds: string[],
+    section: string,
+  ): { ok: true; bots: BotRecord[] } | { ok: false; reason: "unavailable" | "chief-conflict" } {
+    const ids = [...new Set(botIds)];
+    const targets = ids.map((id) => this.bot(id));
+    if (targets.some((bot) => !bot || bot.hidden)) return { ok: false, reason: "unavailable" };
+
+    const targetSection = sectionKey(section);
+    const selected = targets as BotRecord[];
+    const destinationChiefIds = new Set([
+      ...selected.filter((bot) => bot.chiefOfStaff).map((bot) => bot.id),
+      ...this.bots
+        .filter((bot) => bot.chiefOfStaff && sectionKey(bot.section) === targetSection)
+        .map((bot) => bot.id),
+    ]);
+    if (destinationChiefIds.size > 1) return { ok: false, reason: "chief-conflict" };
+
+    const patches = new Map<string, Partial<BotRecord>>();
+    for (const bot of selected) {
+      patches.set(bot.id, { section: targetSection || undefined });
+    }
+
+    const changedIds = new Set<string>();
+    const nextBots = this.bots.map((bot) => {
+      const patch = patches.get(bot.id);
+      if (!patch) return bot;
+      const next = { ...bot, ...patch };
+      if (JSON.stringify(next) !== JSON.stringify(bot)) changedIds.add(bot.id);
+      return next;
+    });
+    if (changedIds.size) {
+      this.saveBots(nextBots);
+      for (const bot of this.bots) {
+        const patch = patches.get(bot.id);
+        if (patch) Object.assign(bot, patch);
+      }
+      for (const botId of changedIds) this.emit({ type: "bot", botId });
+    }
+    return { ok: true, bots: ids.map((id) => this.bot(id)!) };
   }
 
   /** The one way runtime state changes. Sets `activity` and derives `busy`

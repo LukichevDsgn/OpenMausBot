@@ -28,7 +28,8 @@ import { ReplyQuote } from "./ReplyQuote";
 import { ConnectorCard } from "./ConnectorCard";
 import { SecretRequestCard } from "./SecretRequestCard";
 import { hasRoutineExecutionTask, RoutineRunCard } from "./RoutineRunCard";
-import { AttachedImageGallery } from "./AttachmentPreview";
+import { GoalRunCard } from "./GoalRunCard";
+import { AttachedFileChips, AttachedImageGallery } from "./AttachmentPreview";
 import { GroupCallButton, GroupCallOverlay } from "./GroupCallView";
 
 import { ApprovalCard } from "./ApprovalCard";
@@ -43,7 +44,7 @@ import { BOTTOM_FOLLOW_THRESHOLD, shouldResumeBottomFollow } from "@/lib/bottom-
 import { useComposerDockPad } from "@/lib/composer-dock";
 import { showWorkingDots } from "@/lib/turn-tail";
 import { liveActivityLabel } from "@/lib/live-activity";
-import { splitAttachedImages } from "@/lib/composer-attachments";
+import { splitTranscriptAttachments } from "@/lib/composer-attachments";
 import {
   TRANSCRIPT_WINDOW_SIZE,
   expandWindowStart,
@@ -179,7 +180,7 @@ const Transcript = memo(function Transcript({
         const m = item.message;
         if (m.id === emergingId) return null;
         const user = m.role === "user";
-        const attachedImages = user && m.text ? splitAttachedImages(m.text) : null;
+        const attachments = user && m.text ? splitTranscriptAttachments(m.text) : null;
         const newCluster = !prev || prev.role !== m.role || prev.from?.botId !== m.from?.botId || newDay;
         const routineOwner = m.kind === "routine.run" ? memberOf(m.from?.botId) : undefined;
         const routineExecutionThreadId = m.routineRun?.executionThreadId;
@@ -199,6 +200,10 @@ const Transcript = memo(function Transcript({
           ) : m.kind === "options" && m.card?.requestId && m.card.tool ? (
             <div className="flex justify-start">
               <ApprovalCard bot={memberOf(m.from?.botId)} message={m} />
+            </div>
+          ) : m.kind === "goal.run" ? (
+            <div className="flex justify-start">
+              <GoalRunCard message={m} />
             </div>
           ) : m.kind === "routine.run" ? (
             <div className="flex justify-start">
@@ -254,10 +259,16 @@ const Transcript = memo(function Transcript({
                   })()}
                   {user ? (
                     <>
-                      {attachedImages && attachedImages.images.length > 0 && (
-                        <AttachedImageGallery paths={attachedImages.images} />
+                      {attachments && attachments.images.length > 0 && (
+                        <AttachedImageGallery paths={attachments.images} />
                       )}
-                      {attachedImages?.display ?? m.text}
+                      {attachments && attachments.files.length > 0 && (
+                        <AttachedFileChips
+                          files={attachments.files}
+                          className={!attachments.display ? "mb-0" : undefined}
+                        />
+                      )}
+                      {attachments?.display ?? m.text}
                     </>
                   ) : <ChatMarkdown text={m.text} />}
                 </div>
@@ -861,7 +872,7 @@ export function GroupView({ group }: { group: Group }) {
   const toolInFlight = lastGroupMessage?.kind === "activity" && lastGroupMessage.tool?.ok === undefined;
   const activityLabel = liveActivityLabel(lastGroupMessage);
   const waiting = Boolean(
-    speaker && showWorkingDots(true, undefined, group.messages.at(-1), speaker.id),
+    speaker && showWorkingDots(true, group.messages.at(-1), speaker.id),
   );
   const wasWaiting = useRef(false);
   const [popping, setPopping] = useState<{ id: string; text: string; botId?: string } | null>(null);
@@ -951,7 +962,7 @@ export function GroupView({ group }: { group: Group }) {
     if (!el || !followRef.current) return;
     el.scrollTo({ top: el.scrollHeight });
     previousScrollTop.current = el.scrollTop;
-  }, [group.id, group.messages.length, streaming, group.busyBotId, composerDock.pad]);
+  }, [group.id, group.messages.length, streaming, group.busyBotId, group.working, composerDock.pad]);
 
   // Expanding prepends rows: capture the height first, then after the commit
   // shift scrollTop by the growth so the message under the cursor stays put

@@ -17,7 +17,7 @@ import { z } from "zod";
 import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
 import { freePortBlock } from "./testing/ports.ts";
 import { openSse } from "./testing/sse.ts";
-import { IMAGE_MAX_BYTES } from "./attachments.ts";
+import { FILE_MAX_BYTES, IMAGE_MAX_BYTES } from "./attachments.ts";
 import { DEFAULT_ANTIGRAVITY_PROXY_URL } from "./config.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
@@ -92,6 +92,19 @@ const api = async (method: string, path: string, body?: unknown): Promise<{ stat
     body: body ? JSON.stringify(body) : undefined,
   });
   return { status: res.status, body: await res.json() };
+};
+
+const readJsonFileWhenReady = async <T = unknown>(file: string, timeout = 5_000): Promise<T> => {
+  let parsed: unknown;
+  await expect.poll(() => {
+    try {
+      parsed = JSON.parse(readFileSync(file, "utf8"));
+      return true;
+    } catch {
+      return false;
+    }
+  }, { timeout }).toBe(true);
+  return parsed as T;
 };
 
 const storedMessageCount = (threadId: string): number => {
@@ -868,14 +881,13 @@ describe("harness HTTP API", () => {
 
       rmSync(fakeClaudeDump, { force: true });
       expect((await api("POST", `/api/bots/${chief.id}/messages`, { text: "prepare the team" })).status).toBe(202);
-      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
       const dump = z.object({
         mcpConfig: z.object({
           mcpServers: z.object({
             agents: z.object({ env: z.object({ OMB_COMMS_TOKEN: z.string() }) }),
           }),
         }),
-      }).parse(JSON.parse(readFileSync(fakeClaudeDump, "utf8")));
+      }).parse(await readJsonFileWhenReady(fakeClaudeDump));
       const internalHeaders = {
         authorization: `Bearer ${dump.mcpConfig.mcpServers.agents.env.OMB_COMMS_TOKEN}`,
         "content-type": "application/json",
@@ -1241,6 +1253,118 @@ describe("harness HTTP API", () => {
     }
   });
 
+  it("files a sidebar section atomically, trims and dedupes, and preserves its Chief", async () => {
+    const incumbent = (await api("POST", "/api/bots")).body.bot;
+    const incoming = (await api("POST", "/api/bots")).body.bot;
+    const teammate = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await api("PATCH", `/api/bots/${incumbent.id}`, { section: "Launch", chiefOfStaff: true });
+      await api("PATCH", `/api/bots/${incoming.id}`, { section: "Research" });
+      await api("PATCH", `/api/bots/${teammate.id}`, { section: "Personal" });
+
+      const stream = await openSse(`${BASE}/api/events`);
+      try {
+        await stream.until((frame) => frame.kind === "hello");
+        const created = await api("POST", "/api/sidebar-sections", {
+          name: "  Launch  ",
+          botIds: [incoming.id, teammate.id, incoming.id],
+        });
+        expect(created.status).toBe(200);
+        expect(created.body.section).toBe("Launch");
+        expect(created.body.bots.map((bot: { id: string }) => bot.id)).toEqual([
+          incoming.id,
+          teammate.id,
+        ]);
+        expect(created.body.bots.find((bot: { id: string }) => bot.id === incoming.id))
+          .toMatchObject({ section: "Launch" });
+        expect(Boolean(created.body.bots.find((bot: { id: string }) => bot.id === incoming.id)?.chiefOfStaff))
+          .toBe(false);
+
+        for (const id of [incoming.id, teammate.id]) {
+          const frame = await stream.until(
+            (candidate) => candidate.kind === "bot" && candidate.bot?.id === id,
+          );
+          expect(frame.bot.section).toBe("Launch");
+        }
+
+        const bots = (await api("GET", "/api/bots")).body.bots;
+        expect(bots.find((bot: { id: string }) => bot.id === incumbent.id))
+          .toMatchObject({ section: "Launch", chiefOfStaff: true });
+      } finally {
+        stream.close();
+      }
+    } finally {
+      for (const bot of [incumbent, incoming, teammate]) await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("rejects a sidebar section Chief collision without changing any bot", async () => {
+    const incumbent = (await api("POST", "/api/bots")).body.bot;
+    const incoming = (await api("POST", "/api/bots")).body.bot;
+    const teammate = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await api("PATCH", `/api/bots/${incumbent.id}`, { section: "Launch", chiefOfStaff: true });
+      await api("PATCH", `/api/bots/${incoming.id}`, { section: "Research", chiefOfStaff: true });
+      await api("PATCH", `/api/bots/${teammate.id}`, { section: "Personal" });
+
+      const response = await api("POST", "/api/sidebar-sections", {
+        name: "Launch",
+        botIds: [incoming.id, teammate.id],
+      });
+      expect(response).toEqual({
+        status: 409,
+        body: {
+          error: "A section can have only one Chief of Staff. Choose one Chief or use a section without one.",
+        },
+      });
+
+      const bots = (await api("GET", "/api/bots")).body.bots;
+      expect(bots.find((bot: { id: string }) => bot.id === incumbent.id))
+        .toMatchObject({ section: "Launch", chiefOfStaff: true });
+      expect(bots.find((bot: { id: string }) => bot.id === incoming.id))
+        .toMatchObject({ section: "Research", chiefOfStaff: true });
+      expect(bots.find((bot: { id: string }) => bot.id === teammate.id))
+        .toMatchObject({ section: "Personal" });
+      expect(Boolean(bots.find((bot: { id: string }) => bot.id === teammate.id)?.chiefOfStaff))
+        .toBe(false);
+    } finally {
+      for (const bot of [incumbent, incoming, teammate]) await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("rejects malformed or unavailable sidebar section targets without partially filing bots", async () => {
+    const visible = (await api("POST", "/api/bots")).body.bot;
+    const hidden = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await api("PATCH", `/api/bots/${visible.id}`, { section: "Original" });
+      await api("PATCH", `/api/bots/${hidden.id}`, { hidden: true, chiefOfStaff: false });
+
+      for (const body of [
+        { name: "   ", botIds: [visible.id] },
+        { name: "S".repeat(61), botIds: [visible.id] },
+        { name: "Work", botIds: [] },
+        { name: "Work", botIds: ["not/an/id"] },
+        { name: "Work", botIds: [visible.id], extra: true },
+      ]) {
+        expect((await api("POST", "/api/sidebar-sections", body)).status).toBe(400);
+      }
+      expect((await api("POST", "/api/sidebar-sections", {
+        name: "Work",
+        botIds: [visible.id, "missing"],
+      })).status).toBe(404);
+      expect((await api("POST", "/api/sidebar-sections", {
+        name: "Work",
+        botIds: [visible.id, hidden.id],
+      })).status).toBe(404);
+
+      const bots = (await api("GET", "/api/bots")).body.bots;
+      expect(bots.find((bot: { id: string }) => bot.id === visible.id)?.section).toBe("Original");
+    } finally {
+      await api("DELETE", `/api/bots/${visible.id}`);
+      await api("DELETE", `/api/bots/${hidden.id}`);
+    }
+  });
+
   it("explains when archived room members cannot respond", async () => {
     const archived = (await api("POST", "/api/bots")).body.bot;
     const active = (await api("POST", "/api/bots")).body.bot;
@@ -1370,6 +1494,121 @@ describe("harness HTTP API", () => {
       body: Buffer.alloc(IMAGE_MAX_BYTES + 1),
     });
     expect(tooBig.status).toBe(413);
+
+    const uploadId = "11111111-1111-4111-8111-111111111111";
+    const idempotent = await fetch(`${BASE}/api/attachments?uploadId=${uploadId}`, {
+      method: "POST",
+      headers: { "content-type": "image/png" },
+      body: new Uint8Array(png),
+    });
+    expect(idempotent.status).toBe(201);
+    const idempotentResult = (await idempotent.json()) as { path: string };
+    const retry = await fetch(`${BASE}/api/attachments?uploadId=${uploadId}`, {
+      method: "POST",
+      headers: { "content-type": "image/png" },
+      body: new Uint8Array(png),
+    });
+    expect(retry.status).toBe(201);
+    expect((await retry.json() as { path: string }).path).toBe(idempotentResult.path);
+
+    const conflictingRetry = await fetch(`${BASE}/api/attachments?uploadId=${uploadId}`, {
+      method: "POST",
+      headers: { "content-type": "image/png" },
+      body: new Uint8Array([1, 2, 3]),
+    });
+    expect(conflictingRetry.status).toBe(409);
+
+    const malformedId = await fetch(`${BASE}/api/attachments?uploadId=..%2Fescape`, {
+      method: "POST",
+      headers: { "content-type": "image/png" },
+      body: new Uint8Array(png),
+    });
+    expect(malformedId.status).toBe(400);
+  });
+
+  it("streams shared documents safely into the local attachments directory", async () => {
+    const contents = Buffer.from("name,score\nAda,10\n");
+    const saved = await fetch(`${BASE}/api/files?name=${encodeURIComponent("scores.exe")}`, {
+      method: "POST",
+      headers: { "content-type": "text/csv; charset=utf-8" },
+      body: contents,
+    });
+    expect(saved.status).toBe(201);
+    const result = (await saved.json()) as { path: string; name: string; mime: string; bytes: number };
+    expect(result).toMatchObject({ name: "scores.csv", mime: "text/csv", bytes: contents.byteLength });
+    expect(result.path).toMatch(/[\\/]attachments[\\/][0-9a-f-]+\.csv$/);
+    expect(readFileSync(result.path).equals(contents)).toBe(true);
+    if (process.platform !== "win32") {
+      expect(statSync(dirname(result.path)).mode & 0o777).toBe(0o700);
+      expect(statSync(result.path).mode & 0o777).toBe(0o600);
+    }
+
+    const unsupported = await fetch(`${BASE}/api/files?name=payload.zip`, {
+      method: "POST",
+      headers: { "content-type": "application/zip" },
+      body: Buffer.from("archive"),
+    });
+    expect(unsupported.status).toBe(400);
+
+    const missingName = await fetch(`${BASE}/api/files`, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: Buffer.from("hello"),
+    });
+    expect(missingName.status).toBe(400);
+
+    for (const name of ["..%2F..%2Fsecret.txt", "..%5C..%5Csecret.txt", "..%252F..%252Fsecret.txt"]) {
+      const traversal = await fetch(`${BASE}/api/files?name=${name}`, {
+        method: "POST",
+        headers: { "content-type": "text/plain" },
+        body: Buffer.from("hello"),
+      });
+      expect(traversal.status, name).toBe(400);
+    }
+
+    const empty = await fetch(`${BASE}/api/files?name=empty.pdf`, {
+      method: "POST",
+      headers: { "content-type": "application/pdf" },
+      body: Buffer.alloc(0),
+    });
+    expect(empty.status).toBe(400);
+
+    const tooBig = await fetch(`${BASE}/api/files?name=large.pdf`, {
+      method: "POST",
+      headers: { "content-type": "application/pdf" },
+      body: Buffer.alloc(FILE_MAX_BYTES + 1),
+    });
+    expect(tooBig.status).toBe(413);
+
+    const uploadId = "22222222-2222-4222-8222-222222222222";
+    const first = await fetch(`${BASE}/api/files?name=notes.txt&uploadId=${uploadId}`, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: Buffer.from("retry-safe"),
+    });
+    expect(first.status).toBe(201);
+    const firstResult = (await first.json()) as { path: string };
+    const retry = await fetch(`${BASE}/api/files?name=notes.txt&uploadId=${uploadId}`, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: Buffer.from("retry-safe"),
+    });
+    expect(retry.status).toBe(201);
+    expect((await retry.json() as { path: string }).path).toBe(firstResult.path);
+
+    const conflictingRetry = await fetch(`${BASE}/api/files?name=notes.txt&uploadId=${uploadId}`, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: Buffer.from("different"),
+    });
+    expect(conflictingRetry.status).toBe(409);
+
+    const malformedId = await fetch(`${BASE}/api/files?name=notes.txt&uploadId=not-a-uuid`, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: Buffer.from("hello"),
+    });
+    expect(malformedId.status).toBe(400);
   });
 
   it("persists only app-owned bot avatars and supported crop shapes", async () => {
@@ -2523,6 +2762,128 @@ describe("harness HTTP API", () => {
     }
   });
 
+  it("creates, edits, lists, and deletes scheduled multi-bot calls", async () => {
+    const first = (await api("POST", "/api/bots", { name: "Call host" })).body.bot;
+    const second = (await api("POST", "/api/bots", { name: "Call guest" })).body.bot;
+    let callId = "";
+    try {
+      const invalidCreate = await api("POST", "/api/calendar-calls", {
+        name: "",
+        botIds: [],
+        schedule: { type: "once", at: Date.now() + 60_000 },
+      });
+      expect(invalidCreate.status).toBe(400);
+
+      const created = await api("POST", "/api/calendar-calls", {
+        name: "Weekly bot sync",
+        description: "Review priorities.",
+        botIds: [first.id, second.id],
+        schedule: { type: "once", at: Date.now() + 60_000 },
+        durationMinutes: 30,
+        attachments: [],
+      });
+      expect(created.status).toBe(201);
+      callId = created.body.call.id;
+      expect(created.body.call).toMatchObject({
+        name: "Weekly bot sync",
+        botIds: [first.id, second.id],
+        durationMinutes: 30,
+      });
+
+      const edited = await api("PATCH", `/api/calendar-calls/${callId}`, {
+        schedule: { type: "daily", time: "11:15", weekdays: [1, 2, 3, 4, 5] },
+      });
+      expect(edited.status).toBe(200);
+      expect(edited.body.call.schedule).toEqual({ type: "daily", time: "11:15", weekdays: [1, 2, 3, 4, 5] });
+      const invalidPatch = await api("PATCH", `/api/calendar-calls/${callId}`, { durationMinutes: 5 });
+      expect(invalidPatch.status).toBe(400);
+      expect((await api("GET", "/api/calendar-calls")).body.calls).toEqual(
+        expect.arrayContaining([expect.objectContaining({ id: callId, name: "Weekly bot sync" })]),
+      );
+
+      expect((await api("DELETE", `/api/calendar-calls/${callId}`)).status).toBe(200);
+      callId = "";
+      expect((await api("PATCH", "/api/calendar-calls/missing", { name: "Nope" })).status).toBe(404);
+    } finally {
+      if (callId) await api("DELETE", `/api/calendar-calls/${callId}`).catch(() => undefined);
+      await api("DELETE", `/api/bots/${first.id}`).catch(() => undefined);
+      await api("DELETE", `/api/bots/${second.id}`).catch(() => undefined);
+    }
+  });
+
+  it("opens one calendar room and posts the scheduled seed to everyone", async () => {
+    const modelSelection = { instanceId: "ghost", model: "ghost-1" };
+    const first = (await api("POST", "/api/bots", { name: "Calendar researcher", modelSelection })).body.bot;
+    const second = (await api("POST", "/api/bots", { name: "Calendar writer", modelSelection })).body.bot;
+    let callId = "";
+    let roomId = "";
+    try {
+      const created = await api("POST", "/api/calendar-calls", {
+        name: "Launch room",
+        description: "Review the launch plan.",
+        botIds: [first.id, second.id],
+        schedule: { type: "once", at: Date.now() - 100 },
+        durationMinutes: 30,
+        attachments: [{
+          id: "launch-brief",
+          name: "Launch brief.txt",
+          path: "/tmp/a\"&<>.txt",
+          size: 12,
+          kind: "file",
+        }],
+      });
+      expect(created.status).toBe(201);
+      callId = created.body.call.id;
+
+      await expect.poll(async () => {
+        const snapshot = await api("GET", "/api/bots?messages=50");
+        const room = snapshot.body.groups.find((candidate: { memberIds: string[] }) =>
+          candidate.memberIds.length === 2 &&
+          candidate.memberIds.includes(first.id) &&
+          candidate.memberIds.includes(second.id)
+        );
+        return room?.messages.find((message: { sendId?: string }) =>
+          message.sendId?.startsWith(`calendar_${callId}_`)
+        )?.text;
+      }, { timeout: 5_000 }).toBe(
+        '@everyone Review the launch plan.\n\n<attached-file path="/tmp/a&quot;&amp;&lt;&gt;.txt" />',
+      );
+
+      const snapshot = await api("GET", "/api/bots?messages=50");
+      const room = snapshot.body.groups.find((candidate: { memberIds: string[] }) =>
+        candidate.memberIds.length === 2 &&
+        candidate.memberIds.includes(first.id) &&
+        candidate.memberIds.includes(second.id)
+      );
+      expect(room).toMatchObject({ defaultResponder: { kind: "everyone" } });
+      roomId = room.id;
+
+      await expect.poll(async () => {
+        const refreshed = await api("GET", "/api/bots?messages=50");
+        const current = refreshed.body.groups.find((candidate: { id: string }) => candidate.id === roomId);
+        return current?.messages
+          .filter((message: { from?: { botId?: string } }) => message.from?.botId)
+          .map((message: { from: { botId: string } }) => message.from.botId)
+          .sort();
+      }, { timeout: 5_000 }).toEqual([first.id, second.id].sort());
+
+      const joined = await api("POST", `/api/calendar-calls/${callId}/room`, {});
+      expect(joined.status).toBe(200);
+      expect(joined.body.group.id).toBe(roomId);
+      expect(room.messages.filter((message: { sendId?: string }) =>
+        message.sendId?.startsWith(`calendar_${callId}_`)
+      )).toHaveLength(1);
+    } finally {
+      if (callId) await api("DELETE", `/api/calendar-calls/${callId}`).catch(() => undefined);
+      if (roomId) {
+        await api("POST", `/api/groups/${roomId}/interrupt`, {}).catch(() => undefined);
+        await api("DELETE", `/api/groups/${roomId}`).catch(() => undefined);
+      }
+      await api("DELETE", `/api/bots/${first.id}`).catch(() => undefined);
+      await api("DELETE", `/api/bots/${second.id}`).catch(() => undefined);
+    }
+  });
+
   it("refuses to delete a bot while one of its routines is active", async () => {
     const bot = (await api("POST", "/api/bots", {
       modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
@@ -2651,7 +3012,6 @@ describe("harness HTTP API", () => {
 
       rmSync(fakeClaudeDump, { force: true });
       expect((await api("POST", `/api/groups/${room.id}/messages`, { text: "Check the website" })).status).toBe(202);
-      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
       const dump = z.object({
         argv: z.array(z.string()),
         env: z.record(z.string(), z.string()),
@@ -2666,7 +3026,7 @@ describe("harness HTTP API", () => {
             }),
           }),
         }),
-      }).parse(JSON.parse(readFileSync(fakeClaudeDump, "utf8")));
+      }).parse(await readJsonFileWhenReady(fakeClaudeDump));
       const browserEnv = dump.mcpConfig.mcpServers.browser.env;
       expect(browserEnv).toMatchObject({ OMB_BOT_ID: bot.id, OMB_BROWSER_PROFILE: "work" });
       const registration = browserCapabilityCalls.find(
@@ -2780,8 +3140,7 @@ describe("harness HTTP API", () => {
       expect(replacementTooSoon.body.queued).toBe(true);
       expect(existsSync(fakeClaudeDump)).toBe(false);
 
-      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
-      expect(JSON.stringify(JSON.parse(readFileSync(fakeClaudeDump, "utf8")))).toContain("replacement");
+      expect(JSON.stringify(await readJsonFileWhenReady(fakeClaudeDump))).toContain("replacement");
     } finally {
       browserRegisterDelayMs = 0;
       await api("POST", `/api/bots/${bot.id}/interrupt`, {}).catch(() => undefined);
@@ -3082,7 +3441,7 @@ describe("harness HTTP API", () => {
       await waitForIsolatedServer(isolatedChild, isolatedPort, () => isolatedStderr);
       await expect.poll(() => JSON.parse(
         readFileSync(join(isolatedData, "browser-cleanups.json"), "utf8"),
-      )).toEqual([]);
+      ), { timeout: 5_000 }).toEqual([]);
 
       const beforeReuse = await isolatedApi("GET", "/api/bots?messages=0");
       expect(beforeReuse.body.bots.find((bot: { id: string }) => bot.id === "crash-bot"))
@@ -3174,6 +3533,22 @@ describe("harness HTTP API", () => {
       await expect.poll(() => browserCapabilityCalls.slice(callOffset).some(
         (call) => call.operation === "register" && call.body.botId === activeBot.id,
       ), { timeout: 5_000 }).toBe(true);
+      // Registration happens before the provider's init frame is persisted.
+      // Wait for that final startup write before sabotaging the store;
+      // otherwise slower Windows runners can reset the next HTTP request when
+      // the resume-cursor save races the deliberately-invalid bots path.
+      await expect.poll(() => {
+        try {
+          const bots = z.array(z.object({
+            id: z.string().optional(),
+            resumeCursors: z.record(z.string(), z.string()).optional(),
+          }).passthrough()).parse(JSON.parse(readFileSync(botsFile, "utf8")));
+          const cursor = bots.find((bot) => bot.id === activeBot.id)?.resumeCursors?.claude;
+          return Boolean(cursor);
+        } catch {
+          return false;
+        }
+      }, { timeout: 5_000 }).toBe(true);
 
       // The hanging provider may bank one final activity write concurrently.
       // Win the replacement atomically by retrying until the path is a
@@ -3560,11 +3935,10 @@ describe("harness HTTP API", () => {
 
       rmSync(fakeClaudeDump, { force: true });
       expect((await api("POST", `/api/groups/${room.id}/messages`, { text: "start the lead" })).status).toBe(202);
-      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
-      const firstDump = JSON.parse(readFileSync(fakeClaudeDump, "utf8")) as {
+      const firstDump = await readJsonFileWhenReady<{
         pid: number;
         mcpConfig: { mcpServers: { agents: { env: { OMB_COMMS_TOKEN: string } } } };
-      };
+      }>(fakeClaudeDump);
       const token = firstDump.mcpConfig.mcpServers.agents.env.OMB_COMMS_TOKEN;
       expect(token).toMatch(/^[a-f0-9]{48}$/);
 
@@ -3633,8 +4007,9 @@ describe("harness HTTP API", () => {
 
       rmSync(fakeClaudeDump, { force: true });
       expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "prepare a routine" })).status).toBe(202);
-      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
-      const dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+      const dump = await readJsonFileWhenReady<{
+        mcpConfig: { mcpServers: { agents: { env: { OMB_COMMS_TOKEN: string } } } };
+      }>(fakeClaudeDump);
       const token = dump.mcpConfig.mcpServers.agents.env.OMB_COMMS_TOKEN;
       expect(token).toMatch(/^[a-f0-9]{48}$/);
       expect((await api("POST", `/api/bots/${bot.id}/interrupt`)).status).toBe(200);
@@ -3985,8 +4360,9 @@ describe("harness HTTP API", () => {
 
       rmSync(fakeClaudeDump, { force: true });
       expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "prepare a skill" })).status).toBe(202);
-      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
-      const dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+      const dump = await readJsonFileWhenReady<{
+        mcpConfig: { mcpServers: { agents: { env: { OMB_COMMS_TOKEN: string } } } };
+      }>(fakeClaudeDump);
       const token = dump.mcpConfig.mcpServers.agents.env.OMB_COMMS_TOKEN;
       expect(token).toMatch(/^[a-f0-9]{48}$/);
       const internalHeaders = {

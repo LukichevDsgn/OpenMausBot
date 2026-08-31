@@ -9,6 +9,7 @@ import { extname, join } from "node:path";
 
 import { z } from "zod";
 import { botAvatarUrlFromStoredPath } from "../shared/bot-avatar.ts";
+import { escapeAttribute } from "../src/lib/composer-attachments.ts";
 import {
   CREDENTIAL_TARGETS,
   credentialResumeOutcome,
@@ -40,7 +41,18 @@ import {
 import * as checkpoints from "./checkpoints.ts";
 import { appendDecision, readDecisions } from "./decision-log.ts";
 import { validateBotCwd } from "./bot-cwd.ts";
-import { attachmentExists, extensionForMime, IMAGE_MAX_BYTES, readAttachment, saveImage, type SavedAttachment } from "./attachments.ts";
+import {
+  attachmentExists,
+  extensionForMime,
+  FILE_MAX_BYTES,
+  IMAGE_MAX_BYTES,
+  readAttachment,
+  saveFile,
+  saveImage,
+  saveImageUpload,
+  type SavedAttachment,
+  validateAttachmentUploadId,
+} from "./attachments.ts";
 import {
   avatarGenerationRequestSchema,
   avatarGenerationStateMatches,
@@ -103,6 +115,17 @@ import {
   newId,
 } from "./contracts.ts";
 import { RETRY_MAX_ATTEMPTS } from "./drivers/retry.ts";
+import {
+  GROUP_GOAL_MAX_TURNS,
+  groupGoalAssignmentKey,
+  groupGoalCoordinatorInstructions,
+  groupGoalWorkerInstructions,
+  parseGroupGoalDecision,
+  resolveGroupGoalMember,
+  selectGroupGoalCoordinator,
+  type GoalRunMember,
+} from "./group-goal-run.ts";
+import type { GroupGoalRunCardData, GroupGoalRunStatus } from "../shared/group-goal-run.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type CommsBus } from "./comms-visibility.ts";
@@ -181,6 +204,7 @@ import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import { redactSecretsInText } from "./redact.ts";
 import * as vps from "./vps-computer.ts";
 import { RoutineManager, type RoutineRun, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
+import { CalendarCallManager, type CalendarCall } from "./calendar-calls.ts";
 import {
   BUILT_IN_BROWSER_SYSTEM_PROMPT,
   applyDesktopBrowserConnectionMessage,
@@ -298,6 +322,10 @@ function authorizedComms(header: string | string[] | undefined): boolean {
 // A→B is allowed but B→C (and A→B→A loops) never start.
 const MAX_COMMS_DEPTH = 1;
 const MAX_WORKSPACE_BOTS = 100;
+const createSidebarSectionSchema = z.object({
+  name: z.string(),
+  botIds: z.array(z.string().regex(/^[\w-]+$/)).min(1).max(MAX_WORKSPACE_BOTS),
+}).strict();
 const createGroupTaskRequestSchema = z.object({ title: z.string().optional() });
 // Resolved from the server root — see server/proxy-paths.ts. This descending
 // path happened to survive bundling, but it goes through the same anchor so
@@ -826,6 +854,16 @@ type GroupTurnOperation = {
   botIds: Set<string>;
   cancelled: boolean;
   providerHandshakePending: boolean;
+  goalRun?: {
+    runId: string;
+    goal: string;
+    coordinatorBotId: string;
+    coordinatorName: string;
+    turnCount: number;
+    maxTurns: number;
+    startedAt: number;
+    finished: boolean;
+  };
 };
 
 // busyBotId names only the speaker that currently owns the provider process.
@@ -833,6 +871,81 @@ type GroupTurnOperation = {
 // queued behind that speaker. Keep that operation visible for its whole
 // lifetime so polling clients cannot mistake a handoff for completion.
 const groupTurnOperations = new Map<string, Set<GroupTurnOperation>>();
+
+/** The central runtime fold uses this to hide a coordinator's private
+ * decision envelope from both streaming UI and the durable transcript. */
+type GroupGoalCoordinatorTurn = {
+  token: symbol;
+  turnId?: string;
+  assistantItems: string[];
+  /** A timed-out provider may still emit after the goal operation returns.
+   * Keep swallowing that abandoned turn until its real completion arrives. */
+  discard: boolean;
+  cleanupTimer?: ReturnType<typeof setTimeout>;
+};
+const groupGoalCoordinatorTurns = new Map<string, Set<GroupGoalCoordinatorTurn>>();
+const GROUP_GOAL_COORDINATOR_GUARD_MS = 5 * 60_000;
+
+function addGroupGoalCoordinatorTurn(threadId: string, turn: GroupGoalCoordinatorTurn): void {
+  const turns = groupGoalCoordinatorTurns.get(threadId) ?? new Set<GroupGoalCoordinatorTurn>();
+  turns.add(turn);
+  groupGoalCoordinatorTurns.set(threadId, turns);
+}
+
+function removeGroupGoalCoordinatorTurn(threadId: string, turn: GroupGoalCoordinatorTurn): void {
+  if (turn.cleanupTimer) clearTimeout(turn.cleanupTimer);
+  const turns = groupGoalCoordinatorTurns.get(threadId);
+  turns?.delete(turn);
+  if (turns?.size === 0) groupGoalCoordinatorTurns.delete(threadId);
+}
+
+function hasUnboundDiscardedGroupGoalTurn(threadId: string): boolean {
+  return [...(groupGoalCoordinatorTurns.get(threadId) ?? [])]
+    .some((turn) => turn.discard && !turn.turnId);
+}
+
+/** Match private coordinator output to one provider turn, never merely to a
+ * reusable room thread. Most adapters emit turn.started before sendTurn
+ * resolves, so the first stable event may bind an otherwise pending guard. */
+function groupGoalCoordinatorTurnForEvent(event: RuntimeEvent): GroupGoalCoordinatorTurn | undefined {
+  const turns = groupGoalCoordinatorTurns.get(event.threadId);
+  if (!turns?.size) return undefined;
+  const candidates = [...turns];
+  if (event.turnId) {
+    const exact = candidates.find((turn) => turn.turnId === event.turnId);
+    if (exact) return exact;
+    // Until an interrupted handshake returns its own id, no new id can be
+    // attributed safely. The stall fallback keeps this thread unavailable in
+    // that narrow window; private text is suppressed below until sendTurn's
+    // result binds the old guard or its bounded expiry releases ownership.
+    const unboundDiscarded = candidates.filter((turn) => turn.discard && !turn.turnId);
+    if (unboundDiscarded.length > 0) {
+      // The ownership fallback below keeps a lone abandoned handshake's
+      // thread closed, so its first eventual id can safely bind here. More
+      // than one unbound candidate is genuinely ambiguous and stays gated.
+      if (candidates.length === 1) {
+        unboundDiscarded[0]!.turnId = event.turnId;
+        // This event is the first stable identity for an already-abandoned
+        // provider turn. Tombstone it immediately so this event and every
+        // later completion/request cannot settle a replacement on the same
+        // room thread.
+        retireProviderTurn(event.turnId);
+        return unboundDiscarded[0];
+      }
+      return undefined;
+    }
+    const pending = candidates.findLast((turn) => !turn.turnId && !turn.discard);
+    if (pending && !pending.turnId) {
+      pending.turnId = event.turnId;
+      return pending;
+    }
+    return undefined;
+  }
+  // Turn-scoped events normally carry an id. If an adapter omits it, fail
+  // closed for private text; with multiple overlapping guards there is no
+  // safe way to attribute a completion, so leave cleanup to the bounded timer.
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
 
 function groupIsWorking(group: GroupRecord): boolean {
   return Boolean(group.busyBotId) || Boolean(groupTurnOperations.get(group.id)?.size);
@@ -863,6 +976,9 @@ function beginGroupTurnOperation(
 }
 
 function finishGroupTurnOperation(groupId: string, operation: GroupTurnOperation) {
+  if (operation.goalRun && !operation.goalRun.finished) {
+    finishGroupGoalRun(groupId, operation, "failed", "The team run ended before the lead reported an outcome.");
+  }
   clearCancelledProviderHandshake(operation.threadId, `group:${operation.id}`);
   const operations = groupTurnOperations.get(groupId);
   operations?.delete(operation);
@@ -871,10 +987,57 @@ function finishGroupTurnOperation(groupId: string, operation: GroupTurnOperation
   if (group) broadcast({ kind: "group", group: publicGroupState(group) });
 }
 
+function finishGroupGoalRun(
+  groupId: string,
+  operation: GroupTurnOperation,
+  status: Exclude<GroupGoalRunStatus, "working">,
+  detail: string,
+): void {
+  const run = operation.goalRun;
+  if (!run || run.finished) return;
+  run.finished = true;
+  const finishedAt = Date.now();
+  const card: GroupGoalRunCardData = {
+    runId: run.runId,
+    goal: run.goal,
+    status,
+    coordinatorBotId: run.coordinatorBotId,
+    coordinatorName: run.coordinatorName,
+    turnCount: run.turnCount,
+    maxTurns: run.maxTurns,
+    detail: detail.trim().slice(0, 500),
+    startedAt: run.startedAt,
+    finishedAt,
+  };
+  const group = store.group(groupId);
+  const coordinator = store.bot(run.coordinatorBotId);
+  const ownsThread = group?.dm
+    ? group.threadId === operation.threadId
+    : Boolean(group && store.groupTaskByThread(group.id, operation.threadId));
+  if (!ownsThread) return;
+  const fallbackState = status === "completed"
+    ? "completed"
+    : status === "needs-input"
+      ? "needs your input"
+      : status === "limit-reached"
+        ? "reached its turn limit"
+        : status;
+  store.appendMessage(operation.threadId, {
+    role: "bot",
+    kind: "goal.run",
+    text: `Goal ${fallbackState}: ${card.detail ?? card.goal}`,
+    from: coordinator
+      ? { botId: coordinator.id, name: coordinator.name, color: coordinator.color }
+      : undefined,
+    goalRun: card,
+  });
+}
+
 function cancelGroupTurnOperations(groupId: string, threadId: string) {
   for (const operation of groupTurnOperations.get(groupId) ?? []) {
     if (operation.threadId !== threadId) continue;
     operation.cancelled = true;
+    finishGroupGoalRun(groupId, operation, "stopped", "Stopped by you.");
     if (operation.providerHandshakePending) {
       markCancelledProviderHandshake(operation.threadId, `group:${operation.id}`);
     }
@@ -1223,7 +1386,16 @@ const watchdog = new TurnWatchdog({
     // sooner. Keep ownership during that grace period so another turn cannot
     // overlap the process we are stopping. The normal turn.completed fold
     // clears it first when the adapter responds.
-    const release = setTimeout(() => {
+    const releaseOwnership = () => {
+      // A goal coordinator can stall before sendTurn reveals its provider
+      // turn id. Reusing the room during that ambiguous pre-id window would
+      // make old and replacement events indistinguishable. Keep ownership
+      // until the guard binds or reaches its bounded expiry.
+      if (hasUnboundDiscardedGroupGoalTurn(turn.threadId)) {
+        const retry = setTimeout(releaseOwnership, 1_000);
+        retry.unref?.();
+        return;
+      }
       const group = store.groupByThread(turn.threadId);
       const speaker = groupSpeakers.get(turn.threadId);
       if (group && group.busyBotId === turn.botId && speaker?.botId === turn.botId) {
@@ -1243,7 +1415,8 @@ const watchdog = new TurnWatchdog({
         drainConnectorResumes();
         drainSecretResumes();
       }
-    }, 6_000);
+    };
+    const release = setTimeout(releaseOwnership, 6_000);
     release.unref?.();
   },
 });
@@ -1376,6 +1549,7 @@ function isUnattended(botId?: string | null): boolean {
   return true;
 }
 let routines: RoutineManager | null = null;
+let calendarCalls: CalendarCallManager | null = null;
 const localVmOwnerBusy = (botId: string) => store.bot(botId)?.busy === true;
 const localVmLeases = new LocalVmLeasePool(30 * 60_000);
 const localVmLifecycleBusy = new Set<string>();
@@ -1467,6 +1641,45 @@ bus.subscribe((event: RuntimeEvent) => {
       timer.unref?.();
     }
   }
+  const coordinatorTurnsForThread = groupGoalCoordinatorTurns.get(event.threadId);
+  const ambiguousCoordinatorText = !event.turnId && (coordinatorTurnsForThread?.size ?? 0) > 1;
+  const goalCoordinatorTurn = groupGoalCoordinatorTurnForEvent(event);
+  if (goalCoordinatorTurn?.discard && retiredProviderTurns.has(event.turnId)) {
+    removeGroupGoalCoordinatorTurn(event.threadId, goalCoordinatorTurn);
+    return;
+  }
+  // Buffer every coordinator text item for the whole provider turn. A model
+  // can split the private envelope across assistant items (or emit multiple
+  // envelopes), so sanitizing item-by-item can leak protocol into the chat.
+  if (
+    event.type === "item.completed" &&
+    event.itemType === "assistant_text" &&
+    (goalCoordinatorTurn || ambiguousCoordinatorText)
+  ) {
+    if (goalCoordinatorTurn && !goalCoordinatorTurn.discard) goalCoordinatorTurn.assistantItems.push(event.text);
+    return;
+  }
+  if (
+    event.type === "content.delta" &&
+    event.streamKind === "assistant_text" &&
+    (goalCoordinatorTurn || ambiguousCoordinatorText)
+  ) return;
+  const coordinatorVisibleText = goalCoordinatorTurn && !goalCoordinatorTurn.discard && event.type === "turn.completed"
+    ? parseGroupGoalDecision(goalCoordinatorTurn.assistantItems.join("\n")).visibleText
+    : "";
+  if (goalCoordinatorTurn && event.type === "turn.completed") {
+    removeGroupGoalCoordinatorTurn(event.threadId, goalCoordinatorTurn);
+  }
+  if (coordinatorVisibleText) {
+    const publicAssistantEvent: RuntimeEvent = {
+      ...event,
+      eventId: `${event.eventId}-goal-text`,
+      type: "item.completed",
+      itemType: "assistant_text",
+      text: coordinatorVisibleText,
+    };
+    broadcast({ kind: "runtime", event: publicAssistantEvent });
+  }
   broadcast({ kind: "runtime", event });
   const routineRun = routines?.handleRuntimeEvent(event) ?? null;
   const bot = store.botByThread(event.threadId);
@@ -1479,6 +1692,11 @@ bus.subscribe((event: RuntimeEvent) => {
     return message;
   };
 
+  if (coordinatorVisibleText) {
+    pushMessage({ role: "bot", kind: "text", text: coordinatorVisibleText });
+    lastReply.set(event.threadId, coordinatorVisibleText);
+  }
+
   switch (event.type) {
     case "session.started":
       if (bot && event.sessionId && event.providerInstanceId) {
@@ -1487,10 +1705,11 @@ bus.subscribe((event: RuntimeEvent) => {
       break;
     case "item.completed":
       if (event.itemType === "assistant_text") {
-        pushMessage({ role: "bot", kind: "text", text: event.text });
+        const text = event.text;
+        pushMessage({ role: "bot", kind: "text", text });
         // kept so "finished" can say what it finished with, rather than
         // just that something ended
-        lastReply.set(event.threadId, event.text);
+        lastReply.set(event.threadId, text);
       } else if (event.itemType === "tool" && event.itemId) {
         const itemKey = `${event.threadId}:${event.itemId}`;
         const messageId = toolMessageByItem.get(itemKey);
@@ -2924,6 +3143,10 @@ routines = new RoutineManager({
     notify(buildNotification("routine-failed", bot, routineSourceThread(run) ?? run.threadId ?? bot.threadId, detail));
   },
 });
+calendarCalls = new CalendarCallManager({
+  botExists: (botId) => Boolean(store.bot(botId)),
+  onDue: deliverCalendarCall,
+});
 const recoveryOwners = routines.routineRequestReceiptOwners();
 if (recoveryOwners.length > 0) {
   // A normal launch has no crash-gap receipts, so it must not eagerly load
@@ -3127,6 +3350,14 @@ const groupQueues = new Map<string, Promise<void>>();
 const GROUP_CONTEXT_MESSAGES = 30;
 const MAX_GROUP_HOPS = 1;
 
+type GroupMemberTurnOutcome = "settled" | "provider_failed" | "dispatch_failed" | "stalled" | "timed_out" | "cancelled";
+type GroupTurnOrchestration = {
+  systemInstructions: string;
+  followMentions: boolean;
+  result: { replyText?: string; outcome?: GroupMemberTurnOutcome; stopReason?: string | null };
+  onTurnStarted?: (turnId: string) => void;
+};
+
 function serializeRoomContext(threadId: string, userName: string): string {
   const messages = store.messagesFor(threadId);
   const messagesById = new Map(messages.map((message) => [message.id, message]));
@@ -3181,6 +3412,7 @@ async function runGroupMemberTurn(
   onProviderHandshakeStarted?: () => void,
   onProviderHandshakeSettled?: () => void,
   skillAuthoringClaim: { claimed: boolean } = { claimed: false },
+  orchestration?: GroupTurnOrchestration,
 ): Promise<boolean> {
   if (isCancelled?.()) return false;
   const group = store.group(groupId);
@@ -3336,6 +3568,7 @@ async function runGroupMemberTurn(
       "If the user explicitly asks to list or review, schedule, run, or change routines, use list_routines and propose_routine or propose_routine_action. A proposal is not applied until the user confirms its in-app card, so never claim the action completed before that confirmation.",
     skillAuthoring &&
       "If the user sends /learn or asks you to save a reusable procedure from this work, use skills_list and skill_manage. Only create new skills, include the URL, folder, or conversation as source provenance, and wait for the user to review and enable the staged SKILL.md.",
+    orchestration?.systemInstructions,
   ]
     .filter(Boolean)
     .join("\n");
@@ -3371,13 +3604,44 @@ async function runGroupMemberTurn(
   // connector-failed first responder must not silently consume /learn for the
   // next eligible room member.
   if (skillAuthoring) skillAuthoringClaim.claimed = true;
+  // A stopped room handshake may not have revealed its provider turn id yet.
+  // Do not launch a replacement into that ambiguous window; once the old id
+  // is known it is retired and this bounded gate clears immediately.
+  await pendingCancelledProviderHandshakes.waitForClear(threadId);
+  if (
+    isCancelled?.() ||
+    store.group(group.id)?.busyBotId !== bot.id ||
+    store.bot(bot.id)?.busy !== true
+  ) {
+    await releaseBrowserCapabilityForThread(threadId);
+    if (store.group(group.id)?.busyBotId === bot.id) {
+      groupSpeakers.delete(threadId);
+      store.patchGroup(group.id, { busyBotId: null, unread: true });
+    }
+    if (store.bot(bot.id)?.busy) {
+      store.setActivity(bot.id, "idle");
+      retryDelegationsWaitingOn(bot.id);
+    }
+    return false;
+  }
   let replyText = "";
+  let providerTurnId: string | undefined;
+  let abandoned = false;
+  const retirementOwner = `room-abandoned:${randomUUID()}`;
+  const abandonProviderTurn = () => {
+    if (abandoned) return;
+    abandoned = true;
+    watchdog.settle(threadId);
+    if (providerTurnId) retireProviderTurn(providerTurnId);
+    else markCancelledProviderHandshake(threadId, retirementOwner);
+  };
   const timeoutMinutes = roomTurnTimeoutMinutes(cfg);
-  const outcome = await new Promise<"settled" | "dispatch_failed" | "stalled" | "timed_out" | "cancelled">((resolve) => {
+  const outcome = await new Promise<GroupMemberTurnOutcome>((resolve) => {
     let done = false;
     let unsub = () => {};
     let unregisterStall = () => {};
     const deadline = new RoomTurnDeadline(timeoutMinutes, () => {
+      abandonProviderTurn();
       void releaseBrowserCapabilityForThread(threadId);
       void instance.adapter.interruptTurn(threadId).catch(() => {});
       store.appendMessage(threadId, {
@@ -3388,7 +3652,7 @@ async function runGroupMemberTurn(
       });
       finish("timed_out");
     });
-    const finish = (value: "settled" | "dispatch_failed" | "stalled" | "timed_out" | "cancelled") => {
+    const finish = (value: GroupMemberTurnOutcome) => {
       if (done) return;
       done = true;
       deadline.stop();
@@ -3399,8 +3663,16 @@ async function runGroupMemberTurn(
     unsub = bus.subscribe((e: RuntimeEvent) => {
       if (shouldIgnoreProviderEvent(e)) return;
       if (e.threadId !== threadId) return;
+      if (providerTurnId && e.turnId && e.turnId !== providerTurnId) return;
       if (e.type === "item.completed" && e.itemType === "assistant_text") replyText += `\n${e.text}`;
-      else if (e.type === "turn.completed") finish("settled");
+      else if (e.type === "turn.completed") {
+        if (orchestration && !e.ok) {
+          orchestration.result.stopReason = e.stopReason ?? null;
+          finish("provider_failed");
+        } else {
+          finish("settled");
+        }
+      }
       // Waiting on a person is not turn work: hold the ceiling while an
       // approval or question card is open, so deciding slowly does not
       // stop the turn underneath the card. Everything else keeps burning it.
@@ -3408,7 +3680,10 @@ async function runGroupMemberTurn(
       else if (e.type === "request.resolved") deadline.setWaitingOnHuman(false);
     });
     deadline.start();
-    unregisterStall = roomStallCompletions.register(threadId, () => finish("stalled"));
+    unregisterStall = roomStallCompletions.register(threadId, () => {
+      abandonProviderTurn();
+      finish("stalled");
+    });
     watchdog.watch(threadId, bot.id);
     onProviderHandshakeStarted?.();
     guardTurnDispatch(instance.adapter.sendTurn({
@@ -3418,7 +3693,7 @@ async function runGroupMemberTurn(
         cwd,
         integrations,
         ...memberTurnSelection(bot.modelSelection),
-      }), () => Boolean(isCancelled?.()), async () => {
+      }), () => abandoned || Boolean(isCancelled?.()), async () => {
         // Stop may have landed while the adapter was authenticating, before
         // it had an active process for the first interrupt to reach. Now that
         // sendTurn completed setup, revoke again and interrupt the real turn.
@@ -3426,6 +3701,12 @@ async function runGroupMemberTurn(
         await instance.adapter.interruptTurn(threadId).catch(() => {});
       })
       .then((dispatch) => {
+        providerTurnId = dispatch.value.turnId;
+        orchestration?.onTurnStarted?.(dispatch.value.turnId);
+        if (abandoned) {
+          retireProviderTurn(dispatch.value.turnId);
+          clearCancelledProviderHandshake(threadId, retirementOwner);
+        }
         if (dispatch.cancelled) {
           retireProviderTurn(dispatch.value.turnId);
           onProviderHandshakeSettled?.();
@@ -3436,6 +3717,8 @@ async function runGroupMemberTurn(
       })
       .catch((err) => {
         onProviderHandshakeSettled?.();
+        clearCancelledProviderHandshake(threadId, retirementOwner);
+        if (abandoned) return;
         const message = err instanceof Error ? err.message : "turn failed";
         store.appendMessage(threadId, {
           role: "bot",
@@ -3448,6 +3731,10 @@ async function runGroupMemberTurn(
         finish("dispatch_failed");
       });
   });
+  if (orchestration) {
+    orchestration.result.replyText = replyText.trim();
+    orchestration.result.outcome = outcome;
+  }
   // A timed-out provider still owns the room thread until its interrupt
   // produces turn.completed (or the stall watchdog's grace fallback runs).
   // Do not clear busy or start the next member on that same thread early.
@@ -3472,7 +3759,37 @@ async function runGroupMemberTurn(
     drainSecretResumes();
     return false;
   }
-  if (outcome === "stalled" || outcome === "timed_out") return false;
+  if (outcome === "timed_out") {
+    // turn.completed is intentionally retired above, so it cannot release
+    // room ownership for us. Give interrupt a short grace period, then do the
+    // same bounded cleanup as the stall watchdog. An unbound goal handshake
+    // keeps the room closed until attribution becomes safe.
+    const releaseOwnership = () => {
+      if (hasUnboundDiscardedGroupGoalTurn(threadId)) {
+        const retry = setTimeout(releaseOwnership, 1_000);
+        retry.unref?.();
+        return;
+      }
+      const currentGroup = store.group(group.id);
+      const speaker = groupSpeakers.get(threadId);
+      if (currentGroup?.busyBotId === bot.id && speaker?.botId === bot.id) {
+        groupSpeakers.delete(threadId);
+        store.patchGroup(group.id, { busyBotId: null, unread: true });
+      }
+      const currentBot = store.bot(bot.id);
+      if (currentBot?.busy) {
+        store.setActivity(bot.id, "idle");
+        retryDelegationsWaitingOn(bot.id);
+        drainQueuedSends();
+        drainConnectorResumes();
+        drainSecretResumes();
+      }
+    };
+    const release = setTimeout(releaseOwnership, 6_000);
+    release.unref?.();
+    return false;
+  }
+  if (outcome === "stalled") return false;
   // turn.completed normally performs this cleanup. Only use the fallback
   // when this invocation still owns the room; otherwise it would emit a
   // duplicate group frame or clear a newer speaker's state.
@@ -3493,9 +3810,18 @@ async function runGroupMemberTurn(
     drainConnectorResumes();
     drainSecretResumes();
   }
+  if (outcome === "provider_failed") {
+    if (skillAuthoring) skillAuthoringClaim.claimed = false;
+    return false;
+  }
 
   // chained mentions: a member's reply can summon teammates — one hop only
-  if (!isCancelled?.() && hop < MAX_GROUP_HOPS && replyText.trim()) {
+  if (
+    (orchestration?.followMentions ?? true) &&
+    !isCancelled?.() &&
+    hop < MAX_GROUP_HOPS &&
+    replyText.trim()
+  ) {
     const members = group.memberIds
       .map((id) => store.bot(id))
       .filter((b): b is NonNullable<typeof b> => Boolean(b) && b!.id !== bot.id);
@@ -3522,7 +3848,210 @@ async function runGroupMemberTurn(
   return true;
 }
 
-function startGroupTurn(groupId: string, text: string, replyTo?: Message, sendId?: string) {
+async function runGroupGoalStep(args: {
+  groupId: string;
+  threadId: string;
+  bot: BotRecord;
+  operation: GroupTurnOperation;
+  skillAuthoringClaim: { claimed: boolean };
+  coordinator: boolean;
+  instructions: string;
+}): Promise<{ ran: boolean; replyText: string; outcome?: GroupMemberTurnOutcome; stopReason?: string | null }> {
+  const run = args.operation.goalRun;
+  if (!run || args.operation.cancelled || run.turnCount >= run.maxTurns) {
+    return { ran: false, replyText: "" };
+  }
+  run.turnCount += 1;
+  args.operation.botIds.add(args.bot.id);
+  const result: GroupTurnOrchestration["result"] = {};
+  const token = Symbol("goal-coordinator-turn");
+  const coordinatorTurn: GroupGoalCoordinatorTurn | undefined = args.coordinator
+    ? { token, assistantItems: [], discard: false }
+    : undefined;
+  if (coordinatorTurn) addGroupGoalCoordinatorTurn(args.threadId, coordinatorTurn);
+  try {
+    const ran = await runGroupMemberTurn(
+      args.groupId,
+      args.threadId,
+      args.bot.id,
+      run.turnCount === 1 ? 0 : 1,
+      new Set(),
+      undefined,
+      undefined,
+      () => args.operation.cancelled,
+      () => groupProviderHandshakeStarted(args.operation),
+      () => groupProviderHandshakeSettled(args.operation),
+      args.skillAuthoringClaim,
+      {
+        systemInstructions: args.instructions,
+        followMentions: false,
+        result,
+        onTurnStarted: (turnId) => {
+          if (coordinatorTurn && !coordinatorTurn.turnId) coordinatorTurn.turnId = turnId;
+        },
+      },
+    );
+    return {
+      ran,
+      replyText: result.replyText ?? "",
+      outcome: result.outcome,
+      stopReason: result.stopReason,
+    };
+  } finally {
+    if (coordinatorTurn && groupGoalCoordinatorTurns.get(args.threadId)?.has(coordinatorTurn)) {
+      if (result.outcome === "timed_out" || result.outcome === "stalled") {
+        // interruptTurn is asynchronous: the orchestration can stop before
+        // the provider emits its final text/completion. Retain a discard-only
+        // guard so a late private decision envelope never reaches the room.
+        // Broken providers get a bounded fallback; the token check keeps an
+        // old timer from deleting a newer goal turn on the same thread.
+        coordinatorTurn.discard = true;
+        coordinatorTurn.assistantItems = [];
+        const cleanupTimer = setTimeout(() => {
+          removeGroupGoalCoordinatorTurn(args.threadId, coordinatorTurn);
+        }, GROUP_GOAL_COORDINATOR_GUARD_MS);
+        cleanupTimer.unref?.();
+        coordinatorTurn.cleanupTimer = cleanupTimer;
+      } else {
+        removeGroupGoalCoordinatorTurn(args.threadId, coordinatorTurn);
+      }
+    }
+  }
+}
+
+async function runGroupGoalOperation(args: {
+  groupId: string;
+  threadId: string;
+  coordinator: BotRecord;
+  members: BotRecord[];
+  operation: GroupTurnOperation;
+}): Promise<void> {
+  const run = args.operation.goalRun;
+  if (!run) return;
+  const skillAuthoringClaim = { claimed: false };
+  const assignmentCounts = new Map<string, number>();
+  const goalMembers: GoalRunMember[] = args.members.map((member) => ({
+    id: member.id,
+    name: member.name,
+    hidden: member.hidden,
+    chiefOfStaff: member.chiefOfStaff,
+  }));
+
+  while (!args.operation.cancelled && run.turnCount < run.maxTurns) {
+    const coordinatorTurn = run.turnCount + 1;
+    const coordinatorResult = await runGroupGoalStep({
+      ...args,
+      bot: args.coordinator,
+      skillAuthoringClaim,
+      coordinator: true,
+      instructions: groupGoalCoordinatorInstructions({
+        goal: run.goal,
+        members: goalMembers,
+        turn: coordinatorTurn,
+        maxTurns: run.maxTurns,
+        remainingTurns: run.maxTurns - coordinatorTurn,
+      }),
+    });
+    if (args.operation.cancelled) return;
+    if (!coordinatorResult.ran || coordinatorResult.outcome !== "settled") {
+      const reason = coordinatorResult.stopReason?.trim().slice(0, 120);
+      finishGroupGoalRun(
+        args.groupId,
+        args.operation,
+        "failed",
+        `${args.coordinator.name} could not complete the coordination step${reason ? ` — ${reason}` : ""}.`,
+      );
+      return;
+    }
+
+    const decision = parseGroupGoalDecision(coordinatorResult.replyText).decision;
+    if (!decision) {
+      finishGroupGoalRun(
+        args.groupId,
+        args.operation,
+        "blocked",
+        `${args.coordinator.name} did not provide a valid next-step decision.`,
+      );
+      return;
+    }
+    if (decision.status !== "continue") {
+      finishGroupGoalRun(args.groupId, args.operation, decision.status, decision.detail);
+      return;
+    }
+    if (run.turnCount >= run.maxTurns) break;
+
+    const worker = resolveGroupGoalMember(decision.next, goalMembers);
+    if (!worker) {
+      finishGroupGoalRun(
+        args.groupId,
+        args.operation,
+        "blocked",
+        `${args.coordinator.name} selected a teammate who is not an active member of this channel.`,
+      );
+      return;
+    }
+    const workerBot = store.bot(worker.id);
+    if (!workerBot || workerBot.hidden) {
+      finishGroupGoalRun(args.groupId, args.operation, "blocked", `${worker.name} is not available.`);
+      return;
+    }
+    const assignmentKey = groupGoalAssignmentKey(worker.id, decision.instruction);
+    const repeated = (assignmentCounts.get(assignmentKey) ?? 0) + 1;
+    assignmentCounts.set(assignmentKey, repeated);
+    if (repeated >= 3) {
+      finishGroupGoalRun(
+        args.groupId,
+        args.operation,
+        "blocked",
+        `The team repeated the same assignment three times without resolving the goal.`,
+      );
+      return;
+    }
+
+    const workerTurn = run.turnCount + 1;
+    const workerResult = await runGroupGoalStep({
+      ...args,
+      bot: workerBot,
+      skillAuthoringClaim,
+      coordinator: false,
+      instructions: groupGoalWorkerInstructions({
+        goal: run.goal,
+        coordinatorName: args.coordinator.name,
+        assignment: decision.instruction,
+        turn: workerTurn,
+        maxTurns: run.maxTurns,
+      }),
+    });
+    if (args.operation.cancelled) return;
+    if (!workerResult.ran || workerResult.outcome !== "settled" || !workerResult.replyText.trim()) {
+      const reason = workerResult.stopReason?.trim().slice(0, 120);
+      finishGroupGoalRun(
+        args.groupId,
+        args.operation,
+        "failed",
+        `${workerBot.name} could not return a result to ${args.coordinator.name}${reason ? ` — ${reason}` : ""}.`,
+      );
+      return;
+    }
+  }
+
+  if (!args.operation.cancelled && !run.finished) {
+    finishGroupGoalRun(
+      args.groupId,
+      args.operation,
+      "limit-reached",
+      `Paused at the ${run.maxTurns}-turn safety limit. Send the goal again to continue with a fresh bounded run.`,
+    );
+  }
+}
+
+function startGroupTurn(
+  groupId: string,
+  text: string,
+  replyTo?: Message,
+  sendId?: string,
+  channelMode: "chat" | "goal" = "chat",
+) {
   const group = store.group(groupId);
   if (!group) throw Object.assign(new Error("no such group"), { status: 404 });
   if (roomSetupPending(group)) {
@@ -3537,6 +4066,7 @@ function startGroupTurn(groupId: string, text: string, replyTo?: Message, sendId
     text,
     replyToId: replyTo?.id,
     sendId,
+    channelMode,
   });
   if (!group.dm) store.titleGroupTaskFromFirstMessage(group.id, text, threadId);
 
@@ -3557,6 +4087,10 @@ function startGroupTurn(groupId: string, text: string, replyTo?: Message, sendId
     });
   }
   let responders = roomResponders(text, members, group.defaultResponder);
+  const explicitlyMentionedLead = roomResponders(text, availableMembers, { kind: "mentions" })[0];
+  const goalCoordinator = channelMode === "goal"
+    ? explicitlyMentionedLead ?? selectGroupGoalCoordinator(availableMembers, group.defaultResponder)
+    : null;
   // bot⇄bot channels: chipping in without a tag addresses the last speaker
   if (!responders.length && group.dm) {
     const lastSpeakerId = [...store.messagesFor(threadId)]
@@ -3565,7 +4099,7 @@ function startGroupTurn(groupId: string, text: string, replyTo?: Message, sendId
     const last = availableMembers.find((b) => b.id === lastSpeakerId) ?? availableMembers[0];
     responders = last ? [last] : [];
   }
-  if (!responders.length) {
+  if (!responders.length && !goalCoordinator) {
     const defaultArchivedId = group.defaultResponder.kind === "member" ? group.defaultResponder.botId : undefined;
     const defaultArchived = archived.find((member) => member.id === defaultArchivedId);
     let unavailableMessage: string | undefined;
@@ -3584,7 +4118,23 @@ function startGroupTurn(groupId: string, text: string, replyTo?: Message, sendId
     return message;
   }
 
-  const operation = beginGroupTurnOperation(groupId, threadId, responders.map((responder) => responder.id));
+  const operation = beginGroupTurnOperation(
+    groupId,
+    threadId,
+    goalCoordinator ? [goalCoordinator.id] : responders.map((responder) => responder.id),
+  );
+  if (goalCoordinator) {
+    operation.goalRun = {
+      runId: `goal-${Date.now().toString(36)}-${randomUUID()}`,
+      goal: text,
+      coordinatorBotId: goalCoordinator.id,
+      coordinatorName: goalCoordinator.name,
+      turnCount: 0,
+      maxTurns: GROUP_GOAL_MAX_TURNS,
+      startedAt: Date.now(),
+      finished: false,
+    };
+  }
   const prev = groupQueues.get(groupId) ?? Promise.resolve();
   const next = prev.then(async () => {
     if (operation.cancelled) return;
@@ -3598,29 +4148,71 @@ function startGroupTurn(groupId: string, text: string, replyTo?: Message, sendId
       });
       return;
     }
-    const spoken = new Set<string>();
-    const skillAuthoringClaim = { claimed: false };
-    for (const responder of responders) {
-      if (operation.cancelled) break;
-      if (spoken.has(responder.id)) continue;
-      if (!(await runGroupMemberTurn(
-        groupId,
-        threadId,
-        responder.id,
-        0,
-        spoken,
-        undefined,
-        undefined,
-        () => operation.cancelled,
-        () => groupProviderHandshakeStarted(operation),
-        () => groupProviderHandshakeSettled(operation),
-        skillAuthoringClaim,
-      ))) break;
+    if (goalCoordinator) {
+      await runGroupGoalOperation({ groupId, threadId, coordinator: goalCoordinator, members, operation });
+    } else {
+      const spoken = new Set<string>();
+      const skillAuthoringClaim = { claimed: false };
+      for (const responder of responders) {
+        if (operation.cancelled) break;
+        if (spoken.has(responder.id)) continue;
+        if (!(await runGroupMemberTurn(
+          groupId,
+          threadId,
+          responder.id,
+          0,
+          spoken,
+          undefined,
+          undefined,
+          () => operation.cancelled,
+          () => groupProviderHandshakeStarted(operation),
+          () => groupProviderHandshakeSettled(operation),
+          skillAuthoringClaim,
+        ))) break;
+      }
     }
   });
   const tracked = next.finally(() => finishGroupTurnOperation(groupId, operation));
   groupQueues.set(groupId, tracked.catch(() => {}));
   return message;
+}
+
+function sameCalendarRoster(group: GroupRecord, botIds: readonly string[]): boolean {
+  if (group.dm || group.memberIds.length !== botIds.length) return false;
+  const wanted = new Set(botIds);
+  return group.memberIds.every((id) => wanted.has(id));
+}
+
+function ensureCalendarCallRoom(call: CalendarCall): GroupRecord {
+  const linked = call.roomId ? store.group(call.roomId) : undefined;
+  let group = linked && sameCalendarRoster(linked, call.botIds) && !roomSetupPending(linked)
+    ? linked
+    : undefined;
+  group ??= store.createGroup(call.name, call.botIds, false, undefined, {
+    bulletin: "",
+    defaultResponder: { kind: "everyone" },
+    completed: true,
+  });
+  if (call.roomId !== group.id) calendarCalls!.linkRoom(call.id, group.id);
+  return group;
+}
+
+function deliverCalendarCall(call: CalendarCall, scheduledFor: number): void {
+  // A one-bot calendar entry remains a reminder that opens that bot's chat.
+  // Multi-bot entries are rooms and begin with the shared event prompt.
+  if (call.botIds.length < 2) return;
+  const group = ensureCalendarCallRoom(call);
+  const text = [
+    `@everyone ${call.description.trim() || call.name}`,
+    ...call.attachments.map((attachment) =>
+      `<${attachment.kind === "image" ? "attached-image" : "attached-file"} path="${escapeAttribute(attachment.path)}" />`
+    ),
+  ].join("\n\n");
+  const sendId = `calendar_${call.id}_${scheduledFor}`;
+  const threadIds = new Set([group.threadId, ...(group.tasks ?? []).map((task) => task.threadId)]);
+  const messages = [...threadIds].flatMap((threadId) => store.messagesFor(threadId));
+  if (messages.some((message) => message.sendId === sendId)) return;
+  startGroupTurn(group.id, text, undefined, sendId);
 }
 
 function roomSetupPending(group: GroupRecord): boolean {
@@ -5033,6 +5625,42 @@ const server = createServer(async (req, res) => {
       return run ? json(res, 200, { run }) : json(res, 404, { error: "no such active run" });
     }
 
+    // ── scheduled room sessions ────────────────────────────────────────
+    if (path === "/api/calendar-calls" && method === "GET") {
+      return json(res, 200, { calls: calendarCalls!.list() });
+    }
+    if (path === "/api/calendar-calls" && method === "POST") {
+      try {
+        return json(res, 201, { call: calendarCalls!.create(await readBody(req)) });
+      } catch (error) {
+        throw Object.assign(error instanceof Error ? error : new Error(String(error)), { status: 400 });
+      }
+    }
+    const calendarCallRoomMatch = path.match(/^\/api\/calendar-calls\/([\w-]+)\/room$/);
+    if (calendarCallRoomMatch && method === "POST") {
+      const call = calendarCalls!.get(calendarCallRoomMatch[1]);
+      if (!call) return json(res, 404, { error: "no such scheduled call" });
+      if (call.botIds.length < 2) {
+        return json(res, 400, { error: "single-bot events open that bot's chat directly" });
+      }
+      const group = ensureCalendarCallRoom(call);
+      return json(res, 200, { group: { ...publicGroupState(group), messages: store.messagesFor(group.threadId) } });
+    }
+    const calendarCallMatch = path.match(/^\/api\/calendar-calls\/([\w-]+)$/);
+    if (calendarCallMatch && method === "PATCH") {
+      if (!calendarCalls!.get(calendarCallMatch[1])) return json(res, 404, { error: "no such scheduled call" });
+      try {
+        return json(res, 200, { call: calendarCalls!.update(calendarCallMatch[1], await readBody(req)) });
+      } catch (error) {
+        throw Object.assign(error instanceof Error ? error : new Error(String(error)), { status: 400 });
+      }
+    }
+    if (calendarCallMatch && method === "DELETE") {
+      return calendarCalls!.remove(calendarCallMatch[1])
+        ? json(res, 200, { ok: true })
+        : json(res, 404, { error: "no such scheduled call" });
+    }
+
     // ── independent webhook triggers ────────────────────────────────────
     // Management stays on the app-only server. Actual deliveries land on a
     // second, webhook-only loopback listener so Funnel or a future hosted
@@ -5207,12 +5835,33 @@ const server = createServer(async (req, res) => {
     // Pasted/dropped images are stored as files and referenced by path in
     // the prompt (<attached-image path="…"/>); this pair of routes is the
     // save + serve. The POST takes raw bytes (base64 JSON would double the
-    // payload), so it needs its own reader rather than readBody.
+    // payload), so it needs its own reader rather than readBody. A share
+    // extension can add a UUID uploadId; retrying that UUID returns the same
+    // committed path instead of creating an orphan duplicate.
     if (method === "POST" && path === "/api/attachments") {
+      let uploadId: string | undefined;
+      try {
+        uploadId = validateAttachmentUploadId(url.searchParams.get("uploadId") ?? undefined);
+      } catch (error) {
+        req.resume();
+        throw error;
+      }
       const rawType = Array.isArray(req.headers["content-type"]) ? req.headers["content-type"][0] : req.headers["content-type"];
       const mime = rawType?.split(";")[0]?.trim().toLowerCase();
       if (!mime || !extensionForMime(mime)) {
         return json(res, 400, { error: "content-type must be an image type" });
+      }
+      const rawLength = Array.isArray(req.headers["content-length"])
+        ? req.headers["content-length"][0]
+        : req.headers["content-length"];
+      const declaredLength = rawLength === undefined ? undefined : Number(rawLength);
+      if (declaredLength !== undefined && (!Number.isSafeInteger(declaredLength) || declaredLength < 0)) {
+        req.resume();
+        return json(res, 400, { error: "content-length must be a non-negative integer" });
+      }
+      if (declaredLength !== undefined && declaredLength > IMAGE_MAX_BYTES) {
+        req.resume();
+        return json(res, 413, { error: `image exceeds ${IMAGE_MAX_BYTES} bytes` });
       }
       const saved = await new Promise<SavedAttachment>((resolve, reject) => {
         const chunks: Buffer[] = [];
@@ -5229,18 +5878,66 @@ const server = createServer(async (req, res) => {
           if (received > IMAGE_MAX_BYTES) return fail(413, `image exceeds ${IMAGE_MAX_BYTES} bytes`);
           chunks.push(chunk);
         });
-        req.on("end", () => {
+        req.on("end", async () => {
           if (settled) return;
           settled = true;
           try {
-            resolve(saveImage(Buffer.concat(chunks), mime));
+            resolve(await saveImageUpload(Buffer.concat(chunks), mime, uploadId));
           } catch (e) {
-            reject(Object.assign(e instanceof Error ? e : new Error(String(e)), { status: 400 }));
+            reject(e instanceof Error ? e : new Error(String(e)));
           }
         });
         req.on("error", (e) => fail(400, e instanceof Error ? e.message : String(e)));
       });
       return json(res, 201, saved);
+    }
+
+    // ── shared files ────────────────────────────────────────────────────
+    // The iOS share extension sends documents as raw bytes over the same
+    // authenticated companion connection as messages. saveFile writes each
+    // incoming chunk directly to disk, atomically commits it, and removes
+    // partial uploads on error. Its optional UUID uploadId is stable across
+    // route retries, while the aggregate store quota rejects rather than
+    // silently deleting files that old prompts may still reference.
+    if (method === "POST" && path === "/api/files") {
+      let uploadId: string | undefined;
+      try {
+        uploadId = validateAttachmentUploadId(url.searchParams.get("uploadId") ?? undefined);
+      } catch (error) {
+        req.resume();
+        throw error;
+      }
+      const name = url.searchParams.get("name");
+      if (!name) {
+        req.resume();
+        return json(res, 400, { error: "name is required" });
+      }
+      const rawType = Array.isArray(req.headers["content-type"])
+        ? req.headers["content-type"][0]
+        : req.headers["content-type"];
+      const rawLength = Array.isArray(req.headers["content-length"])
+        ? req.headers["content-length"][0]
+        : req.headers["content-length"];
+      const declaredLength = rawLength === undefined ? undefined : Number(rawLength);
+      if (declaredLength !== undefined && (!Number.isSafeInteger(declaredLength) || declaredLength < 0)) {
+        req.resume();
+        return json(res, 400, { error: "content-length must be a non-negative integer" });
+      }
+      if (declaredLength !== undefined && declaredLength > FILE_MAX_BYTES) {
+        req.resume();
+        return json(res, 413, { error: `file exceeds ${FILE_MAX_BYTES} bytes` });
+      }
+      try {
+        // Returning from this iterator must not destroy the request socket:
+        // the caller still needs to receive the useful 4xx response when the
+        // streamed byte count crosses the limit.
+        const chunks = req.iterator({ destroyOnReturn: false }) as AsyncIterable<Buffer>;
+        const saved = await saveFile(chunks, name, rawType ?? "", { uploadId, expectedBytes: declaredLength });
+        return json(res, 201, saved);
+      } catch (error) {
+        req.resume();
+        throw error;
+      }
     }
 
     // serving is name-locked to the attachments dir — readAttachment
@@ -5926,6 +6623,13 @@ const server = createServer(async (req, res) => {
       if (!text) return json(res, 400, { error: "text required" });
       const group = store.group(m[1]);
       if (!group) return json(res, 404, { error: "no such group" });
+      if (body.mode !== undefined && body.mode !== "chat" && body.mode !== "goal") {
+        return json(res, 400, { error: "mode must be chat or goal" });
+      }
+      const channelMode: "chat" | "goal" = body.mode === "goal" ? "goal" : "chat";
+      if (group.dm && channelMode === "goal") {
+        return json(res, 400, { error: "goal mode is available in team channels, not bot-to-bot channels" });
+      }
       if (body.threadId !== undefined && (typeof body.threadId !== "string" || !/^[\w-]+$/.test(body.threadId))) {
         return json(res, 400, { error: "threadId must be a task id" });
       }
@@ -5940,10 +6644,10 @@ const server = createServer(async (req, res) => {
       const replyTo = resolveReplyTarget(threadId, body.replyToId);
       const receipt = await sendSequencer.run(
         sendId ? `group:${group.id}:${threadId}:${sendId}` : undefined,
-        sendFingerprint(text, replyTo?.id),
+        sendFingerprint(text, replyTo?.id, channelMode),
         async () => {
           if (sendId) {
-            const accepted = acceptedSendMatch(store.messagesFor(threadId), sendId, text, replyTo?.id);
+            const accepted = acceptedSendMatch(store.messagesFor(threadId), sendId, text, replyTo?.id, channelMode);
             if (accepted.kind === "conflict") {
               throw Object.assign(new Error("sendId already belongs to another message"), { status: 409 });
             }
@@ -5958,7 +6662,7 @@ const server = createServer(async (req, res) => {
               status: 409,
             });
           }
-          const message = startGroupTurn(current.id, text, replyTo, sendId);
+          const message = startGroupTurn(current.id, text, replyTo, sendId, channelMode);
           return { ok: true as const, threadId, message };
         },
       );
@@ -6000,6 +6704,30 @@ const server = createServer(async (req, res) => {
       const patched = store.toggleReaction(m[1], m[2], emoji, typeof body.by === "string" ? body.by : "user");
       if (!patched) return json(res, 404, { error: "no such message" });
       return json(res, 200, { message: patched });
+    }
+    if (method === "POST" && path === "/api/sidebar-sections") {
+      const parsed = createSidebarSectionSchema.safeParse(await readBody(req));
+      if (!parsed.success) {
+        return json(res, 400, { error: "name and one to 100 valid botIds are required" });
+      }
+      const name = parsed.data.name.trim();
+      if (!name) return json(res, 400, { error: "name is required" });
+      if (name.length > 60) {
+        return json(res, 400, { error: "name must be at most 60 characters" });
+      }
+      const botIds = [...new Set(parsed.data.botIds)];
+      const result = store.setBotsSection(botIds, name);
+      if (!result.ok) {
+        if (result.reason === "chief-conflict") {
+          return json(res, 409, {
+            error: "A section can have only one Chief of Staff. Choose one Chief or use a section without one.",
+          });
+        }
+        return json(res, 404, { error: "one or more bots are unavailable" });
+      }
+      // This files bots under a derived label; it does not create a durable
+      // section resource, and an identical retry is an ordinary no-op.
+      return json(res, 200, { section: name, bots: result.bots.map(wireBot) });
     }
     if (method === "POST" && path === "/api/bots") {
       const body = await readBody(req);
@@ -6398,6 +7126,7 @@ const server = createServer(async (req, res) => {
         activeVpsThreads.delete(bot.id);
         routines!.disableForBot(bot.id);
         webhooks.disableForBot(bot.id);
+        calendarCalls!.removeBot(bot.id);
         lastReply.delete(bot.threadId);
         // a peer approval naming this bot can never be meaningfully answered
         // now, and its caller would otherwise wait out the 15-minute timeout
@@ -7837,6 +8566,8 @@ const server = createServer(async (req, res) => {
   }
 });
 
+calendarCalls.start();
+
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`openmausbot server on http://127.0.0.1:${PORT}`);
 });
@@ -7848,6 +8579,7 @@ const gracefulShutdown = createGracefulShutdown({
       vps.closeAllVpsDesktopTunnels();
       watchdog.stop();
       routines?.stop();
+      calendarCalls?.stop();
       webhookIngress?.server.close();
     },
     () => releaseAllBrowserCapabilities(),
