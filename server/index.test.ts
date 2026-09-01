@@ -5362,6 +5362,57 @@ describe("harness HTTP API", () => {
     expect(JSON.stringify(after.body)).not.toContain("opencode-secret");
   });
 
+  it("stores custom endpoint metadata without echoing its external secret", async () => {
+    const put = await api("PUT", "/api/custom-endpoints/openrouter?secretStorage=external", {
+      id: "openrouter",
+      name: "OpenRouter",
+      providerId: "openrouter",
+      baseUrl: "https://openrouter.ai/api/v1",
+      defaultModel: "z-ai/glm-5.2",
+      context: 1_000_000,
+      discoverModels: false,
+      useForNewChats: true,
+      apiKey: "endpoint-secret", // secret-scan: allow-test-fixture
+    });
+    expect(put.status).toBe(200);
+    expect(put.body.endpoint).toMatchObject({ id: "openrouter", configured: true });
+    expect(JSON.stringify(put.body)).not.toContain("endpoint-secret");
+    const disk = JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8"));
+    expect(disk.customEndpoints.openrouter.apiKey).toBe("");
+
+    const listed = await api("GET", "/api/custom-endpoints");
+    expect(listed.body.endpoints).toEqual([expect.objectContaining({ id: "openrouter", configured: true })]);
+    expect(JSON.stringify(listed.body)).not.toContain("endpoint-secret");
+
+    const removed = await api("DELETE", "/api/custom-endpoints/openrouter");
+    expect(removed.status).toBe(200);
+    expect(removed.body.endpoints).toEqual([]);
+    expect(JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8")).customEndpoints).toEqual({});
+
+    const localPayload = {
+      id: "local-proxy",
+      name: "Local proxy",
+      providerId: "local_proxy",
+      baseUrl: "http://127.0.0.1:1234/v1",
+      defaultModel: "local-model",
+      discoverModels: false,
+      useForNewChats: false,
+    };
+    expect((await api("PUT", "/api/custom-endpoints/local-proxy", {
+      ...localPayload,
+      apiKey: "temporary-secret", // secret-scan: allow-test-fixture
+    })).status).toBe(200);
+    const cleared = await api("PUT", "/api/custom-endpoints/local-proxy", {
+      ...localPayload,
+      clearKey: true,
+    });
+    expect(cleared.status).toBe(200);
+    expect(cleared.body.endpoint).toMatchObject({ id: "local-proxy", configured: false });
+    const clearedDisk = JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8"));
+    expect(clearedDisk.customEndpoints["local-proxy"].apiKey).toBe("");
+    expect((await api("DELETE", "/api/custom-endpoints/local-proxy")).status).toBe(200);
+  });
+
   it("stores the avatar image key as configured-only status", async () => {
     try {
       const put = await api("PUT", "/api/config", { imageGen: { key: "sk-image-secret" } });

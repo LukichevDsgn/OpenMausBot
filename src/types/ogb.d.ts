@@ -273,6 +273,8 @@ type SkillRecordingPayload = {
         name: "composioApiKey" | "xaiApiKey" | "boxToken" | "opencodeGoApiKey" | "ttsKey" | "openaiImageApiKey",
         value: string,
       ): Promise<ConfigStatus>;
+      saveCustomEndpoint?(endpoint: Record<string, unknown>): Promise<unknown>;
+      deleteCustomEndpoint?(id: string): Promise<unknown>;
       /** In-app auto-update (packaged app only; dormant in dev). onState
        * fires immediately with the current state, then on transitions. */
       updater?: {

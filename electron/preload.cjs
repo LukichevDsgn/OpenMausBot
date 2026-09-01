@@ -210,6 +210,9 @@ const bridge = {
     }),
   /** Store a provider credential with OS-backed encryption. */
   setCredential: (name, value) => ipcRenderer.invoke("credential:set", name, value),
+  /** Save/delete a custom OpenAI-compatible endpoint and its encrypted secret. */
+  saveCustomEndpoint: (endpoint) => ipcRenderer.invoke("custom-endpoint:save", endpoint),
+  deleteCustomEndpoint: (id) => ipcRenderer.invoke("custom-endpoint:delete", id),
 
   /** In-app auto-update. State object:
    *  { status: "idle"|"checking"|"available"|"downloading"|"downloaded"|"error",

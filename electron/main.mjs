@@ -2110,6 +2110,52 @@ ipcMain.handle("credential:set", localOnly("credential:set", async (_event, name
   );
 }));
 
+ipcMain.handle("custom-endpoint:save", async (_event, endpoint) => {
+  if (!endpoint || typeof endpoint !== "object" || typeof endpoint.id !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/.test(endpoint.id)) {
+    throw new Error("Invalid custom endpoint id");
+  }
+  if (app.isPackaged && !(await safeStorage.isAsyncEncryptionAvailable())) {
+    throw new Error("The operating-system credential store is unavailable");
+  }
+  const rawKey = endpoint.apiKey;
+  const keyValue = typeof rawKey === "string" ? rawKey.trim() : "";
+  const clearKey = endpoint.clearKey === true;
+  const applyToHarness = async () => {
+    const secretStorage = app.isPackaged ? "?secretStorage=external" : "";
+    const response = await fetch(`http://127.0.0.1:${SERVER_PORT}/api/custom-endpoints/${encodeURIComponent(endpoint.id)}${secretStorage}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(endpoint),
+    });
+    const body = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(body?.error || `Could not save custom endpoint (HTTP ${response.status})`);
+    return body;
+  };
+  if (!app.isPackaged || (!keyValue && !clearKey)) return applyToHarness();
+  return updateSecureCredentialDocument((credentials) => {
+    credentials.customEndpointKeys = { ...credentials.customEndpointKeys };
+    if (clearKey) delete credentials.customEndpointKeys[endpoint.id];
+    else credentials.customEndpointKeys[endpoint.id] = keyValue;
+    return credentials;
+  }, applyToHarness);
+});
+
+ipcMain.handle("custom-endpoint:delete", async (_event, id) => {
+  if (typeof id !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/.test(id)) throw new Error("Invalid custom endpoint id");
+  const applyToHarness = async () => {
+    const response = await fetch(`http://127.0.0.1:${SERVER_PORT}/api/custom-endpoints/${encodeURIComponent(id)}`, { method: "DELETE" });
+    const body = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(body?.error || `Could not delete custom endpoint (HTTP ${response.status})`);
+    return body;
+  };
+  if (!app.isPackaged || !secureCredentials.customEndpointKeys?.[id]) return applyToHarness();
+  return updateSecureCredentialDocument((credentials) => {
+    credentials.customEndpointKeys = { ...credentials.customEndpointKeys };
+    delete credentials.customEndpointKeys[id];
+    return credentials;
+  }, applyToHarness);
+});
+
 async function broadcastDesktopCapabilities() {
   const capabilities = desktopCapabilities({
     platform: process.platform,

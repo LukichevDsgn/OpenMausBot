@@ -10,6 +10,15 @@ import { writeFileAtomic } from "./atomic.ts";
 import type { InstanceConfigMap } from "./contracts.ts";
 import { parseStoredMcpServer } from "./mcp-registry.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
+import {
+  configuredEndpointKey,
+  customEndpointKeyEnv,
+  customEndpointMetadata,
+  customEndpointSchema,
+  isSafeCustomEndpointBaseUrl,
+  sanitizeCustomEndpointBaseUrl,
+  type CustomEndpoint,
+} from "./custom-endpoints.ts";
 
 const optionalText = z.string().optional();
 const SSH_ALIAS = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
@@ -230,6 +239,7 @@ const instanceConfigSchema = z.object({
   config: z.json().optional(),
 });
 const instanceConfigMapSchema = z.record(z.string(), instanceConfigSchema);
+const customEndpointMapSchema = z.record(z.string(), customEndpointSchema);
 const appConfigSchema = z.object({
   xai: z.object({ key: optionalText, url: optionalText }).optional(),
   /** `model` seeds the default selection; `provider` pins an OpenRouter
@@ -244,6 +254,8 @@ const appConfigSchema = z.object({
   vps: vpsConfigSchema.optional(),
   /** Optional OpenCode key; persisted write-only and passed only to its child. */
   opencodeGo: z.object({ apiKey: optionalText }).optional(),
+  /** OpenAI-compatible endpoints managed by the OpenCode ACP harness. */
+  customEndpoints: customEndpointMapSchema.optional(),
   /** Voice credentials and the selected voice id. `provider` picks the
    * engine: "elevenlabs" (default; needs a key) or "system" (the Mac's
    * built-in voices, no key). */
@@ -282,6 +294,7 @@ export interface AppConfig {
   /** A named host from the user's SSH config. Authentication stays with SSH. */
   vps?: { sshAlias?: string };
   opencodeGo?: { apiKey?: string };
+  customEndpoints?: Record<string, CustomEndpoint>;
   tts?: { key?: string; voice?: string; provider?: "elevenlabs" | "system" };
   imageGen?: { key?: string };
   profile?: { name?: string; email?: string };
@@ -372,9 +385,35 @@ export function browserProfilePartitionTarget(
 }
 
 export function parseStoredConfig(value: JsonValue): AppConfig {
-  const parsed = storedAppConfigSchema.safeParse(value);
+  const parsed = storedAppConfigSchema.safeParse(sanitizeStoredCustomEndpointUrls(value).value);
   if (!parsed.success) throw new Error(schemaIssue(parsed.error, "Invalid stored configuration"));
   return parsed.data;
+}
+
+function isJsonRecord(value: JsonValue): value is JsonObject {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+/** Remove credentials, query strings, and fragments from legacy endpoint URLs
+ * before validating the stored configuration. */
+export function sanitizeStoredCustomEndpointUrls(value: JsonValue): { value: JsonValue; changed: boolean } {
+  if (!isJsonRecord(value) || !isJsonRecord(value.customEndpoints)) return { value, changed: false };
+  let sanitizedEndpoints: JsonObject | undefined;
+  for (const [id, rawEndpoint] of Object.entries(value.customEndpoints)) {
+    if (!isJsonRecord(rawEndpoint) || typeof rawEndpoint.baseUrl !== "string") continue;
+    if (isSafeCustomEndpointBaseUrl(rawEndpoint.baseUrl)) continue;
+    const safeBaseUrl = sanitizeCustomEndpointBaseUrl(rawEndpoint.baseUrl);
+    if (!safeBaseUrl || safeBaseUrl === rawEndpoint.baseUrl) continue;
+    sanitizedEndpoints ??= { ...value.customEndpoints };
+    sanitizedEndpoints[id] = { ...rawEndpoint, baseUrl: safeBaseUrl };
+  }
+  return sanitizedEndpoints
+    ? { value: { ...value, customEndpoints: sanitizedEndpoints }, changed: true }
+    : { value, changed: false };
+}
+
+export function effectiveCustomEndpoints(cfg: AppConfig): Record<string, CustomEndpoint> {
+  return { ...cfg.customEndpoints };
 }
 
 /** Exact old→canonical profile ids from #567's persisted config. Store
@@ -452,7 +491,16 @@ export function ensureDirs() {
 export function loadConfig(): AppConfig {
   let cfg: AppConfig = {};
   try {
-    cfg = parseStoredConfig(parseJson(readFileSync(join(DATA_DIR, "config.json"), "utf8")));
+    const configPath = join(DATA_DIR, "config.json");
+    const sanitized = sanitizeStoredCustomEndpointUrls(parseJson(readFileSync(configPath, "utf8")));
+    cfg = parseStoredConfig(sanitized.value);
+    if (sanitized.changed) {
+      try {
+        writeFileAtomic(configPath, JSON.stringify(sanitized.value, null, 2), { mode: 0o600 });
+      } catch {
+        // The in-memory sanitized configuration remains safe and the file is retried next boot.
+      }
+    }
   } catch {
     /* first run — env fallbacks below */
   }
@@ -481,6 +529,13 @@ export function loadConfig(): AppConfig {
   cfg.imageGen = { ...cfg.imageGen };
   if (process.env.OMB_OPENAI_IMAGE_KEY !== undefined) cfg.imageGen.key = process.env.OMB_OPENAI_IMAGE_KEY;
   return cfg;
+}
+
+/** Keep a dynamic endpoint key live in this server process. */
+export function syncCustomEndpointKey(id: string, value: string): void {
+  const envName = customEndpointKeyEnv(id);
+  if (value.trim()) process.env[envName] = value.trim();
+  else delete process.env[envName];
 }
 
 /** After saveConfig() writes a credential, the running process's env must
@@ -590,6 +645,15 @@ export function saveConfig(patch: Partial<AppConfig>): void {
     Object.assign(merged, section);
     disk[key] = merged;
   }
+  if (checkedPatch.customEndpoints) {
+    const current = jsonObjectSchema.safeParse(disk.customEndpoints);
+    const merged: JsonObject = current.success ? { ...current.data } : {};
+    for (const [id, endpoint] of Object.entries(checkedPatch.customEndpoints)) {
+      const previous = jsonObjectSchema.safeParse(merged[id]);
+      merged[id] = { ...(previous.success ? previous.data : {}), ...endpoint };
+    }
+    disk.customEndpoints = merged;
+  }
   if (checkedPatch.vps !== undefined) disk.vps = normalizeVpsConfig(checkedPatch.vps);
   // scalar, not a section: the merge loop above only walks objects
   if (checkedPatch.language !== undefined) disk.language = checkedPatch.language;
@@ -630,6 +694,23 @@ export function saveConfig(patch: Partial<AppConfig>): void {
     disk.instances = diskInstances;
   }
   mkdirSync(DATA_DIR, { recursive: true });
+  writeFileAtomic(p, JSON.stringify(disk, null, 2), { mode: 0o600 });
+}
+
+export function removeCustomEndpoint(id: string): void {
+  const p = join(DATA_DIR, "config.json");
+  let disk: JsonObject = {};
+  try {
+    const parsed = jsonObjectSchema.safeParse(parseJson(readFileSync(p, "utf8")));
+    if (parsed.success) disk = parsed.data;
+  } catch {
+    return;
+  }
+  const current = jsonObjectSchema.safeParse(disk.customEndpoints);
+  if (!current.success || !Object.hasOwn(current.data, id)) return;
+  const endpoints = { ...current.data };
+  delete endpoints[id];
+  disk.customEndpoints = endpoints;
   writeFileAtomic(p, JSON.stringify(disk, null, 2), { mode: 0o600 });
 }
 
@@ -699,6 +780,12 @@ function injectedEnvironment(cfg: AppConfig, driver: string): Map<string, string
     environment.set("OPENAI_COMPAT_URL", cfg.openaiCompat.url);
   if (driver === "boxAgent" && cfg.box?.token) environment.set("BOX_TOKEN", cfg.box.token);
   if (driver === "opencodeGo" && cfg.opencodeGo?.apiKey) environment.set("OPENCODE_API_KEY", cfg.opencodeGo.apiKey);
+  if (driver === "opencodeGo") {
+    for (const endpoint of Object.values(effectiveCustomEndpoints(cfg))) {
+      const key = endpoint.apiKey || process.env[customEndpointKeyEnv(endpoint.id)];
+      if (key) environment.set(customEndpointKeyEnv(endpoint.id), key);
+    }
+  }
   return environment;
 }
 
@@ -751,6 +838,10 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
   } as const;
   const configured = cfg.instances && Object.keys(cfg.instances).length ? cfg.instances : null;
   const map: InstanceConfigMap = configured ? { ...configured } : { ...DEFAULT_FLEET };
+  const hasCustomEndpointKey = Object.values(effectiveCustomEndpoints(cfg)).some((endpoint) => Boolean(configuredEndpointKey(endpoint)));
+  if (configured && hasCustomEndpointKey && !Object.hasOwn(map, "opencodeGo")) {
+    map.opencodeGo = { driver: "opencodeGo" };
+  }
   // Product fleets pick up newly shipped engines. A one-off test/shadow map
   // (no claude/grok/codex) is left exactly as written.
   if (
@@ -770,6 +861,13 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     const environment = { ...entry.environment };
     for (const [key, value] of injectedEnvironment(cfg, entry.driver)) environment[key] = value;
     entry.environment = environment;
+    if (entry.driver === "opencodeGo") {
+      const raw = entry.config && typeof entry.config === "object" && !Array.isArray(entry.config)
+        ? { ...(entry.config as Record<string, unknown>) }
+        : {};
+      raw.customEndpoints = customEndpointMetadata(effectiveCustomEndpoints(cfg));
+      entry.config = raw;
+    }
     // The driver URL is configuration, not a credential. Environment is
     // intentionally not consulted by ProviderRegistry when it decodes a
     // driver's config, so carry the workspace default into the transient

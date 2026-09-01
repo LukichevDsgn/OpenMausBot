@@ -50,12 +50,14 @@ import { augmentedPath } from "../../env-path.ts";
 const COMPUTER_PROXY_PATH = SPAWNED_PROXIES.computer;
 import { appendNative } from "../native.ts";
 import { SPAWNED_PROXIES } from "../../proxy-paths.ts";
+import type { CustomEndpoint } from "../../custom-endpoints.ts";
 
 export interface AcpConfig {
   cli: string;
   fullAuto: boolean;
   /** Optional home for this instance's sessions. */
   workspace?: string;
+  customEndpoints?: CustomEndpoint[];
 }
 
 /** Per-harness specifics — everything that differs between Grok, Gemini, … */
@@ -129,6 +131,7 @@ export interface AcpSupport {
   resolveTurnModel?(
     model: string | undefined,
     env: Record<string, string | undefined>,
+    config: AcpConfig,
   ): string | undefined;
   /** Apply per-session settings between session/new (or session/load) and the
    * first session/prompt. Some CLIs ignore argv and take the model/mode over
@@ -160,6 +163,7 @@ function decodeAcpConfig(defaultCli: string) {
       cli: typeof o.cli === "string" ? o.cli : defaultCli,
       fullAuto: o.fullAuto === true,
       workspace: typeof o.workspace === "string" ? o.workspace : undefined,
+      customEndpoints: Array.isArray(o.customEndpoints) ? o.customEndpoints as CustomEndpoint[] : undefined,
     };
   };
 }
@@ -336,7 +340,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           emit({ ...base(threadId, turnId), type: "turn.completed", ok: false, stopReason: "auth_required", cost: null });
           return { turnId };
         }
-        const resolvedModel = support.resolveTurnModel?.(turn.model, env);
+        const resolvedModel = support.resolveTurnModel?.(turn.model, env, config);
         support.applyTurnEnv?.(env, { model: resolvedModel, requestedModel: turn.model });
         const cliTurn =
           resolvedModel !== undefined && resolvedModel !== turn.model

@@ -13,6 +13,7 @@ import { customMcpServers,
   localVmMode,
   parseConfigPatch,
   parseStoredConfig,
+  sanitizeStoredCustomEndpointUrls,
   roomTurnTimeoutMinutes,
   showToolCallsEnabled,
   saveConfig,
@@ -51,6 +52,37 @@ describe("configuration boundaries", () => {
     );
     expect(() => parseConfigPatch({ opencodeGo: { apiKey: 42 } })).toThrow("opencodeGo.apiKey");
     expect(() => parseConfigPatch({ profile: [] })).toThrow("profile");
+  });
+
+  it("rejects credentials, queries, and fragments in new custom endpoint URLs", () => {
+    for (const baseUrl of [
+      "https://user:password@example.test/api",
+      "https://example.test/api?token=secret", // secret-scan: allow-test-fixture
+      "https://example.test/api#fragment",
+    ]) {
+      expect(() => parseConfigPatch({
+        customEndpoints: {
+          unsafe: { id: "unsafe", name: "Unsafe", providerId: "unsafe", baseUrl, defaultModel: "model" },
+        },
+      })).toThrow();
+    }
+  });
+
+  it("sanitizes unsafe URL components in legacy custom endpoint metadata", () => {
+    const raw = {
+      customEndpoints: {
+        first: {
+          id: "first",
+          name: "First",
+          providerId: "first",
+          baseUrl: "https://user:password@example.test/api?token=secret#fragment", // secret-scan: allow-test-fixture
+          defaultModel: "first-model",
+        },
+      },
+    };
+    const sanitized = sanitizeStoredCustomEndpointUrls(raw);
+    expect(sanitized.changed).toBe(true);
+    expect(parseStoredConfig(raw).customEndpoints?.first.baseUrl).toBe("https://example.test/api");
   });
 
   it("canonicalizes legacy browser profile ids without dropping other stored settings", () => {

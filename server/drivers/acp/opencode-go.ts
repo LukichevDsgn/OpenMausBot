@@ -9,6 +9,11 @@ import { decodeInjectId, hostApiKey, localHost, mergeLocalInject } from "../loca
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 import type { ModelCatalog, ProviderErrorCode } from "../../contracts.ts";
 import { execCli } from "../../procs.ts";
+import {
+  customEndpointKeyEnv,
+  ensureOpenCodeCustomEndpointModel,
+  fetchCustomEndpointModels,
+} from "../../custom-endpoints.ts";
 
 const STATIC_MODELS: ModelCatalog = {
   default: "opencode/x-preview-f-free",
@@ -365,23 +370,38 @@ const support = (loadCatalog: OpenCodeCatalogLoader): AcpSupport => ({
   spawnArgs: () => ["acp"],
   credentialEnv: ["OPENCODE_API_KEY"],
   selectModel: { configId: "model" },
-  resolveTurnModel: (model, env) => model
-    ? ensureOpenCodeInjectModel(normalizeLegacyOpenCodeModel(model, env), env)
-    : model,
-  transformEnv: stripForeignProviderKeys,
+  resolveTurnModel: (model, env, config) => {
+    if (!model) return model;
+    const normalized = normalizeLegacyOpenCodeModel(model, env);
+    const custom = ensureOpenCodeCustomEndpointModel(normalized, config.customEndpoints ?? [], env);
+    return custom === normalized ? ensureOpenCodeInjectModel(normalized, env) : custom;
+  },
+  transformEnv: (env, config) => {
+    stripForeignProviderKeys(env);
+    for (const endpoint of config.customEndpoints ?? []) {
+      const envKey = customEndpointKeyEnv(endpoint.id);
+      if (endpoint.apiKey && !env[envKey]) env[envKey] = endpoint.apiKey;
+    }
+  },
   pickAuthMethod: () => null,
   authFailure: "continue",
   isAuthenticated: async (env, config) => (
     Boolean(env.OPENCODE_API_KEY)
+    || (config.customEndpoints ?? []).some((endpoint) => Boolean(env[customEndpointKeyEnv(endpoint.id)] || endpoint.apiKey))
     || hasStoredOpenCodeAuth(env)
     || await canListOpenCodeModels(env, config.cli)
   ),
   requireAuthenticationBeforeSpawn: true,
   classifyError: classifyOpenCodeError,
-  resolveModels: async (environment, config) => mergeLocalInject(
-    await loadCatalog(environment, config.cli),
-    environment,
-  ),
+  resolveModels: async (environment, config) => {
+    const base = await mergeLocalInject(await loadCatalog(environment, config.cli), environment);
+    const custom = await fetchCustomEndpointModels(config.customEndpoints ?? [], environment);
+    const seen = new Set(base.options.map((option) => option.id));
+    return {
+      default: custom.default || base.default,
+      options: [...base.options, ...custom.options.filter((option) => !seen.has(option.id))],
+    };
+  },
   buildPromptText: (turn) => turn.system ? `${turn.system}\n\n${turn.text}` : turn.text,
 });
 

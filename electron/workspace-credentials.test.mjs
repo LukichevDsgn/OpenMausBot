@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  customEndpointEnvName,
   migrateWorkspaceCredentials,
   workspaceCredentialEnv,
   WORKSPACE_CREDENTIALS,
@@ -107,6 +108,20 @@ describe("workspace credential migration", () => {
     expect(result.credentialsChanged).toBe(false);
     expect(result.config.xai.key).toBe(42);
   });
+
+  it("moves custom endpoint keys into the encrypted store", () => {
+    const result = migrateWorkspaceCredentials({
+      customEndpoints: {
+        local: { baseUrl: "http://127.0.0.1:1234/v1", apiKey: "local-secret" }, // secret-scan: allow-test-fixture
+        public: { baseUrl: "https://example.test/v1" },
+      },
+    }, { customEndpointKeys: { keep: "keep-secret" } });
+    expect(result.credentials.customEndpointKeys).toEqual({ keep: "keep-secret", local: "local-secret" });
+    expect(result.config.customEndpoints.local).toEqual({ baseUrl: "http://127.0.0.1:1234/v1" });
+    expect(result.config.customEndpoints.public).toEqual({ baseUrl: "https://example.test/v1" });
+    expect(result.configChanged).toBe(true);
+    expect(result.credentialsChanged).toBe(true);
+  });
 });
 
 describe("workspace credential env", () => {
@@ -133,6 +148,14 @@ describe("workspace credential env", () => {
     expect(workspaceCredentialEnv({})).toEqual({});
     expect(workspaceCredentialEnv({ xaiApiKey: "" })).toEqual({});
     expect(workspaceCredentialEnv(undefined)).toEqual({});
+  });
+
+  it("maps custom endpoint keys to scoped environment variables", () => {
+    expect(customEndpointEnvName("local_proxy")).toBe("OPENMAUSBOT_ENDPOINT_LOCAL_UPROXY_API_KEY");
+    expect(customEndpointEnvName("local-proxy")).toBe("OPENMAUSBOT_ENDPOINT_LOCAL_DPROXY_API_KEY");
+    expect(workspaceCredentialEnv({ customEndpointKeys: { local_proxy: "secret", empty: "" } })).toEqual({
+      OPENMAUSBOT_ENDPOINT_LOCAL_UPROXY_API_KEY: "secret",
+    });
   });
 
   it("covers every credential the migration table declares", () => {

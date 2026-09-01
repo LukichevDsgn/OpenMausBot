@@ -9,6 +9,7 @@ import { analyticsEnabled, setAnalyticsEnabled } from "@/lib/analytics";
 import { builtInBrowserEnabled, showToolCallsEnabled, skillRecorderEnabled } from "@/lib/feature-flags";
 import { localeChoices } from "@/locales";
 import { ApiKeyRow, VpsConnection } from "./ApiKeys";
+import { CustomEndpointsPanel } from "./CustomEndpointsPanel";
 import { useUpdaterState } from "@/lib/updater";
 import { EnginesSettings } from "./EnginesSettings";
 import { LocalComputerSection } from "./LocalComputerSection";
@@ -677,6 +678,7 @@ export function SettingsModal() {
                       Connected apps service is ready
                     </div>
                   ) : null}
+                  <CustomEndpointsPanel />
                   <TranscriptionSettings />
                   <ApiKeyRow section="box" />
                   <VpsConnection />

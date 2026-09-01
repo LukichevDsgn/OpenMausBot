@@ -79,13 +79,16 @@ import {
 } from "./container-computer.ts";
 import {
   ensureDirs,
+  effectiveCustomEndpoints,
   instanceConfigs,
   loadConfig,
   localVmMaxInstances,
   localVmMode,
   parseConfigPatch,
+  removeCustomEndpoint,
   roomTurnTimeoutMinutes,
   saveConfig,
+  syncCustomEndpointKey,
   showToolCallsEnabled,
   skillRecorderEnabled,
   builtInBrowserEnabled,
@@ -99,6 +102,13 @@ import {
   NATIVE_DIR,
   customMcpServers,
 } from "./config.ts";
+import {
+  customEndpointKeyEnv,
+  parseCustomEndpoint,
+  publicCustomEndpoint,
+  testCustomEndpoint,
+  type CustomEndpoint,
+} from "./custom-endpoints.ts";
 import { ComputerControl } from "./computer-control.ts";
 import { MAX_REMOTE_COMMAND_LENGTH } from "./remote-computer.ts";
 import { augmentedPath, findCliCandidates, resetPathCache } from "./env-path.ts";
@@ -272,6 +282,7 @@ import { describeBrand, loadBrand } from "./brand.ts";
 
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
 const WEBHOOK_PORT = Number(process.env.OMB_WEBHOOK_PORT || PORT + 1);
+const CUSTOM_ENDPOINT_API_KEY_FIELD = "apiKey" as const;
 // Behind a proxy or tunnel, the base URL senders should use (docs/self-hosting.md).
 const WEBHOOK_PUBLIC_URL = process.env.OMB_WEBHOOK_PUBLIC_URL || undefined;
 const STATIC_DIR = process.env.OMB_STATIC_DIR || null;
@@ -9326,6 +9337,80 @@ const server = createServer(async (req, res) => {
         return json(res, 200, mcpServerResponse());
       } finally {
         mcpConfigBusy = false;
+      }
+    }
+
+    // ── OpenAI-compatible custom endpoints ──
+    if (method === "GET" && path === "/api/custom-endpoints") {
+      return json(res, 200, {
+        endpoints: Object.values(effectiveCustomEndpoints(cfg)).map((endpoint) => publicCustomEndpoint(endpoint)),
+      });
+    }
+    if (method === "POST" && path === "/api/custom-endpoints/test") {
+      if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+        return json(res, 415, { error: "content-type must be application/json" });
+      }
+      const body = await readBody(req);
+      try {
+        const endpoint = parseCustomEndpoint(body);
+        const saved = effectiveCustomEndpoints(cfg)[endpoint.id];
+        const rawKey = body?.apiKey;
+        const key = typeof rawKey === "string" && rawKey.trim()
+          ? rawKey.trim()
+          : saved?.apiKey || process.env[customEndpointKeyEnv(endpoint.id)];
+        return json(res, 200, await testCustomEndpoint(endpoint, key));
+      } catch (error) {
+        return json(res, 400, { ok: false, message: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    const customEndpointRoute = /^\/api\/custom-endpoints\/([a-z][a-z0-9_-]{0,63})$/.exec(path);
+    if (customEndpointRoute && method === "PUT") {
+      if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+        return json(res, 415, { error: "content-type must be application/json" });
+      }
+      const id = customEndpointRoute[1];
+      const body = await readBody(req);
+      let endpoint: CustomEndpoint;
+      try {
+        endpoint = parseCustomEndpoint({ ...body, id });
+      } catch (error) {
+        return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      if (providerConfigBusy) return json(res, 409, { error: "provider settings are already being updated" });
+      providerConfigBusy = true;
+      try {
+        const externalSecretStorage = url.searchParams.get("secretStorage") === "external";
+        const rawKey = body?.apiKey;
+        const keySupplied = typeof rawKey === "string" && rawKey.trim().length > 0;
+        const clearKey = body?.clearKey === true;
+        const persisted: CustomEndpoint = { ...endpoint };
+        if (externalSecretStorage || clearKey) persisted[CUSTOM_ENDPOINT_API_KEY_FIELD] = "";
+        if (!keySupplied && !clearKey && !externalSecretStorage) delete persisted.apiKey;
+        saveConfig({ customEndpoints: { [id]: persisted } });
+        if (keySupplied || clearKey) syncCustomEndpointKey(id, clearKey ? "" : body.apiKey);
+        Object.assign(cfg, loadConfig());
+        await reloadProviders();
+        return json(res, 200, {
+          endpoint: publicCustomEndpoint(effectiveCustomEndpoints(cfg)[id] ?? persisted),
+          endpoints: Object.values(effectiveCustomEndpoints(cfg)).map((candidate) => publicCustomEndpoint(candidate)),
+        });
+      } finally {
+        providerConfigBusy = false;
+      }
+    }
+    if (customEndpointRoute && method === "DELETE") {
+      if (providerConfigBusy) return json(res, 409, { error: "provider settings are already being updated" });
+      providerConfigBusy = true;
+      try {
+        removeCustomEndpoint(customEndpointRoute[1]);
+        syncCustomEndpointKey(customEndpointRoute[1], "");
+        Object.assign(cfg, loadConfig());
+        await reloadProviders();
+        return json(res, 200, {
+          endpoints: Object.values(effectiveCustomEndpoints(cfg)).map((endpoint) => publicCustomEndpoint(endpoint)),
+        });
+      } finally {
+        providerConfigBusy = false;
       }
     }
 

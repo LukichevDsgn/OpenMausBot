@@ -15,6 +15,11 @@ export const WORKSPACE_CREDENTIALS = [
   { section: "opencodeGo", field: "apiKey", name: "opencodeGoApiKey", env: "OPENCODE_API_KEY" },
 ];
 
+export function customEndpointEnvName(id) {
+  const escapedId = String(id).replaceAll("_", "_U").replaceAll("-", "_D").toUpperCase();
+  return `OPENMAUSBOT_ENDPOINT_${escapedId}_API_KEY`;
+}
+
 /** One boot-time sweep of config.json: move every plaintext workspace secret
  * into the encrypted store and DELETE the plaintext field.
  *
@@ -55,6 +60,23 @@ export function migrateWorkspaceCredentials(config, credentials) {
     delete home[field];
     configChanged = true;
   }
+  const endpoints = nextConfig?.customEndpoints;
+  if (endpoints && typeof endpoints === "object" && !Array.isArray(endpoints)) {
+    let endpointKeys = null;
+    for (const [id, endpoint] of Object.entries(endpoints)) {
+      if (!endpoint || typeof endpoint !== "object" || Array.isArray(endpoint) || !Object.hasOwn(endpoint, "apiKey")) continue;
+      const value = endpoint.apiKey;
+      if (typeof value !== "string") continue;
+      const keyValue = value.trim();
+      if (!endpointKeys) endpointKeys = { ...nextCredentials.customEndpointKeys };
+      if (keyValue) endpointKeys[id] = keyValue;
+      else delete endpointKeys[id];
+      delete endpoint.apiKey;
+      configChanged = true;
+      credentialsChanged = true;
+    }
+    if (endpointKeys) nextCredentials.customEndpointKeys = endpointKeys;
+  }
   return { config: nextConfig, credentials: nextCredentials, configChanged, credentialsChanged };
 }
 
@@ -65,6 +87,12 @@ export function workspaceCredentialEnv(credentials) {
   for (const { name, env: envName } of WORKSPACE_CREDENTIALS) {
     const value = credentials?.[name];
     if (typeof value === "string" && value) env[envName] = value;
+  }
+  const endpointKeys = credentials?.customEndpointKeys;
+  if (endpointKeys && typeof endpointKeys === "object" && !Array.isArray(endpointKeys)) {
+    for (const [id, value] of Object.entries(endpointKeys)) {
+      if (typeof value === "string" && value) env[customEndpointEnvName(id)] = value;
+    }
   }
   return env;
 }
