@@ -4,6 +4,7 @@ const ALLOWED_PACKAGE_HOSTS = new Set(["github.com", "www.github.com", "raw.gith
 const GROK_BOT_DEEP_LINK = /^grokbot:\/\/app\/v1\/bot-template\?id=[A-Za-z0-9_-]{21}$/;
 const GROK_BOT_PROTOCOL = "grokbot";
 
+/** Parse a supported package deep link and return its package URL, if valid. */
 export function packageUrlFromDeepLink(rawValue) {
   const raw = String(rawValue);
   if (GROK_BOT_DEEP_LINK.test(raw)) return raw;
@@ -34,6 +35,7 @@ export function packageUrlFromDeepLink(rawValue) {
   return packageUrl.toString();
 }
 
+/** Find the first supported package deep link in a command-line argument list. */
 export function packageUrlFromCommandLine(argv) {
   for (const value of argv) {
     const parsed = packageUrlFromDeepLink(value);
@@ -62,6 +64,7 @@ export function grokBotProtocolClientContract({ platform, packaged, executablePa
   };
 }
 
+/** Report whether Grok Bot links are supported and currently registered on Windows. */
 export function grokBotLinkHandlerStatus({
   platform,
   packaged,
@@ -85,6 +88,7 @@ export function grokBotLinkHandlerStatus({
   return { supported, isDefault };
 }
 
+/** Opt into Grok Bot link registration and report the resulting handler state. */
 export function enableGrokBotLinkHandler({
   platform,
   packaged,
