@@ -7,7 +7,7 @@ import { join } from "node:path";
 
 import { writeFileAtomic } from "./atomic.ts";
 import { peerAllowKey, type PeerAction } from "./peer-approval-key.ts";
-import { DATA_DIR } from "./config.ts";
+import { ANTIGRAVITY_WORKER_A_INSTANCE_ID, DATA_DIR, loadBrowserProfileIdAliases } from "./config.ts";
 import * as mdb from "./message-db.ts";
 import { workspaceDir } from "./workspace.ts";
 import { newId, type CloudBackend, type ModelSelection, type ThreadId } from "./contracts.ts";
@@ -477,6 +477,10 @@ export interface BotRecord {
    * start false — a shared persona must not reach the user's Gmail on
    * turn one. */
   composio?: boolean;
+  /** Whether this bot gets the app's built-in browser. On unless switched off. */
+  browser?: boolean;
+  /** Saved browser profile id; absent = the bot's own durable session. */
+  browserProfile?: string;
   /** Explicit skill ids. Undefined keeps the catalog's defaultEnabled behavior;
    * [] is an intentional deny-all choice. */
   skillGrants?: string[];
@@ -647,6 +651,15 @@ interface ThreadState {
   activeLeafId: string | null;
 }
 
+function migrateLegacyAntigravityCursors(cursors: Record<string, unknown>): boolean {
+  if (!Object.hasOwn(cursors, "antigravity")) return false;
+  if (!Object.hasOwn(cursors, ANTIGRAVITY_WORKER_A_INSTANCE_ID)) {
+    cursors[ANTIGRAVITY_WORKER_A_INSTANCE_ID] = cursors.antigravity;
+  }
+  delete cursors.antigravity;
+  return true;
+}
+
 export class Store {
   bots: BotRecord[] = [];
   groups: GroupRecord[] = [];
@@ -670,10 +683,21 @@ export class Store {
     // busy never survives a restart — no turn does either. Rooms saved
     // before default responders existed adopt their first member as lead.
     let botsMigrated = false;
+    const browserProfileAliases = loadBrowserProfileIdAliases();
     const chiefSectionsSeen = new Set<string>();
     let groupsMigrated = false;
     for (const b of this.bots) {
+      if (b.modelSelection.instanceId === "antigravity") {
+        b.modelSelection = { ...b.modelSelection, instanceId: ANTIGRAVITY_WORKER_A_INSTANCE_ID };
+        botsMigrated = true;
+      }
+      if (migrateLegacyAntigravityCursors(b.resumeCursors)) botsMigrated = true;
       for (const task of b.tasks ?? []) {
+        if (task.lastInstanceId === "antigravity") {
+          task.lastInstanceId = ANTIGRAVITY_WORKER_A_INSTANCE_ID;
+          botsMigrated = true;
+        }
+        if (migrateLegacyAntigravityCursors(task.resumeCursors)) botsMigrated = true;
         if (task.handoffScope && task.handoffScope.accessMode !== "read-only" && task.handoffScope.accessMode !== "writer") {
           task.handoffScope.accessMode = "writer";
           botsMigrated = true;
@@ -703,6 +727,13 @@ export class Store {
       if (b.busy || (b.activity !== undefined && b.activity !== "idle")) botsMigrated = true;
       b.busy = false;
       b.activity = "idle";
+      if (b.browserProfile) {
+        const browserProfile = browserProfileAliases.get(b.browserProfile);
+        if (browserProfile && browserProfile !== b.browserProfile) {
+          b.browserProfile = browserProfile;
+          botsMigrated = true;
+        }
+      }
       if (b.chiefRuntimePolicyLocked !== true && b.chiefRuntimePolicyLocked !== false) {
         b.chiefRuntimePolicyLocked = false;
         botsMigrated = true;
@@ -850,8 +881,8 @@ export class Store {
     }
   }
 
-  private saveBots() {
-    writeFileAtomic(BOTS_FILE, JSON.stringify(this.bots, null, 2));
+  private saveBots(bots: BotRecord[] = this.bots) {
+    writeFileAtomic(BOTS_FILE, JSON.stringify(bots, null, 2));
   }
 
   private saveGroups() {
@@ -1324,6 +1355,54 @@ export class Store {
     this.saveBots();
     this.emit({ type: "bot", botId: id });
     return bot;
+  }
+
+  /** File visible bots into one sidebar section as a single durable write.
+   *
+   * This deliberately stages the complete next file before touching the
+   * live records. A missing/hidden target therefore changes nothing, and a
+   * failed atomic write cannot leave memory ahead of disk. A Chief collision
+   * is refused rather than silently removing somebody's coordinator role. */
+  setBotsSection(
+    botIds: string[],
+    section: string,
+  ): { ok: true; bots: BotRecord[] } | { ok: false; reason: "unavailable" | "chief-conflict" } {
+    const ids = [...new Set(botIds)];
+    const targets = ids.map((id) => this.bot(id));
+    if (targets.some((bot) => !bot || bot.hidden)) return { ok: false, reason: "unavailable" };
+
+    const targetSection = sectionKey(section);
+    const selected = targets as BotRecord[];
+    const destinationChiefIds = new Set([
+      ...selected.filter((bot) => bot.chiefOfStaff).map((bot) => bot.id),
+      ...this.bots
+        .filter((bot) => bot.chiefOfStaff && sectionKey(bot.section) === targetSection)
+        .map((bot) => bot.id),
+    ]);
+    if (destinationChiefIds.size > 1) return { ok: false, reason: "chief-conflict" };
+
+    const patches = new Map<string, Partial<BotRecord>>();
+    for (const bot of selected) {
+      patches.set(bot.id, { section: targetSection || undefined });
+    }
+
+    const changedIds = new Set<string>();
+    const nextBots = this.bots.map((bot) => {
+      const patch = patches.get(bot.id);
+      if (!patch) return bot;
+      const next = { ...bot, ...patch };
+      if (JSON.stringify(next) !== JSON.stringify(bot)) changedIds.add(bot.id);
+      return next;
+    });
+    if (changedIds.size) {
+      this.saveBots(nextBots);
+      for (const bot of this.bots) {
+        const patch = patches.get(bot.id);
+        if (patch) Object.assign(bot, patch);
+      }
+      for (const botId of changedIds) this.emit({ type: "bot", botId });
+    }
+    return { ok: true, bots: ids.map((id) => this.bot(id)!) };
   }
 
   /** The one way runtime state changes. Sets `activity` and derives `busy`

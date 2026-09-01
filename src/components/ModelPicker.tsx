@@ -75,7 +75,7 @@ export function AntigravityAccountCards({
           onClick={onRefresh}
           disabled={busy}
           className="rounded p-1 text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50"
-          title="Обновить квоты обоих аккаунтов"
+          title="Обновить квоту выбранного аккаунта"
           aria-label="Обновить квоты Antigravity"
         >
           <RefreshCw size={12} className={busy ? "animate-spin" : undefined} />
@@ -189,6 +189,7 @@ function ModelSearch({
   );
 }
 
+/** Render model selection, Antigravity account status, and network controls. */
 export function ModelPicker({
   bot,
   className,
@@ -212,6 +213,9 @@ export function ModelPicker({
   const [agyBusy, setAgyBusy] = useState(false);
   const [agyError, setAgyError] = useState<string | null>(null);
   const [agyNotice, setAgyNotice] = useState<string | null>(null);
+  const [agyProxyDraft, setAgyProxyDraft] = useState("http://127.0.0.1:10808");
+  const [agyProxySaving, setAgyProxySaving] = useState(false);
+  const [agyProxyError, setAgyProxyError] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
 
   const selection = bot.modelSelection;
@@ -219,6 +223,14 @@ export function ModelPicker({
   const railInstance =
     state.instances.find((instance) => instance.instanceId === (railId === OPENMAUS_RAIL_ID ? "opencodeGo" : railId ?? selection.instanceId)) ?? state.instances[0];
   const showingOpenMaus = railId === OPENMAUS_RAIL_ID;
+  const antigravityProxy = state.config?.features?.antigravityProxy ?? {
+    mode: "off" as const,
+    url: "http://127.0.0.1:10808",
+  };
+
+  useEffect(() => {
+    if (open) setAgyProxyDraft(antigravityProxy.url);
+  }, [open, antigravityProxy.url]);
 
   useEffect(() => {
     if (!open) return;
@@ -318,7 +330,11 @@ export function ModelPicker({
     setAgyError(null);
     setAgyNotice(null);
     try {
-      const result = await api("/api/antigravity/accounts?refresh=1");
+      const selectedAccount = agyAccounts.find(
+        (candidate) => candidate.instanceId === railInstance.instanceId,
+      );
+      if (!selectedAccount) throw new Error("No Antigravity account is selected.");
+      const result = await api(`/api/antigravity/accounts?refresh=1&profile=${selectedAccount.profile}`);
       setAgyAccounts(result.accounts ?? []);
       if (result.refreshDeferred) {
         setAgyNotice("Worker is active. Quota will refresh automatically when its task finishes.");
@@ -328,6 +344,40 @@ export function ModelPicker({
     } finally {
       setAgyBusy(false);
     }
+  };
+
+  const saveAgyProxy = async (patch: { mode?: "off" | "tun" | "proxy"; url?: string }) => {
+    if (agyProxySaving) return;
+    setAgyProxySaving(true);
+    setAgyProxyError(null);
+    try {
+      const config = await fetch("/api/config", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ features: { antigravityProxy: patch } }),
+      }).then(async (response) => {
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.error ?? "Could not save the Antigravity network mode.");
+        return body;
+      });
+      dispatch({ type: "configStatus", config });
+    } catch (error) {
+      setAgyProxyError(error instanceof Error ? error.message : "Could not save the Antigravity network mode.");
+    } finally {
+      setAgyProxySaving(false);
+    }
+  };
+
+  const selectAgyProxyMode = (mode: "off" | "tun" | "proxy") => {
+    if (mode === antigravityProxy.mode) return;
+    void saveAgyProxy(mode === "proxy"
+      ? { mode, url: agyProxyDraft.trim() || antigravityProxy.url }
+      : { mode });
+  };
+
+  const saveAgyProxyUrl = () => {
+    if (antigravityProxy.mode !== "proxy" || agyProxyDraft.trim() === antigravityProxy.url) return;
+    void saveAgyProxy({ mode: "proxy", url: agyProxyDraft });
   };
 
   const official = railInstance?.models.options.filter((option) => !option.custom) ?? [];
@@ -492,6 +542,54 @@ export function ModelPicker({
                   )}
                   {agyNotice && railInstance.driverKind === "antigravityAgent" && (
                     <div className="mt-2 text-[10.5px] text-ink-secondary">{agyNotice}</div>
+                  )}
+                  {railInstance.driverKind === "antigravityAgent" && (
+                    <div className="mt-3 rounded-lg border border-hairline/40 bg-inset px-2.5 py-2.5">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="text-[12px] font-medium text-ink">VPN mode</div>
+                        <div role="radiogroup" aria-label="VPN mode" className="flex rounded-md bg-card p-0.5">
+                          {[
+                            { label: "Off", mode: "off" as const },
+                            { label: "TUN", mode: "tun" as const },
+                            { label: "Proxy", mode: "proxy" as const },
+                          ].map((mode) => (
+                            <button
+                              key={mode.label}
+                              type="button"
+                              role="radio"
+                              aria-checked={antigravityProxy.mode === mode.mode}
+                              disabled={agyProxySaving}
+                              onClick={() => selectAgyProxyMode(mode.mode)}
+                              className={cn(
+                                "rounded px-2 py-1 text-[10.5px] font-medium transition-colors",
+                                antigravityProxy.mode === mode.mode
+                                  ? "bg-control text-ink"
+                                  : "text-ink-secondary hover:text-ink",
+                                agyProxySaving && "cursor-wait opacity-50",
+                              )}
+                            >
+                              {mode.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      {antigravityProxy.mode === "proxy" && (
+                        <label className="mt-2 block text-[10.5px] text-ink-secondary">
+                          Proxy URL
+                          <input
+                            type="url"
+                            value={agyProxyDraft}
+                            onChange={(event) => setAgyProxyDraft(event.target.value)}
+                            onBlur={saveAgyProxyUrl}
+                            disabled={agyProxySaving}
+                            placeholder="http://127.0.0.1:10808"
+                            aria-label="Proxy URL"
+                            className="mt-1 w-full rounded-md border border-hairline/40 bg-card px-2 py-1.5 text-[11.5px] text-ink placeholder:text-ink-secondary focus:border-accent/60 focus:outline-none disabled:opacity-50"
+                          />
+                        </label>
+                      )}
+                      {agyProxyError && <div className="mt-1.5 text-[10.5px] text-warning">{agyProxyError}</div>}
+                    </div>
                   )}
                 </div>
 

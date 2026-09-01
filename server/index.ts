@@ -63,6 +63,9 @@ import {
 } from "./container-computer.ts";
 import {
   ensureDirs,
+  antigravityNetworkRoute,
+  antigravityProxySettings,
+  builtInBrowserEnabled,
   effectiveCustomEndpoints,
   instanceConfigs,
   loadConfig,
@@ -276,6 +279,10 @@ function authorizedComms(header: string | string[] | undefined): boolean {
 // A→B is allowed but B→C (and A→B→A loops) never start.
 const MAX_COMMS_DEPTH = 1;
 const MAX_WORKSPACE_BOTS = 100;
+const createSidebarSectionSchema = z.object({
+  name: z.string(),
+  botIds: z.array(z.string().regex(/^[\w-]+$/)).min(1).max(MAX_WORKSPACE_BOTS),
+}).strict();
 // Resolved from the server root — see server/proxy-paths.ts. This descending
 // path happened to survive bundling, but it goes through the same anchor so
 // there is exactly one way proxies are located.
@@ -1278,7 +1285,10 @@ bus.subscribe((event: RuntimeEvent) => {
     const settledProfile = settledBot ? profileForInstance(settledBot.modelSelection.instanceId) : null;
     if (settledProfile) {
       const timer = setTimeout(() => {
-        void refreshAntigravityProfileQuota(settledProfile).catch(() => {
+        void refreshAntigravityProfileQuota(
+          settledProfile,
+          antigravityNetworkRoute(loadConfig()),
+        ).catch(() => {
           // Telemetry is best-effort and must never change the turn outcome.
         });
       }, 1_500);
@@ -3822,6 +3832,7 @@ async function perBotLocalVmCountForModeChange(): Promise<number | null> {
   return existingPerBotLocalVmCount(runtime.runtime);
 }
 
+/** Build the non-secret config snapshot consumed by the renderer. */
 function configStatus() {
   return {
     xai: { configured: Boolean(cfg.xai?.key) },
@@ -3845,7 +3856,13 @@ function configStatus() {
       mode: localVmMode(cfg),
       maxInstances: localVmMaxInstances(cfg),
     },
-    features: { skillRecorder: skillRecorderEnabled(cfg), showToolCalls: showToolCallsEnabled(cfg) },
+    features: {
+      skillRecorder: skillRecorderEnabled(cfg),
+      showToolCalls: showToolCallsEnabled(cfg),
+      browser: builtInBrowserEnabled(cfg),
+      antigravityProxy: antigravityProxySettings(cfg),
+    },
+    browserProfiles: cfg.browserProfiles ?? [],
   };
 }
 
@@ -5678,6 +5695,30 @@ const server = createServer(async (req, res) => {
       if (!patched) return json(res, 404, { error: "no such message" });
       return json(res, 200, { message: patched });
     }
+    if (method === "POST" && path === "/api/sidebar-sections") {
+      const parsed = createSidebarSectionSchema.safeParse(await readBody(req));
+      if (!parsed.success) {
+        return json(res, 400, { error: "name and one to 100 valid botIds are required" });
+      }
+      const name = parsed.data.name.trim();
+      if (!name) return json(res, 400, { error: "name is required" });
+      if (name.length > 60) {
+        return json(res, 400, { error: "name must be at most 60 characters" });
+      }
+      const botIds = [...new Set(parsed.data.botIds)];
+      const result = store.setBotsSection(botIds, name);
+      if (!result.ok) {
+        if (result.reason === "chief-conflict") {
+          return json(res, 409, {
+            error: "A section can have only one Chief of Staff. Choose one Chief or use a section without one.",
+          });
+        }
+        return json(res, 404, { error: "one or more bots are unavailable" });
+      }
+      // This files bots under a derived label; it does not create a durable
+      // section resource, and an identical retry is an ordinary no-op.
+      return json(res, 200, { section: name, bots: result.bots.map(wireBot) });
+    }
     if (method === "POST" && path === "/api/bots") {
       const body = await readBody(req);
       if (!body || typeof body !== "object" || Array.isArray(body)) {
@@ -6898,6 +6939,10 @@ const server = createServer(async (req, res) => {
 
     if (method === "GET" && path === "/api/antigravity/accounts") {
       const refresh = url.searchParams.get("refresh") === "1";
+      const requestedProfile = url.searchParams.get("profile");
+      if (requestedProfile !== null && requestedProfile !== "a" && requestedProfile !== "b") {
+        return json(res, 400, { error: "profile must be a or b" });
+      }
       // A managed Worker A/B turn owns the launcher's machine-wide credential
       // mutex. Do not call it a standalone terminal and do not start a quota
       // probe that may wait behind a long task. Return the last good cache;
@@ -6911,7 +6956,24 @@ const server = createServer(async (req, res) => {
       if (refresh && await antigravityProcessRunning() && !antigravityManagedQuotaRefreshRunning()) {
         return json(res, 409, { error: "Close standalone Antigravity terminals before refreshing account quotas." });
       }
-      return json(res, 200, { accounts: await antigravityAccountStatuses(refresh) });
+      if (refresh && requestedProfile) {
+        try {
+          await refreshAntigravityProfileQuota(
+            requestedProfile,
+            antigravityNetworkRoute(loadConfig()),
+          );
+        } catch {
+          // The status response keeps the last-good value and marks this exact
+          // profile stale, so the picker remains truthful without a generic 500.
+        }
+        return json(res, 200, { accounts: await antigravityAccountStatuses(false) });
+      }
+      return json(res, 200, {
+        accounts: await antigravityAccountStatuses(
+          refresh,
+          antigravityNetworkRoute(loadConfig()),
+        ),
+      });
     }
 
     if (method === "POST" && path === "/api/antigravity/activate") {

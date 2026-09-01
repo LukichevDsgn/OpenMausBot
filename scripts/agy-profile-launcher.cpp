@@ -35,6 +35,56 @@ static std::wstring quote(const std::wstring& value) {
     return out;
 }
 
+static bool regularFileExists(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+// agy initializes its browser tooling even for the read-only /usage command.
+// The worker's isolated USERPROFILE would otherwise point playwright-go at an
+// empty cache and make it download a retired driver URL. Reuse a complete
+// driver already installed for the signed-in Windows account. The environment
+// override is inherited by agy after USERPROFILE/HOME become worker-scoped.
+static void configureSharedPlaywrightDriver(const std::wstring& userProfile) {
+    wchar_t existing[MAX_PATH];
+    const DWORD existingSize = GetEnvironmentVariableW(
+        L"PLAYWRIGHT_DRIVER_PATH", existing, MAX_PATH);
+    if (existingSize > 0 && existingSize < MAX_PATH) return;
+
+    wchar_t localAppData[MAX_PATH];
+    const DWORD localSize = GetEnvironmentVariableW(
+        L"LOCALAPPDATA", localAppData, MAX_PATH);
+    const std::wstring cacheRoot =
+        localSize > 0 && localSize < MAX_PATH
+            ? std::wstring(localAppData) + L"\\ms-playwright-go"
+            : userProfile + L"\\AppData\\Local\\ms-playwright-go";
+
+    WIN32_FIND_DATAW entry{};
+    HANDLE search = FindFirstFileW((cacheRoot + L"\\*").c_str(), &entry);
+    if (search == INVALID_HANDLE_VALUE) return;
+
+    std::wstring selected;
+    do {
+        if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+            std::wcscmp(entry.cFileName, L".") == 0 ||
+            std::wcscmp(entry.cFileName, L"..") == 0) {
+            continue;
+        }
+        const std::wstring candidate = cacheRoot + L"\\" + entry.cFileName;
+        if (regularFileExists(candidate + L"\\node.exe") &&
+            regularFileExists(candidate + L"\\package\\cli.js") &&
+            (selected.empty() || candidate > selected)) {
+            selected = candidate;
+        }
+    } while (FindNextFileW(search, &entry));
+    FindClose(search);
+
+    if (!selected.empty()) {
+        SetEnvironmentVariableW(L"PLAYWRIGHT_DRIVER_PATH", selected.c_str());
+    }
+}
+
 enum class AgyPatchStatus {
     Patched,
     Unpatched,
@@ -304,6 +354,7 @@ int wmain(int argc, wchar_t** argv) {
                status == AgyPatchStatus::Unpatched ? 115 : 116;
     }
 
+    configureSharedPlaywrightDriver(userProfile);
     SetEnvironmentVariableW(L"USERPROFILE", profile.c_str());
     SetEnvironmentVariableW(L"HOME", profile.c_str());
     const NetworkRoute networkRoute = configureNetworkRoute();

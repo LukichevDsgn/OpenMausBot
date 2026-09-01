@@ -278,6 +278,11 @@ export interface Bot {
   /** Whether this bot may use the workspace's connected apps. Unset means
    * allowed for existing bots; imported bots start with this disabled. */
   composio?: boolean;
+  /** Whether this bot gets the app's built-in browser (Browser tab). On unless switched off. */
+  browser?: boolean;
+  /** Named browser profile id (config.browserProfiles); absent/null = the
+   * bot's own session (null is how a clear travels over PATCH). */
+  browserProfile?: string | null;
   /** Explicit skill ids; undefined keeps catalog defaults, [] denies all. */
   skillGrants?: string[];
   /** Explicit skill-owned tool ids; undefined keeps declared-tool defaults. */
@@ -361,12 +366,27 @@ export interface ConfigStatus {
   /** who's using the app — collected in onboarding, shown in the sidebar */
   profile?: { name: string; email: string };
   /** Opt-in flags. Absent means off. */
-  features?: { skillRecorder: boolean; showToolCalls?: boolean };
+  features?: {
+    skillRecorder: boolean;
+    showToolCalls?: boolean;
+    browser?: boolean;
+    antigravityProxy?: { mode: "off" | "tun" | "proxy"; url: string };
+  };
+  /** Named browser sessions any bot can be pointed at. */
+  browserProfiles?: BrowserProfile[];
+}
+
+export interface BrowserProfile {
+  id: string;
+  name: string;
+  /** Read-only durable Electron routing inherited from legacy profiles.
+   * Config PATCH payloads must omit it. */
+  partitionId?: string;
 }
 
 export type ConfigStatusFrame = Pick<
   ConfigStatus,
-  "xai" | "nvidia" | "openrouter" | "composio" | "box" | "vps" | "rooms" | "localVm" | "opencodeGo" | "tts" | "imageGen" | "profile" | "features"
+  "xai" | "nvidia" | "openrouter" | "composio" | "box" | "vps" | "rooms" | "localVm" | "opencodeGo" | "tts" | "imageGen" | "profile" | "features" | "browserProfiles"
 >;
 
 export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
@@ -384,6 +404,7 @@ export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
     imageGen: frame.imageGen,
     profile: frame.profile,
     features: frame.features,
+    browserProfiles: frame.browserProfiles,
   };
 }
 
@@ -457,6 +478,7 @@ export interface AntigravityAccountStatus {
 
 export type AppSettingsSection =
   | "general"
+  | "experimental"
   | "connections"
   | "engines"
   | "skills"

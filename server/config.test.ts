@@ -1,11 +1,17 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  ANTIGRAVITY_NETWORK_ROUTE_ENV,
+  ANTIGRAVITY_WORKER_A_INSTANCE_ID,
+  ANTIGRAVITY_WORKER_B_INSTANCE_ID,
+  DEFAULT_ANTIGRAVITY_PROXY_URL,
   DATA_DIR,
+  antigravityNetworkRoute,
+  antigravityProxySettings,
   publicConfigTransactionFailure,
   replaceAppConfig,
   instanceConfigs,
@@ -13,10 +19,12 @@ import {
   loadConfig,
   localVmMaxInstances,
   localVmMode,
+  normalizeAntigravityProxyUrl,
   parseConfigPatch,
   parseStoredConfig,
   sanitizeStoredCustomEndpointUrls,
   roomTurnTimeoutMinutes,
+  saveConfig,
   showToolCallsEnabled,
   skillRecorderEnabled,
   stripWorkspaceCredentialEnv,
@@ -256,6 +264,97 @@ describe("configuration boundaries", () => {
       features: { showToolCalls: true },
     });
     expect(showToolCallsEnabled({ features: { showToolCalls: true } })).toBe(true);
+  });
+
+  it("accepts only explicit loopback HTTP(S) proxy URLs and migrates the three network modes", () => {
+    expect(antigravityProxySettings({})).toEqual({ mode: "off", url: DEFAULT_ANTIGRAVITY_PROXY_URL });
+    expect(normalizeAntigravityProxyUrl(" HTTPS://LOCALHOST:08080/ ")).toBe("https://localhost:8080");
+    expect(parseConfigPatch({
+      features: { antigravityProxy: { enabled: true, url: "http://[::1]:10808/" } },
+    })).toEqual({
+      features: { antigravityProxy: { mode: "proxy", url: "http://[::1]:10808" } },
+    });
+    expect(parseStoredConfig({ features: { antigravityProxy: { enabled: true, url: "http://127.0.0.1:10808" } } }))
+      .toMatchObject({ features: { antigravityProxy: { mode: "proxy", url: DEFAULT_ANTIGRAVITY_PROXY_URL } } });
+    expect(parseStoredConfig({ features: { antigravityProxy: { enabled: false } } }))
+      .toMatchObject({ features: { antigravityProxy: { mode: "tun", url: DEFAULT_ANTIGRAVITY_PROXY_URL } } });
+    expect(parseStoredConfig({})).toEqual({});
+    for (const url of [
+      "http://user:password@127.0.0.1:10808", // secret-scan: allow-test-fixture
+      "http://127.0.0.1:10808/path",
+      "http://127.0.0.1:10808?token=secret", // secret-scan: allow-test-fixture
+      "http://127.0.0.1:10808#fragment",
+      "https://192.168.1.20:10808",
+      "socks5://127.0.0.1:10808",
+      "http://127.0.0.1",
+      "http://127.0.0.1:0",
+      "http://127.0.0.1:65536",
+    ]) {
+      try {
+        parseConfigPatch({ features: { antigravityProxy: { enabled: true, url } } });
+        throw new Error("expected invalid proxy URL");
+      } catch (error) {
+        expect(String(error)).toMatch(/features\.antigravityProxy\.url|Invalid configuration/);
+        expect(String(error)).not.toContain(url);
+      }
+    }
+    expect(() => parseConfigPatch({ features: { antigravityProxy: { mode: "proxy" } } })).toThrow(
+      "features.antigravityProxy.url",
+    );
+  });
+
+  it("builds one off/tun/proxy route signal without accepting user proxy values", () => {
+    expect(antigravityNetworkRoute({})).toBe("off");
+    const defaultInstances = instanceConfigs({
+      instances: {
+        agyA: { driver: "antigravityAgent" },
+        agyB: { driver: "antigravityAgent" },
+      },
+    });
+    expect(defaultInstances.agyA.environment).toEqual({ [ANTIGRAVITY_NETWORK_ROUTE_ENV]: "off" });
+    expect(defaultInstances.agyB.environment).toEqual({ [ANTIGRAVITY_NETWORK_ROUTE_ENV]: "off" });
+    const cfg: AppConfig = {
+      features: { antigravityProxy: { mode: "proxy", url: "http://localhost:08080/" } },
+      instances: {
+        agyA: { driver: "antigravityAgent", environment: { HTTP_PROXY: "http://user:secret@remote.invalid:1" } },
+        agyB: { driver: "antigravityAgent" },
+      },
+    };
+    expect(antigravityNetworkRoute(cfg)).toBe("proxy|http://localhost:8080");
+    const instances = instanceConfigs(cfg);
+    expect(instances.agyA.environment).toEqual({
+      HTTP_PROXY: "http://user:secret@remote.invalid:1",
+      [ANTIGRAVITY_NETWORK_ROUTE_ENV]: "proxy|http://localhost:8080",
+    });
+    expect(instances.agyB.environment).toEqual({
+      [ANTIGRAVITY_NETWORK_ROUTE_ENV]: "proxy|http://localhost:8080",
+    });
+    expect(instances.agyA.environment?.[ANTIGRAVITY_NETWORK_ROUTE_ENV]).not.toContain("secret");
+  });
+
+  it("persists normalized mode state through the existing config path", () => {
+    const path = join(DATA_DIR, "config.json");
+    const hadFile = existsSync(path);
+    const original = hadFile ? readFileSync(path) : undefined;
+    mkdirSync(DATA_DIR, { recursive: true });
+    try {
+      saveConfig({ features: { antigravityProxy: { enabled: true, url: "http://localhost:08080/" } } });
+      expect(JSON.parse(readFileSync(path, "utf8")).features.antigravityProxy).toEqual({
+        mode: "proxy",
+        url: "http://localhost:8080",
+      });
+      expect(antigravityProxySettings(loadConfig())).toEqual({ mode: "proxy", url: "http://localhost:8080" });
+
+      saveConfig({ features: { antigravityProxy: { mode: "tun" } } });
+      expect(JSON.parse(readFileSync(path, "utf8")).features.antigravityProxy).toEqual({
+        mode: "tun",
+        url: "http://localhost:8080",
+      });
+      expect(antigravityNetworkRoute(loadConfig())).toBe("tun");
+    } finally {
+      if (original === undefined) rmSync(path, { force: true });
+      else writeFileSync(path, original);
+    }
   });
 
   it.each([0, 1.5, 5, "2", null])("rejects an invalid per-bot VM limit: %j", (maxInstances) => {
@@ -635,6 +734,70 @@ describe("Instance CLI override", () => {
   });
 });
 
+describe("default fleet", () => {
+  it("publishes selectable Antigravity A/B workers and migrates the legacy aggregate config", () => {
+    const defaults = instanceConfigs({});
+    expect(defaults.antigravity).toBeUndefined();
+    expect(defaults[ANTIGRAVITY_WORKER_A_INSTANCE_ID]).toMatchObject({
+      driver: "antigravityAgent",
+      displayName: "Antigravity A · Worker A",
+    });
+    expect(defaults[ANTIGRAVITY_WORKER_B_INSTANCE_ID]).toMatchObject({
+      driver: "antigravityAgent",
+      displayName: "Antigravity B · Worker B",
+    });
+    expect(defaults[ANTIGRAVITY_WORKER_A_INSTANCE_ID]?.config).toEqual(expect.objectContaining({
+      cli: expect.stringMatching(/agy-worker-a\.exe$/i),
+    }));
+    expect(defaults[ANTIGRAVITY_WORKER_B_INSTANCE_ID]?.config).toEqual(expect.objectContaining({
+      cli: expect.stringMatching(/agy-worker-b\.exe$/i),
+    }));
+
+    const migrated = instanceConfigs({
+      instances: {
+        antigravity: {
+          driver: "antigravityAgent",
+          displayName: "Antigravity",
+          environment: { CUSTOM_FLAG: "keep" },
+          config: { helperMode: "legacy" },
+        },
+      },
+    });
+    expect(migrated.antigravity).toBeUndefined();
+    expect(migrated[ANTIGRAVITY_WORKER_A_INSTANCE_ID]).toMatchObject({
+      displayName: "Antigravity A · Worker A",
+      config: { helperMode: "legacy", cli: expect.stringMatching(/agy-worker-a\.exe$/i) },
+      environment: expect.objectContaining({ CUSTOM_FLAG: "keep", [ANTIGRAVITY_NETWORK_ROUTE_ENV]: "off" }),
+    });
+    expect(migrated[ANTIGRAVITY_WORKER_B_INSTANCE_ID]).toMatchObject({
+      displayName: "Antigravity B · Worker B",
+      config: { helperMode: "legacy", cli: expect.stringMatching(/agy-worker-b\.exe$/i) },
+      environment: expect.objectContaining({ CUSTOM_FLAG: "keep", [ANTIGRAVITY_NETWORK_ROUTE_ENV]: "off" }),
+    });
+  });
+
+  it("routes a packaged fleet to its shipped A/B helper binaries", () => {
+    const root = mkdtempSync(join(tmpdir(), "openmaus-antigravity-resources-"));
+    const resources = join(root, "antigravity");
+    mkdirSync(resources, { recursive: true });
+    writeFileSync(join(resources, "agy-worker-a.exe"), "fake-a");
+    writeFileSync(join(resources, "agy-worker-b.exe"), "fake-b");
+    const previous = process.env.OMB_RESOURCES_PATH;
+    process.env.OMB_RESOURCES_PATH = root;
+    try {
+      const instances = instanceConfigs({});
+      expect((instances[ANTIGRAVITY_WORKER_A_INSTANCE_ID]?.config as { cli?: string } | undefined)?.cli)
+        .toBe(join(resources, "agy-worker-a.exe"));
+      expect((instances[ANTIGRAVITY_WORKER_B_INSTANCE_ID]?.config as { cli?: string } | undefined)?.cli)
+        .toBe(join(resources, "agy-worker-b.exe"));
+    } finally {
+      if (previous === undefined) delete process.env.OMB_RESOURCES_PATH;
+      else process.env.OMB_RESOURCES_PATH = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("OpenCode Go configuration", () => {
   it("injects the key only into OpenCode Go instances", () => {
     const cfg: AppConfig = {
@@ -698,6 +861,7 @@ describe("credential env narrowing", () => {
     const instances = instanceConfigs(cfg);
     for (const [id, entry] of Object.entries(instances)) {
       if (id === "computer") expect(entry.environment).toEqual({ BOX_TOKEN: "SECRET-BOX" });
+      else if (entry.driver === "antigravityAgent") expect(entry.environment).toEqual({ [ANTIGRAVITY_NETWORK_ROUTE_ENV]: "off" });
       else expect(entry.environment).toEqual({});
     }
   });

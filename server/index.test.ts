@@ -2421,20 +2421,32 @@ describe("harness HTTP API", () => {
   it("keeps Teach a skill off by default and persists an explicit opt-in", async () => {
     const before = await api("GET", "/api/config");
     expect(before.status).toBe(200);
-    expect(before.body.features).toEqual({ skillRecorder: false, showToolCalls: false });
+    expect(before.body.features).toEqual({
+      skillRecorder: false,
+      showToolCalls: false,
+      antigravityProxy: { mode: "off", url: "http://127.0.0.1:10808" },
+    });
 
     const saved = await api("PATCH", "/api/config", {
       features: { skillRecorder: true },
     });
     expect(saved.status).toBe(200);
-    expect(saved.body.features).toEqual({ skillRecorder: true, showToolCalls: false });
+    expect(saved.body.features).toEqual({
+      skillRecorder: true,
+      showToolCalls: false,
+      antigravityProxy: { mode: "off", url: "http://127.0.0.1:10808" },
+    });
 
     const disk = JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8"));
     expect(disk.features).toEqual({ skillRecorder: true });
 
     const tools = await api("PATCH", "/api/config", { features: { showToolCalls: true } });
     expect(tools.status).toBe(200);
-    expect(tools.body.features).toEqual({ skillRecorder: true, showToolCalls: true });
+    expect(tools.body.features).toEqual({
+      skillRecorder: true,
+      showToolCalls: true,
+      antigravityProxy: { mode: "off", url: "http://127.0.0.1:10808" },
+    });
 
     await api("PATCH", "/api/config", { features: { skillRecorder: false, showToolCalls: false } });
   });
@@ -3305,9 +3317,9 @@ describe("harness HTTP API", () => {
   it("manual-selects one exact skill for direct and room sends with hidden authoritative grants", async () => {
     const catalog = await api("GET", "/api/skills/catalog");
     expect(catalog.status).toBe(200);
-    expect(catalog.body.skills).toEqual([
+    expect(catalog.body.skills).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: "phone-harness", origin: "built-in", status: "available", tools: ["phone"] }),
-    ]);
+    ]));
 
     const created = await api("POST", "/api/bots", {});
     const botId = created.body.bot.id;

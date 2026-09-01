@@ -22,6 +22,8 @@ import {
 
 const optionalText = z.string().optional();
 const SSH_ALIAS = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const LEGACY_BROWSER_PROFILE_ID = /^[A-Za-z0-9_-]{1,40}$/;
+const BROWSER_PROFILE_ID = /^[a-z0-9_-]{1,40}$/;
 
 export const DEFAULT_ROOM_TURN_TIMEOUT_MINUTES = 5;
 export const MIN_ROOM_TURN_TIMEOUT_MINUTES = 1;
@@ -70,11 +72,239 @@ const localVmConfigSchema = z.object({
     .max(MAX_LOCAL_VM_MAX_INSTANCES)
     .optional(),
 });
+
+const browserProfileSchema = z.object({
+  id: z.string().regex(BROWSER_PROFILE_ID).refine((id) => id !== "guest", "guest is reserved"),
+  name: z.string().trim().min(1).max(40),
+}).strict();
+
+const legacyBrowserProfileSchema = z.object({
+  id: z.string().regex(LEGACY_BROWSER_PROFILE_ID).refine((id) => id !== "guest", "guest is reserved"),
+  name: z.string().trim().min(1).max(40),
+  partitionId: z.string().regex(LEGACY_BROWSER_PROFILE_ID).refine((id) => id !== "guest", "guest is reserved").optional(),
+}).strict();
+
+interface StoredBrowserProfileMigration {
+  profiles: BrowserProfile[];
+  aliases: ReadonlyMap<string, string>;
+}
+
+function suffixedBrowserProfileId(base: string, unavailable: ReadonlySet<string>): string {
+  for (let suffix = 2; ; suffix += 1) {
+    const ending = `-${suffix}`;
+    const candidate = `${base.slice(0, 40 - ending.length)}${ending}`;
+    if (candidate !== "guest" && !unavailable.has(candidate)) return candidate;
+  }
+}
+
+function migrateStoredBrowserProfiles(
+  profiles: Array<z.output<typeof legacyBrowserProfileSchema>>,
+): StoredBrowserProfileMigration {
+  const requestedPartitions = profiles.map((profile) => profile.partitionId ?? profile.id);
+  const rawBases = profiles.map((profile) => profile.id.toLowerCase());
+  const canonicalIds: Array<string | undefined> = Array(profiles.length).fill(undefined);
+  const used = new Set<string>();
+  const baseOwner = new Map<string, number>();
+  rawBases.forEach((base, index) => {
+    if (base === "guest") return;
+    const current = baseOwner.get(base);
+    if (current === undefined || (profiles[index]!.id === base && profiles[current]!.id !== base)) {
+      baseOwner.set(base, index);
+    }
+  });
+  for (const [base, index] of baseOwner) {
+    canonicalIds[index] = base;
+    used.add(base);
+  }
+  const reserved = new Set([
+    "guest",
+    ...rawBases,
+    ...requestedPartitions.map((partitionId) => partitionId.toLowerCase()),
+  ]);
+  rawBases.forEach((base, index) => {
+    if (canonicalIds[index] !== undefined) return;
+    const id = suffixedBrowserProfileId(base, new Set([...reserved, ...used]));
+    canonicalIds[index] = id;
+    used.add(id);
+  });
+
+  const partitionWinner = new Map<string, number>();
+  requestedPartitions.forEach((partitionId, index) => {
+    const folded = partitionId.toLowerCase();
+    const current = partitionWinner.get(folded);
+    if (current === undefined) {
+      partitionWinner.set(folded, index);
+      return;
+    }
+    const score = (candidate: number) => canonicalIds[candidate] === folded ? 1 : 0;
+    if (score(index) > score(current)) partitionWinner.set(folded, index);
+  });
+
+  let effectivePartitions = requestedPartitions.map((partitionId, index) =>
+    partitionWinner.get(partitionId.toLowerCase()) === index ? partitionId : canonicalIds[index]!,
+  );
+  const conflictingIdOwners = new Set<number>();
+  canonicalIds.forEach((id, owner) => {
+    effectivePartitions.forEach((partitionId, partitionOwner) => {
+      if (partitionOwner !== owner && partitionId.toLowerCase() === id) conflictingIdOwners.add(owner);
+    });
+  });
+  const unavailable = new Set([...reserved, ...used]);
+  for (const owner of conflictingIdOwners) {
+    const id = suffixedBrowserProfileId(rawBases[owner]!, unavailable);
+    canonicalIds[owner] = id;
+    unavailable.add(id);
+  }
+  if (conflictingIdOwners.size > 0) {
+    effectivePartitions = requestedPartitions.map((partitionId, index) =>
+      partitionWinner.get(partitionId.toLowerCase()) === index ? partitionId : canonicalIds[index]!,
+    );
+  }
+
+  const aliases = new Map<string, string>();
+  const canonical: BrowserProfile[] = profiles.map((profile, index) => {
+    const id = canonicalIds[index]!;
+    const partitionId = effectivePartitions[index]!;
+    const migrated: BrowserProfile = { id, name: profile.name };
+    if (partitionId !== id) migrated.partitionId = partitionId;
+    if (!aliases.has(profile.id)) aliases.set(profile.id, id);
+    return migrated;
+  });
+  return { profiles: canonical, aliases };
+}
+
+const legacyBrowserProfilesSchema = z.array(legacyBrowserProfileSchema).max(20);
+const storedBrowserProfilesSchema = legacyBrowserProfilesSchema.transform(
+  (profiles) => migrateStoredBrowserProfiles(profiles).profiles,
+);
+const browserProfilesSchema = z.array(browserProfileSchema).max(20).superRefine((profiles, ctx) => {
+  const seen = new Set<string>();
+  profiles.forEach((profile, index) => {
+    if (!seen.has(profile.id)) {
+      seen.add(profile.id);
+      return;
+    }
+    ctx.addIssue({
+      code: "custom",
+      path: [index, "id"],
+      message: `browser profile id ${profile.id} is duplicated`,
+    });
+  });
+});
+
+export const DEFAULT_ANTIGRAVITY_PROXY_URL = "http://127.0.0.1:10808";
+export const ANTIGRAVITY_NETWORK_ROUTE_ENV = "OPENMAUSBOT_ANTIGRAVITY_NETWORK_ROUTE";
+export const ANTIGRAVITY_NETWORK_ROUTE_SEPARATOR = "|";
+export const ANTIGRAVITY_WORKER_A_INSTANCE_ID = "antigravity-worker-a";
+export const ANTIGRAVITY_WORKER_B_INSTANCE_ID = "antigravity-worker-b";
+const ANTIGRAVITY_WORKER_LABELS = {
+  a: "Antigravity A · Worker A",
+  b: "Antigravity B · Worker B",
+} as const;
+
+function antigravityWorkerCli(profile: "a" | "b"): string {
+  const packaged = process.env.OMB_RESOURCES_PATH
+    ? join(process.env.OMB_RESOURCES_PATH, "antigravity", `agy-worker-${profile}.exe`)
+    : null;
+  return packaged && existsSync(packaged)
+    ? packaged
+    : join(homedir(), ".openmausbot", "bin", `agy-worker-${profile}.exe`);
+}
+
+export type AntigravityNetworkMode = "off" | "tun" | "proxy";
+
+/** Normalize only an explicitly-portioned loopback HTTP(S) proxy URL. */
+export function normalizeAntigravityProxyUrl(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const input = value.trim();
+  const match = /^(https?):\/\/(\[[0-9a-f:.]+\]|[a-z0-9.-]+):(\d{1,5})(\/?)$/i.exec(input);
+  if (!match) return null;
+  const protocol = match[1]!.toLowerCase();
+  const host = match[2]!.toLowerCase();
+  if (host !== "127.0.0.1" && host !== "localhost" && host !== "[::1]") return null;
+  const port = Number(match[3]);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) return null;
+  try {
+    const parsed = new URL(input);
+    if (parsed.username || parsed.password || parsed.search || parsed.hash) return null;
+    if (parsed.pathname !== "" && parsed.pathname !== "/") return null;
+  } catch {
+    return null;
+  }
+  return `${protocol}://${host}:${port}`;
+}
+
+function canonicalAntigravityProxySettings(raw: {
+  mode?: AntigravityNetworkMode;
+  enabled?: boolean;
+  url?: string;
+} | undefined): { mode: AntigravityNetworkMode; url: string } {
+  const normalizedUrl = normalizeAntigravityProxyUrl(raw?.url);
+  if (raw?.url !== undefined && normalizedUrl === null) throw new Error("Invalid Antigravity proxy URL");
+  const mode = raw?.mode
+    ?? (raw?.enabled === true ? "proxy" : raw?.enabled === false ? "tun" : "off");
+  if (mode === "proxy" && normalizedUrl === null) throw new Error("Antigravity proxy URL is required in Proxy mode");
+  return { mode, url: normalizedUrl ?? DEFAULT_ANTIGRAVITY_PROXY_URL };
+}
+
+function canonicalAntigravityProxyPatch(raw: {
+  mode?: AntigravityNetworkMode;
+  enabled?: boolean;
+  url?: string;
+}): { mode: AntigravityNetworkMode; url?: string } {
+  const settings = canonicalAntigravityProxySettings(raw);
+  return settings.mode === "proxy" || raw.url !== undefined
+    ? settings
+    : { mode: settings.mode };
+}
+
+export function antigravityProxySettings(cfg: Pick<AppConfig, "features">): {
+  mode: AntigravityNetworkMode;
+  url: string;
+} {
+  try {
+    return canonicalAntigravityProxySettings(cfg.features?.antigravityProxy);
+  } catch {
+    return { mode: "off", url: DEFAULT_ANTIGRAVITY_PROXY_URL };
+  }
+}
+
+export function antigravityNetworkRoute(cfg: Pick<AppConfig, "features">): string {
+  const settings = antigravityProxySettings(cfg);
+  return settings.mode === "proxy"
+    ? `proxy${ANTIGRAVITY_NETWORK_ROUTE_SEPARATOR}${settings.url}`
+    : settings.mode;
+}
+
+export function normalizeAntigravityNetworkRoute(value: unknown): string {
+  if (value === "system") return "tun";
+  if (value === "off" || value === "tun") return value;
+  if (typeof value !== "string" || !value.startsWith(`proxy${ANTIGRAVITY_NETWORK_ROUTE_SEPARATOR}`)) return "off";
+  const url = normalizeAntigravityProxyUrl(value.slice(`proxy${ANTIGRAVITY_NETWORK_ROUTE_SEPARATOR}`.length));
+  return url ? `proxy${ANTIGRAVITY_NETWORK_ROUTE_SEPARATOR}${url}` : "off";
+}
+
 const featureConfigSchema = z.object({
   /** Experimental desktop workflow recorder. Hidden unless explicitly enabled. */
   skillRecorder: z.boolean().optional(),
   /** Show each tool run in the transcript. Off unless explicitly enabled. */
   showToolCalls: z.boolean().optional(),
+  /** Experimental built-in browser. Off until explicitly enabled; each bot
+   * also has its own switch. */
+  browser: z.boolean().optional(),
+  /** Shared Antigravity launcher route. `enabled` is a read-compatibility migration input. */
+  antigravityProxy: z.object({
+    mode: z.enum(["off", "tun", "proxy"]).optional(),
+    enabled: z.boolean().optional(),
+    url: z.string().optional().refine(
+      (value) => value === undefined || normalizeAntigravityProxyUrl(value) !== null,
+      "must be a local HTTP(S) proxy URL with an explicit port",
+    ),
+  }).strict().superRefine((value, ctx) => {
+    if ((value.mode === "proxy" || value.enabled === true) && value.url === undefined) {
+      ctx.addIssue({ code: "custom", path: ["url"], message: "is required when proxy routing is enabled" });
+    }
+  }).optional(),
 });
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
@@ -111,7 +341,11 @@ const appConfigSchema = z.object({
   rooms: roomConfigSchema.optional(),
   localVm: localVmConfigSchema.optional(),
   features: featureConfigSchema.optional(),
+  browserProfiles: browserProfilesSchema.optional(),
   instances: instanceConfigMapSchema.optional(),
+});
+const storedAppConfigSchema = appConfigSchema.extend({
+  browserProfiles: storedBrowserProfilesSchema.optional(),
 });
 const appConfigPatchSchema = appConfigSchema.omit({ instances: true });
 const jsonObjectSchema = z.record(z.string(), z.json());
@@ -135,10 +369,78 @@ export interface AppConfig {
    * separate container, durable workspace, viewer and lease. */
   localVm?: { mode?: "shared" | "per-bot"; maxInstances?: number };
   /** Opt-in product experiments. Every flag defaults to disabled. */
-  features?: { skillRecorder?: boolean; showToolCalls?: boolean };
+  features?: {
+    skillRecorder?: boolean;
+    showToolCalls?: boolean;
+    browser?: boolean;
+    antigravityProxy?: { mode?: AntigravityNetworkMode; enabled?: boolean; url?: string };
+  };
+  browserProfiles?: BrowserProfile[];
   instances?: InstanceConfigMap;
 }
+export type BrowserProfile = z.output<typeof browserProfileSchema> & {
+  partitionId?: string;
+};
 export type ConfigPatch = z.output<typeof appConfigPatchSchema>;
+
+export function browserProfilePartitionId(profile: BrowserProfile): string {
+  return profile.partitionId ?? profile.id;
+}
+
+export function browserProfileRoutingConflict(
+  profiles: readonly BrowserProfile[],
+): string | null {
+  const logicalOwner = new Map(profiles.map((profile, index) => [profile.id.toLowerCase(), index]));
+  const partitionOwner = new Map<string, number>();
+  for (const [index, profile] of profiles.entries()) {
+    const partitionId = browserProfilePartitionId(profile);
+    const foldedPartition = partitionId.toLowerCase();
+    const existingPartitionOwner = partitionOwner.get(foldedPartition);
+    if (existingPartitionOwner !== undefined && existingPartitionOwner !== index) {
+      return `browser profiles cannot share the durable session “${partitionId}”`;
+    }
+    partitionOwner.set(foldedPartition, index);
+    const otherLogicalOwner = logicalOwner.get(foldedPartition);
+    if (otherLogicalOwner !== undefined && otherLogicalOwner !== index) {
+      return `browser profile id “${profiles[otherLogicalOwner]!.id}” is already used by another durable session`;
+    }
+  }
+  return null;
+}
+
+export function browserProfileReplacementConflict(
+  currentProfiles: readonly BrowserProfile[],
+  nextProfiles: readonly BrowserProfile[],
+): string | null {
+  const routingConflict = browserProfileRoutingConflict(nextProfiles);
+  if (routingConflict) return routingConflict;
+  const currentIds = new Set(currentProfiles.map((profile) => profile.id));
+  const nextIds = new Set(nextProfiles.map((profile) => profile.id));
+  const removedPartitions = new Set(
+    currentProfiles
+      .filter((profile) => !nextIds.has(profile.id))
+      .map((profile) => browserProfilePartitionId(profile).toLowerCase()),
+  );
+  const reused = nextProfiles.find((profile) =>
+    !currentIds.has(profile.id)
+    && removedPartitions.has(browserProfilePartitionId(profile).toLowerCase()));
+  return reused
+    ? `browser profile “${reused.name}” cannot reuse a session that is being erased; delete it first, then add the new profile`
+    : null;
+}
+
+export interface BrowserProfilePartitionTarget {
+  profileId: string;
+  partitionId: string;
+}
+
+export function browserProfilePartitionTarget(
+  config: Pick<AppConfig, "browserProfiles">,
+  profileId: string,
+): BrowserProfilePartitionTarget | null {
+  const profile = config.browserProfiles?.find((candidate) => candidate.id === profileId);
+  return profile ? { profileId: profile.id, partitionId: browserProfilePartitionId(profile) } : null;
+}
 
 /** Replace the live config object exactly. In-place identity is retained for
  * existing readers, while optional keys removed by the new snapshot cannot
@@ -184,10 +486,20 @@ export function effectiveCustomEndpoints(cfg: AppConfig): Record<string, CustomE
   return result;
 }
 
+/** Validate stored configuration and canonicalize its Antigravity route. */
 export function parseStoredConfig(value: JsonValue): AppConfig {
-  const parsed = appConfigSchema.safeParse(sanitizeStoredCustomEndpointUrls(value).value);
+  const parsed = storedAppConfigSchema.safeParse(sanitizeStoredCustomEndpointUrls(value).value);
   if (!parsed.success) throw new Error(schemaIssue(parsed.error, "Invalid stored configuration"));
-  return parsed.data;
+  const proxy = parsed.data.features?.antigravityProxy;
+  if (proxy === undefined) return parsed.data;
+  try {
+    return {
+      ...parsed.data,
+      features: { ...parsed.data.features, antigravityProxy: canonicalAntigravityProxySettings(proxy) },
+    };
+  } catch {
+    throw new Error("Invalid stored configuration");
+  }
 }
 
 export function parseConfigPatch(value: JsonValue): ConfigPatch {
@@ -195,7 +507,16 @@ export function parseConfigPatch(value: JsonValue): ConfigPatch {
   if (!parsed.success) {
     throw Object.assign(new Error(schemaIssue(parsed.error, "Invalid configuration")), { status: 400 });
   }
-  return parsed.data;
+  const proxy = parsed.data.features?.antigravityProxy;
+  if (proxy === undefined) return parsed.data;
+  try {
+    return {
+      ...parsed.data,
+      features: { ...parsed.data.features, antigravityProxy: canonicalAntigravityProxyPatch(proxy) },
+    };
+  } catch {
+    throw Object.assign(new Error("Invalid configuration"), { status: 400 });
+  }
 }
 
 export function vpsSshAlias(cfg: AppConfig): string | null {
@@ -220,6 +541,10 @@ export function skillRecorderEnabled(cfg: AppConfig): boolean {
 
 export function showToolCallsEnabled(cfg: AppConfig): boolean {
   return cfg.features?.showToolCalls === true;
+}
+
+export function builtInBrowserEnabled(cfg: AppConfig): boolean {
+  return cfg.features?.browser === true;
 }
 
 // OMB_DATA_DIR isolates test/soak rigs from the user's real fleet.
@@ -588,12 +913,28 @@ export function saveConfig(patch: Partial<AppConfig>): void {
     /* first write */
   }
   const checkedPatch = appConfigSchema.partial().parse(patch);
+  const storedProfiles = storedBrowserProfilesSchema.safeParse(disk.browserProfiles);
+  if (storedProfiles.success) disk.browserProfiles = storedProfiles.data;
   for (const key of ["xai", "nvidia", "openrouter", "openaiCompat", "composio", "box", "opencodeGo", "tts", "imageGen", "profile", "rooms", "localVm", "features"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
     const merged: JsonObject = current.success ? { ...current.data } : {};
-    Object.assign(merged, section);
+    const featureSection = key === "features"
+      ? section as NonNullable<AppConfig["features"]>
+      : undefined;
+    if (featureSection?.antigravityProxy) {
+      const currentProxy = jsonObjectSchema.safeParse(merged.antigravityProxy);
+      const mergedProxy = {
+        ...(currentProxy.success ? currentProxy.data : {}),
+        ...featureSection.antigravityProxy,
+      };
+      merged.antigravityProxy = canonicalAntigravityProxySettings(mergedProxy);
+      const { antigravityProxy: _ignored, ...otherFeatures } = featureSection;
+      Object.assign(merged, otherFeatures);
+    } else {
+      Object.assign(merged, section);
+    }
     disk[key] = merged;
   }
   if (checkedPatch.customEndpoints) {
@@ -606,6 +947,21 @@ export function saveConfig(patch: Partial<AppConfig>): void {
     disk.customEndpoints = merged;
   }
   if (checkedPatch.vps !== undefined) disk.vps = normalizeVpsConfig(checkedPatch.vps);
+  if (checkedPatch.browserProfiles !== undefined) {
+    const existingProfiles = new Map(
+      (storedProfiles.success ? storedProfiles.data : []).map((profile) => [profile.id, profile]),
+    );
+    const nextProfiles: BrowserProfile[] = checkedPatch.browserProfiles.map((profile) => {
+      const partitionId = existingProfiles.get(profile.id)?.partitionId;
+      return partitionId ? { ...profile, partitionId } : profile;
+    });
+    const routingConflict = browserProfileReplacementConflict(
+      storedProfiles.success ? storedProfiles.data : [],
+      nextProfiles,
+    );
+    if (routingConflict) throw Object.assign(new Error(routingConflict), { status: 409 });
+    disk.browserProfiles = nextProfiles;
+  }
   if (checkedPatch.instances) {
     const currentInstances = jsonObjectSchema.safeParse(disk.instances);
     const diskInstances: JsonObject = currentInstances.success ? currentInstances.data : {};
@@ -715,7 +1071,22 @@ function injectedEnvironment(cfg: AppConfig, driver: string): Map<string, string
       if (key) environment.set(customEndpointKeyEnv(endpoint.id), key);
     }
   }
+  if (driver === "antigravityAgent") {
+    environment.set(ANTIGRAVITY_NETWORK_ROUTE_ENV, antigravityNetworkRoute(cfg));
+  }
   return environment;
+}
+
+export function loadBrowserProfileIdAliases(): ReadonlyMap<string, string> {
+  try {
+    const document = z.object({ browserProfiles: legacyBrowserProfilesSchema.optional() }).safeParse(
+      parseJson(readFileSync(join(DATA_DIR, "config.json"), "utf8")),
+    );
+    if (!document.success || !document.data.browserProfiles) return new Map();
+    return migrateStoredBrowserProfiles(document.data.browserProfiles).aliases;
+  } catch {
+    return new Map();
+  }
 }
 
 // Default fleet: one instance per built-in driver (upstream
@@ -744,7 +1115,8 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     cursor: { driver: "cursorAgent" },
     claude: { driver: "claudeAgent" },
     codex: { driver: "codex" },
-    antigravity: { driver: "antigravityAgent" },
+    [ANTIGRAVITY_WORKER_A_INSTANCE_ID]: { driver: "antigravityAgent" },
+    [ANTIGRAVITY_WORKER_B_INSTANCE_ID]: { driver: "antigravityAgent" },
     opencodeGo: { driver: "opencodeGo" },
     computer: { driver: "boxAgent" },
     openaiCompat: { driver: "openai-compat" },
@@ -767,6 +1139,36 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
   } as const;
   const configured = cfg.instances && Object.keys(cfg.instances).length ? cfg.instances : null;
   const map: InstanceConfigMap = configured ? { ...configured } : { ...DEFAULT_FLEET };
+  const antigravityFleetIsConfigured = !configured
+    || Object.hasOwn(configured, "antigravity")
+    || Object.hasOwn(configured, ANTIGRAVITY_WORKER_A_INSTANCE_ID)
+    || Object.hasOwn(configured, ANTIGRAVITY_WORKER_B_INSTANCE_ID);
+  if (antigravityFleetIsConfigured) {
+    const legacy = map.antigravity;
+    delete map.antigravity;
+    const workerEntry = (profile: "a" | "b", source: InstanceConfigMap[string] | undefined) => {
+      const rawConfig = source?.config && typeof source.config === "object" && !Array.isArray(source.config)
+        ? source.config as Record<string, unknown>
+        : {};
+      return {
+        ...(source ?? { driver: "antigravityAgent" }),
+        driver: "antigravityAgent",
+        displayName: ANTIGRAVITY_WORKER_LABELS[profile],
+        config: {
+          ...rawConfig,
+          cli: antigravityWorkerCli(profile),
+        },
+      };
+    };
+    map[ANTIGRAVITY_WORKER_A_INSTANCE_ID] = workerEntry(
+      "a",
+      map[ANTIGRAVITY_WORKER_A_INSTANCE_ID] ?? legacy,
+    );
+    map[ANTIGRAVITY_WORKER_B_INSTANCE_ID] = workerEntry(
+      "b",
+      map[ANTIGRAVITY_WORKER_B_INSTANCE_ID] ?? legacy,
+    );
+  }
   // Product fleets pick up newly shipped engines. A one-off test/shadow map
   // (no claude/grok/codex) is left exactly as written.
   if (

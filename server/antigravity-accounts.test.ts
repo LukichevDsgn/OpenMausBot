@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,6 +13,7 @@ process.env.USERPROFILE = testProfileRoot;
 const {
   antigravityManagedQuotaRefreshRunning,
   antigravityManagedWorkerRunning,
+  antigravityHelperPath,
   nextAntigravityQuotaStaleState,
   parseAntigravityUsage,
   registerManagedAntigravityWorker,
@@ -21,6 +22,7 @@ const {
   withAntigravityCredentialLock,
   withManagedAntigravityQuotaRefresh,
   refreshAntigravityProfileQuota,
+  readAntigravityAccountEmail,
   antigravityAccountStatuses,
 } = await import("./antigravity-accounts.ts");
 
@@ -33,6 +35,35 @@ afterAll(() => {
 beforeEach(() => execCliTreeMock.mockReset());
 
 describe("Antigravity account coordination", () => {
+  it("reads private account labels without embedding them in source defaults", () => {
+    const labelsDir = join(testProfileRoot, ".openmausbot");
+    mkdirSync(labelsDir, { recursive: true });
+    writeFileSync(join(labelsDir, "antigravity-account-labels.json"), JSON.stringify({
+      a: "worker-a@example.test",
+      b: "not-an-email",
+    }));
+
+    expect(readAntigravityAccountEmail("a")).toBe("worker-a@example.test");
+    expect(readAntigravityAccountEmail("b")).toBeUndefined();
+  });
+
+  it("prefers helpers shipped beside the packaged server over stale user-bin copies", () => {
+    const root = mkdtempSync(join(tmpdir(), "openmaus-antigravity-resources-"));
+    const helpers = join(root, "antigravity");
+    mkdirSync(helpers, { recursive: true });
+    const packaged = join(helpers, "agy-worker-a.exe");
+    writeFileSync(packaged, "packaged");
+    const previous = process.env.OMB_RESOURCES_PATH;
+    process.env.OMB_RESOURCES_PATH = root;
+    try {
+      expect(antigravityHelperPath("agy-worker-a.exe")).toBe(packaged);
+    } finally {
+      if (previous === undefined) delete process.env.OMB_RESOURCES_PATH;
+      else process.env.OMB_RESOURCES_PATH = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps a failed refresh stale across cache reads until a successful refresh", () => {
     const failed = nextAntigravityQuotaStaleState(false, "failure");
     const normalCacheRead = nextAntigravityQuotaStaleState(failed, "unchanged");
@@ -141,13 +172,16 @@ describe("Antigravity account coordination", () => {
       },
     });
     execCliTreeMock.mockResolvedValueOnce({ stdout: output, stderr: "" });
-    await refreshAntigravityProfileQuota("a");
+    await refreshAntigravityProfileQuota("a", "proxy|http://127.0.0.1:10808");
     expect(execCliTreeMock).toHaveBeenLastCalledWith(
       expect.stringContaining("agy-worker-a.exe"),
       ["--print", "/usage", "--output-format", "json"],
       expect.objectContaining({
         windowsHide: true,
         timeout: 30_000,
+        env: expect.objectContaining({
+          OPENMAUSBOT_ANTIGRAVITY_NETWORK_ROUTE: "proxy|http://127.0.0.1:10808",
+        }),
         completionPredicate: expect.any(Function),
       }),
     );

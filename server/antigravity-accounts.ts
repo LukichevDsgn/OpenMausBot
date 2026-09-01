@@ -6,14 +6,11 @@ import { execCliTree } from "./procs.ts";
 
 const execFileAsync = promisify(execFile);
 const BIN = `${process.env.USERPROFILE ?? ""}\\.openmausbot\\bin`;
-const PACKAGED_VAULT = process.env.OMB_RESOURCES_PATH
-  ? join(process.env.OMB_RESOURCES_PATH, "antigravity", "agy-account-vault.exe")
-  : null;
-const VAULT = PACKAGED_VAULT && existsSync(PACKAGED_VAULT)
-  ? PACKAGED_VAULT
-  : `${BIN}\\agy-account-vault.exe`;
 const QUOTA_CACHE_FILE = `${process.env.USERPROFILE ?? ""}\\.openmausbot\\antigravity-quota-cache.json`;
+const ACCOUNT_LABELS_FILE = `${process.env.USERPROFILE ?? ""}\\.openmausbot\\antigravity-account-labels.json`;
 const QUOTA_PROBE_ARGS = ["--print", "/usage", "--output-format", "json"] as const;
+const ACCOUNT_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[A-Za-z]{2,}$/;
+const NETWORK_ROUTE_ENV = "OPENMAUSBOT_ANTIGRAVITY_NETWORK_ROUTE";
 
 export type AntigravityProfile = "a" | "b";
 
@@ -42,6 +39,42 @@ const PROFILES = {
   a: { instanceId: "antigravity-worker-a", label: "Antigravity A · Worker A" },
   b: { instanceId: "antigravity-worker-b", label: "Antigravity B · Worker B" },
 } as const;
+
+/** Read optional private labels from the user's local OpenMaus data. The file
+ * is intentionally outside the repository so account addresses never become
+ * source defaults or PR content. Malformed values fall back to Worker A/B. */
+export function readAntigravityAccountEmail(profile: AntigravityProfile): string | undefined {
+  try {
+    const labels = JSON.parse(readFileSync(ACCOUNT_LABELS_FILE, "utf8")) as Record<string, unknown>;
+    const value = labels[profile];
+    if (typeof value !== "string") return undefined;
+    const email = value.trim();
+    return email.length <= 320 && ACCOUNT_EMAIL_RE.test(email) ? email : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function profileMeta(profile: AntigravityProfile) {
+  const email = readAntigravityAccountEmail(profile);
+  return email ? { ...PROFILES[profile], email } : PROFILES[profile];
+}
+
+/** Resolve account helpers from the running packaged build first. The user
+ * bin is only a development/legacy fallback; letting stale copies win makes
+ * model turns use one launcher while quota refresh silently uses another. */
+export function antigravityHelperPath(
+  name: "agy-account-vault.exe" | "agy-worker-a.exe" | "agy-worker-b.exe",
+): string {
+  const packaged = process.env.OMB_RESOURCES_PATH
+    ? join(process.env.OMB_RESOURCES_PATH, "antigravity", name)
+    : null;
+  return packaged && existsSync(packaged) ? packaged : `${BIN}\\${name}`;
+}
+
+function launcherForProfile(profile: AntigravityProfile): string {
+  return antigravityHelperPath(`agy-worker-${profile}.exe`);
+}
 const quotaCache = new Map<AntigravityProfile, AntigravityAccountStatus["quota"]>();
 const quotaRefreshFailures = new Set<AntigravityProfile>();
 let credentialQueue: Promise<void> = Promise.resolve();
@@ -265,7 +298,11 @@ function hasCompleteAntigravityUsage(stdout: string): boolean {
 
 /** Invoke the local account vault with bounded Windows process settings. */
 async function runVault(...args: string[]) {
-  return execFileAsync(VAULT, args, { windowsHide: true, timeout: 10_000, encoding: "utf8" });
+  return execFileAsync(antigravityHelperPath("agy-account-vault.exe"), args, {
+    windowsHide: true,
+    timeout: 10_000,
+    encoding: "utf8",
+  });
 }
 
 /** Read the currently active Antigravity profile, or null when unavailable. */
@@ -297,11 +334,20 @@ export async function antigravityProcessRunning(): Promise<boolean> {
 }
 
 /** Collect both account statuses while preserving the originally active profile. */
-async function accountStatusesUnlocked(refresh: boolean): Promise<AntigravityAccountStatus[]> {
+function quotaProbeEnvironment(networkRoute?: string): NodeJS.ProcessEnv {
+  return networkRoute
+    ? { ...process.env, [NETWORK_ROUTE_ENV]: networkRoute }
+    : process.env;
+}
+
+async function accountStatusesUnlocked(
+  refresh: boolean,
+  networkRoute?: string,
+): Promise<AntigravityAccountStatus[]> {
   const originallyActive = await activeAntigravityProfile();
   const statuses: AntigravityAccountStatus[] = [];
   for (const profile of ["a", "b"] as const) {
-    const meta = PROFILES[profile];
+    const meta = profileMeta(profile);
     const cached = quotaCache.get(profile) ?? emptyQuota();
     try {
       await runVault("exists", profile);
@@ -322,9 +368,10 @@ async function accountStatusesUnlocked(refresh: boolean): Promise<AntigravityAcc
         // The profile launcher owns the complete activate -> agy -> capture
         // sequence under a machine-wide mutex. Doing either credential copy
         // here would race a live wrapper between its own atomic operations.
-        const launcher = `${BIN}\\agy-worker-${profile}.exe`;
+        const launcher = launcherForProfile(profile);
         const { stdout } = await execCliTree(launcher, [...QUOTA_PROBE_ARGS], {
           windowsHide: true, timeout: 30_000, maxBuffer: 1024 * 1024,
+          env: quotaProbeEnvironment(networkRoute),
           completionPredicate: (output) => hasCompleteAntigravityUsage(output),
         });
         quota = parseAntigravityUsage(stdout);
@@ -359,24 +406,31 @@ async function accountStatusesUnlocked(refresh: boolean): Promise<AntigravityAcc
 }
 
 /** Return cached statuses or perform a serialized A/B quota refresh. */
-export async function antigravityAccountStatuses(refresh = false): Promise<AntigravityAccountStatus[]> {
-  if (!refresh) return accountStatusesUnlocked(false);
+export async function antigravityAccountStatuses(
+  refresh = false,
+  networkRoute?: string,
+): Promise<AntigravityAccountStatus[]> {
+  if (!refresh) return accountStatusesUnlocked(false, networkRoute);
   return withAntigravityAccountRefreshSingleFlight(() =>
     withAntigravityCredentialLock(() =>
-      withManagedAntigravityQuotaRefresh(() => accountStatusesUnlocked(true)),
+      withManagedAntigravityQuotaRefresh(() => accountStatusesUnlocked(true, networkRoute)),
     ),
   );
 }
 
 /** Refresh the selected profile. Antigravity auth is global, so activation is
  * required even though each launcher supplies an isolated USERPROFILE. */
-export async function refreshAntigravityProfileQuota(profile: AntigravityProfile): Promise<void> {
+export async function refreshAntigravityProfileQuota(
+  profile: AntigravityProfile,
+  networkRoute?: string,
+): Promise<void> {
   return withAntigravityCredentialLock(() =>
     withManagedAntigravityQuotaRefresh(async () => {
-      const launcher = `${BIN}\\agy-worker-${profile}.exe`;
+      const launcher = launcherForProfile(profile);
       try {
         const { stdout } = await execCliTree(launcher, [...QUOTA_PROBE_ARGS], {
           windowsHide: true, timeout: 30_000, maxBuffer: 1024 * 1024,
+          env: quotaProbeEnvironment(networkRoute),
           completionPredicate: (output) => hasCompleteAntigravityUsage(output),
         });
         quotaCache.set(profile, parseAntigravityUsage(stdout));
