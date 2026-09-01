@@ -103,6 +103,7 @@ function ModelSearch({
   );
 }
 
+/** Render model selection, Antigravity account status, and network controls. */
 export function ModelPicker({
   bot,
   className,
@@ -201,6 +202,7 @@ export function ModelPicker({
     resetList();
   };
 
+  /** Activate a selected Antigravity profile before changing the bot model. */
   const pick = async (instance: InstanceInfo, model: string) => {
     const account = agyAccounts.find((candidate) => candidate.instanceId === instance.instanceId);
     if (account) {
@@ -234,6 +236,7 @@ export function ModelPicker({
     setOpen(false);
   };
 
+  /** Refresh both Antigravity account quota snapshots on explicit request. */
   const refreshAgyQuotas = async () => {
     setAgyBusy(true);
     setAgyError(null);
@@ -251,6 +254,7 @@ export function ModelPicker({
     }
   };
 
+  /** Persist one Antigravity network-mode or proxy-URL change. */
   const saveAgyProxy = async (patch: { mode?: "off" | "tun" | "proxy"; url?: string }) => {
     if (agyProxySaving) return;
     setAgyProxySaving(true);
@@ -273,6 +277,7 @@ export function ModelPicker({
     }
   };
 
+  /** Select Off, TUN, or Proxy and persist the route when it changes. */
   const selectAgyProxyMode = (mode: "off" | "tun" | "proxy") => {
     if (mode === antigravityProxy.mode) return;
     void saveAgyProxy(mode === "proxy"
@@ -280,6 +285,7 @@ export function ModelPicker({
       : { mode });
   };
 
+  /** Persist a changed proxy URL after the input loses focus. */
   const saveAgyProxyUrl = () => {
     if (antigravityProxy.mode !== "proxy" || agyProxyDraft.trim() === antigravityProxy.url) return;
     void saveAgyProxy({ mode: "proxy", url: agyProxyDraft });

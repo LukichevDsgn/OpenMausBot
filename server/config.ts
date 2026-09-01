@@ -237,6 +237,7 @@ export function normalizeAntigravityProxyUrl(value: unknown): string | null {
   return `${protocol}://${host}:${port}`;
 }
 
+/** Resolve legacy and explicit network settings to one canonical route. */
 function canonicalAntigravityProxySettings(raw: {
   mode?: AntigravityNetworkMode;
   enabled?: boolean;
@@ -252,6 +253,7 @@ function canonicalAntigravityProxySettings(raw: {
   return { mode, url: normalizedUrl ?? DEFAULT_ANTIGRAVITY_PROXY_URL };
 }
 
+/** Normalize a partial network-mode patch without forcing an absent URL. */
 function canonicalAntigravityProxyPatch(raw: {
   mode?: AntigravityNetworkMode;
   enabled?: boolean;
@@ -263,6 +265,7 @@ function canonicalAntigravityProxyPatch(raw: {
     : { mode: settings.mode };
 }
 
+/** Return canonical Antigravity proxy settings, failing closed to Off. */
 export function antigravityProxySettings(cfg: Pick<AppConfig, "features">): {
   mode: AntigravityNetworkMode;
   url: string;
@@ -469,6 +472,7 @@ export function browserProfilePartitionTarget(
   return profile ? { profileId: profile.id, partitionId: browserProfilePartitionId(profile) } : null;
 }
 
+/** Validate stored configuration and canonicalize its Antigravity route. */
 export function parseStoredConfig(value: JsonValue): AppConfig {
   const parsed = storedAppConfigSchema.safeParse(value);
   if (!parsed.success) throw new Error(schemaIssue(parsed.error, "Invalid stored configuration"));
@@ -499,6 +503,7 @@ export function loadBrowserProfileIdAliases(): ReadonlyMap<string, string> {
   }
 }
 
+/** Validate a config patch and canonicalize its Antigravity route. */
 export function parseConfigPatch(value: JsonValue): ConfigPatch {
   const parsed = appConfigPatchSchema.safeParse(value);
   if (!parsed.success) {

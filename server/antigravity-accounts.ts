@@ -48,10 +48,12 @@ export function registerManagedAntigravityWorker(pid: number | undefined): void 
   if (pid && Number.isInteger(pid) && pid > 0) managedWorkerProcesses.add(pid);
 }
 
+/** Remove a worker process from the server-owned Antigravity set. */
 export function unregisterManagedAntigravityWorker(pid: number | undefined): void {
   if (pid) managedWorkerProcesses.delete(pid);
 }
 
+/** Report whether an OpenMaus-managed Antigravity worker is still running. */
 export function antigravityManagedWorkerRunning(): boolean {
   return managedWorkerProcesses.size > 0;
 }
@@ -64,10 +66,12 @@ export function withAntigravityCredentialLock<T>(operation: () => Promise<T>): P
   return result;
 }
 
+/** Report whether account quota telemetry currently owns the credential lane. */
 export function antigravityManagedQuotaRefreshRunning(): boolean {
   return managedQuotaRefreshes > 0 || accountRefreshInFlight !== null;
 }
 
+/** Run one quota operation while exposing its in-flight state to callers. */
 export async function withManagedAntigravityQuotaRefresh<T>(operation: () => Promise<T>): Promise<T> {
   managedQuotaRefreshes += 1;
   try {
@@ -77,6 +81,7 @@ export async function withManagedAntigravityQuotaRefresh<T>(operation: () => Pro
   }
 }
 
+/** Coalesce concurrent account status refreshes into one promise. */
 export function withAntigravityAccountRefreshSingleFlight(
   operation: () => Promise<AntigravityAccountStatus[]>,
 ): Promise<AntigravityAccountStatus[]> {
@@ -89,6 +94,7 @@ export function withAntigravityAccountRefreshSingleFlight(
   return tracked;
 }
 
+/** Create an empty quota shape for accounts without cached usage data. */
 function emptyQuota(): AntigravityAccountStatus["quota"] {
   return {
     gemini: { weekly: null, fiveHour: null },
@@ -96,6 +102,7 @@ function emptyQuota(): AntigravityAccountStatus["quota"] {
   };
 }
 
+/** Load cached account quotas, ignoring missing or malformed cache files. */
 function loadQuotaCache() {
   try {
     // SAFETY: every entry is validated by profile key before being placed in
@@ -109,6 +116,7 @@ function loadQuotaCache() {
   }
 }
 
+/** Persist the last known quota values for the two Antigravity profiles. */
 function saveQuotaCache() {
   mkdirSync(dirname(QUOTA_CACHE_FILE), { recursive: true });
   writeFileSync(QUOTA_CACHE_FILE, JSON.stringify(Object.fromEntries(quotaCache), null, 2), "utf8");
@@ -116,6 +124,7 @@ function saveQuotaCache() {
 
 loadQuotaCache();
 
+/** Parse tab-separated Antigravity usage output into the UI quota shape. */
 export function parseAntigravityUsage(output: string) {
   const result = emptyQuota();
   for (const line of output.split(/\r?\n/)) {
@@ -133,10 +142,12 @@ export function parseAntigravityUsage(output: string) {
   return result;
 }
 
+/** Invoke the local account vault with bounded Windows process settings. */
 async function runVault(...args: string[]) {
   return execFileAsync(VAULT, args, { windowsHide: true, timeout: 10_000, encoding: "utf8" });
 }
 
+/** Read the currently active Antigravity profile, or null when unavailable. */
 export async function activeAntigravityProfile(): Promise<AntigravityProfile | null> {
   try {
     const { stdout } = await runVault("which");
@@ -147,10 +158,12 @@ export async function activeAntigravityProfile(): Promise<AntigravityProfile | n
   }
 }
 
+/** Activate one of the two machine-wide Antigravity credential profiles. */
 export async function activateAntigravityProfile(profile: AntigravityProfile): Promise<void> {
   await runVault("activate", profile);
 }
 
+/** Detect any running Antigravity CLI process without throwing on probe failure. */
 export async function antigravityProcessRunning(): Promise<boolean> {
   try {
     const { stdout } = await execFileAsync("tasklist.exe", ["/FI", "IMAGENAME eq agy.exe", "/NH"], {
@@ -162,6 +175,7 @@ export async function antigravityProcessRunning(): Promise<boolean> {
   }
 }
 
+/** Collect both account statuses while preserving the originally active profile. */
 async function accountStatusesUnlocked(refresh: boolean): Promise<AntigravityAccountStatus[]> {
   const originallyActive = await activeAntigravityProfile();
   const statuses: AntigravityAccountStatus[] = [];
@@ -218,6 +232,7 @@ async function accountStatusesUnlocked(refresh: boolean): Promise<AntigravityAcc
   return statuses;
 }
 
+/** Return cached statuses or perform a serialized A/B quota refresh. */
 export async function antigravityAccountStatuses(refresh = false): Promise<AntigravityAccountStatus[]> {
   if (!refresh) return accountStatusesUnlocked(false);
   return withAntigravityAccountRefreshSingleFlight(() =>
@@ -242,6 +257,7 @@ export async function refreshAntigravityProfileQuota(profile: AntigravityProfile
   );
 }
 
+/** Map a server instance id to its isolated Antigravity account profile. */
 export function profileForInstance(instanceId: string): AntigravityProfile | null {
   if (instanceId === PROFILES.a.instanceId) return "a";
   if (instanceId === PROFILES.b.instanceId) return "b";

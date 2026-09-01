@@ -99,12 +99,14 @@ export const STATIC_ANTIGRAVITY_MODELS: ModelCatalog = {
   ],
 };
 
+/** Remove the HTTP/2 workaround token before applying a new network route. */
 function removeAntigravityGodebugToken(value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
   const remaining = value.split(",").filter((token) => token.trim() !== "http2client=0");
   return remaining.length > 0 ? remaining.join(",") : undefined;
 }
 
+/** Apply the normalized Off, TUN, or explicit proxy route to a child env. */
 function applyAntigravityNetworkRoute(env: NodeJS.ProcessEnv, rawRoute: unknown): string {
   const route = normalizeAntigravityNetworkRoute(rawRoute);
   env[ANTIGRAVITY_NETWORK_ROUTE_ENV] = route;
@@ -130,6 +132,7 @@ function applyAntigravityNetworkRoute(env: NodeJS.ProcessEnv, rawRoute: unknown)
   return route;
 }
 
+/** Probe the selected proxy endpoint and return a user-actionable failure. */
 export function antigravityProxyUnavailableReason(
   rawRoute: unknown,
   connect: ProxyConnectionFactory = createConnection,
@@ -169,6 +172,7 @@ export function antigravityProxyUnavailableReason(
   });
 }
 
+/** Build the isolated Antigravity child environment and apply its route. */
 function antigravityEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, PATH: augmentedPath(), ...overrides };
   // The launcher consumes one stable, non-secret route value. Normalize direct
@@ -480,6 +484,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
   decodeConfig,
   defaultConfig: () => decodeConfig({}),
 
+  /** Create an Antigravity instance with isolated environment and MCP state. */
   async create(input: DriverCreateInput<AntigravityConfig>): Promise<ProviderInstance> {
     const { instanceId, config } = input;
     const env = antigravityEnvironment(input.environment);
@@ -543,6 +548,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       createdAt: new Date().toISOString(),
     });
 
+    /** Send one bounded prompt through the Antigravity stream process. */
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
       if (disposed) throw new Error("Antigravity instance is disposed");
@@ -909,6 +915,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       return { turnId };
     };
 
+    /** Report CLI and proxy availability without starting a provider turn. */
     const snapshot = async (): Promise<ProviderSnapshot> => {
       const proxyUnavailable = await antigravityProxyUnavailableReason(env[ANTIGRAVITY_NETWORK_ROUTE_ENV]);
       if (proxyUnavailable) return { state: "unavailable", reason: proxyUnavailable };
@@ -928,6 +935,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       return { state: "available", version };
     };
 
+    /** Generate text through the same route and CLI checks as a normal turn. */
     const generateText = async (prompt: string): Promise<string> => {
       const proxyUnavailable = await antigravityProxyUnavailableReason(env[ANTIGRAVITY_NETWORK_ROUTE_ENV]);
       if (proxyUnavailable) throw new Error(proxyUnavailable);

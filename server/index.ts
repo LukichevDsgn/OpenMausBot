@@ -4836,6 +4836,7 @@ async function perBotLocalVmCountForModeChange(): Promise<number | null> {
   return existingPerBotLocalVmCount(runtime.runtime);
 }
 
+/** Build the non-secret config snapshot consumed by the renderer. */
 function configStatus() {
   return {
     xai: { configured: Boolean(cfg.xai?.key) },
