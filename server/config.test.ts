@@ -1,10 +1,13 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   ANTIGRAVITY_NETWORK_ROUTE_ENV,
+  ANTIGRAVITY_WORKER_A_INSTANCE_ID,
+  ANTIGRAVITY_WORKER_B_INSTANCE_ID,
   DEFAULT_ANTIGRAVITY_PROXY_URL,
   customMcpServers,
   DATA_DIR,
@@ -577,6 +580,70 @@ describe("Instance CLI override", () => {
     const custom = { instances: { claude: { driver: "claudeAgent", environment: { MY_FLAG: "1" } } } };
     const kept = withInstanceCli(custom, "claude", "/x");
     expect(kept.config.instances!.claude.environment).toEqual({ MY_FLAG: "1" });
+  });
+});
+
+describe("default fleet", () => {
+  it("publishes selectable Antigravity A/B workers and migrates the legacy aggregate config", () => {
+    const defaults = instanceConfigs({});
+    expect(defaults.antigravity).toBeUndefined();
+    expect(defaults[ANTIGRAVITY_WORKER_A_INSTANCE_ID]).toMatchObject({
+      driver: "antigravityAgent",
+      displayName: "Antigravity A · Worker A",
+    });
+    expect(defaults[ANTIGRAVITY_WORKER_B_INSTANCE_ID]).toMatchObject({
+      driver: "antigravityAgent",
+      displayName: "Antigravity B · Worker B",
+    });
+    expect(defaults[ANTIGRAVITY_WORKER_A_INSTANCE_ID]?.config).toEqual(expect.objectContaining({
+      cli: expect.stringMatching(/agy-worker-a\.exe$/i),
+    }));
+    expect(defaults[ANTIGRAVITY_WORKER_B_INSTANCE_ID]?.config).toEqual(expect.objectContaining({
+      cli: expect.stringMatching(/agy-worker-b\.exe$/i),
+    }));
+
+    const migrated = instanceConfigs({
+      instances: {
+        antigravity: {
+          driver: "antigravityAgent",
+          displayName: "Antigravity",
+          environment: { CUSTOM_FLAG: "keep" },
+          config: { helperMode: "legacy" },
+        },
+      },
+    });
+    expect(migrated.antigravity).toBeUndefined();
+    expect(migrated[ANTIGRAVITY_WORKER_A_INSTANCE_ID]).toMatchObject({
+      displayName: "Antigravity A · Worker A",
+      config: { helperMode: "legacy", cli: expect.stringMatching(/agy-worker-a\.exe$/i) },
+      environment: expect.objectContaining({ CUSTOM_FLAG: "keep", [ANTIGRAVITY_NETWORK_ROUTE_ENV]: "off" }),
+    });
+    expect(migrated[ANTIGRAVITY_WORKER_B_INSTANCE_ID]).toMatchObject({
+      displayName: "Antigravity B · Worker B",
+      config: { helperMode: "legacy", cli: expect.stringMatching(/agy-worker-b\.exe$/i) },
+      environment: expect.objectContaining({ CUSTOM_FLAG: "keep", [ANTIGRAVITY_NETWORK_ROUTE_ENV]: "off" }),
+    });
+  });
+
+  it("routes a packaged fleet to its shipped A/B helper binaries", () => {
+    const root = mkdtempSync(join(tmpdir(), "openmaus-antigravity-resources-"));
+    const resources = join(root, "antigravity");
+    mkdirSync(resources, { recursive: true });
+    writeFileSync(join(resources, "agy-worker-a.exe"), "fake-a");
+    writeFileSync(join(resources, "agy-worker-b.exe"), "fake-b");
+    const previous = process.env.OMB_RESOURCES_PATH;
+    process.env.OMB_RESOURCES_PATH = root;
+    try {
+      const instances = instanceConfigs({});
+      expect((instances[ANTIGRAVITY_WORKER_A_INSTANCE_ID]?.config as { cli?: string } | undefined)?.cli)
+        .toBe(join(resources, "agy-worker-a.exe"));
+      expect((instances[ANTIGRAVITY_WORKER_B_INSTANCE_ID]?.config as { cli?: string } | undefined)?.cli)
+        .toBe(join(resources, "agy-worker-b.exe"));
+    } finally {
+      if (previous === undefined) delete process.env.OMB_RESOURCES_PATH;
+      else process.env.OMB_RESOURCES_PATH = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

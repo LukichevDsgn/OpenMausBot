@@ -1,12 +1,17 @@
 import { execFile } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { execCliTree } from "./procs.ts";
 
 const execFileAsync = promisify(execFile);
 const BIN = `${process.env.USERPROFILE ?? ""}\\.openmausbot\\bin`;
-const VAULT = `${BIN}\\agy-account-vault.exe`;
+const PACKAGED_VAULT = process.env.OMB_RESOURCES_PATH
+  ? join(process.env.OMB_RESOURCES_PATH, "antigravity", "agy-account-vault.exe")
+  : null;
+const VAULT = PACKAGED_VAULT && existsSync(PACKAGED_VAULT)
+  ? PACKAGED_VAULT
+  : `${BIN}\\agy-account-vault.exe`;
 const QUOTA_CACHE_FILE = `${process.env.USERPROFILE ?? ""}\\.openmausbot\\antigravity-quota-cache.json`;
 
 export type AntigravityProfile = "a" | "b";
@@ -27,14 +32,16 @@ export interface AntigravityAccountStatus {
     gemini: { weekly: QuotaWindow | null; fiveHour: QuotaWindow | null };
     other: { weekly: QuotaWindow | null; fiveHour: QuotaWindow | null };
   };
+  quotaStale?: boolean;
   error?: string;
 }
 
 const PROFILES = {
-  a: { instanceId: "antigravity-worker-a", label: "Antigravity A · Worker A", email: "lukichev.eng@gmail.com" },
-  b: { instanceId: "antigravity-worker-b", label: "Antigravity B · Worker B", email: "necaja12@gmail.com" },
+  a: { instanceId: "antigravity-worker-a", label: "Antigravity A · Worker A" },
+  b: { instanceId: "antigravity-worker-b", label: "Antigravity B · Worker B" },
 } as const;
 const quotaCache = new Map<AntigravityProfile, AntigravityAccountStatus["quota"]>();
+const quotaRefreshFailures = new Set<AntigravityProfile>();
 let credentialQueue: Promise<void> = Promise.resolve();
 let managedQuotaRefreshes = 0;
 let accountRefreshInFlight: Promise<AntigravityAccountStatus[]> | null = null;
@@ -100,6 +107,24 @@ function emptyQuota(): AntigravityAccountStatus["quota"] {
     gemini: { weekly: null, fiveHour: null },
     other: { weekly: null, fiveHour: null },
   };
+}
+
+export function nextAntigravityQuotaStaleState(
+  current: boolean,
+  outcome: "unchanged" | "success" | "failure",
+): boolean {
+  if (outcome === "failure") return true;
+  if (outcome === "success") return false;
+  return current;
+}
+
+function recordAntigravityQuotaRefresh(
+  profile: AntigravityProfile,
+  outcome: "success" | "failure",
+): void {
+  const stale = nextAntigravityQuotaStaleState(quotaRefreshFailures.has(profile), outcome);
+  if (stale) quotaRefreshFailures.add(profile);
+  else quotaRefreshFailures.delete(profile);
 }
 
 /** Load cached account quotas, ignoring missing or malformed cache files. */
@@ -184,11 +209,12 @@ async function accountStatusesUnlocked(refresh: boolean): Promise<AntigravityAcc
     const cached = quotaCache.get(profile) ?? emptyQuota();
     try {
       await runVault("exists", profile);
-    } catch (error) {
+    } catch {
       statuses.push({
-        profile, ...meta, active: originallyActive === profile, available: false,
+        profile, ...meta, email: "", active: originallyActive === profile, available: false,
         quota: cached,
-        error: error instanceof Error ? error.message : String(error),
+        quotaStale: quotaRefreshFailures.has(profile),
+        error: "Account helper is unavailable.",
       });
       continue;
     }
@@ -206,16 +232,19 @@ async function accountStatusesUnlocked(refresh: boolean): Promise<AntigravityAcc
         });
         quota = parseAntigravityUsage(stdout);
         quotaCache.set(profile, quota);
+        recordAntigravityQuotaRefresh(profile, "success");
         saveQuotaCache();
-      } catch (error) {
+      } catch {
         // A quota request can be rejected by region, VPN, rate limit or OAuth
         // without making the launcher/profile disappear. Keep the last known
         // good quota and report the refresh failure separately.
-        refreshError = error instanceof Error ? error.message : String(error);
+        recordAntigravityQuotaRefresh(profile, "failure");
+        refreshError = "Quota refresh failed.";
       }
     }
     const status: AntigravityAccountStatus = {
-      profile, ...meta, active: originallyActive === profile, available: true, quota,
+      profile, ...meta, email: "", active: originallyActive === profile, available: true, quota,
+      quotaStale: quotaRefreshFailures.has(profile),
     };
     if (refreshError) status.error = refreshError;
     statuses.push(status);
@@ -248,11 +277,17 @@ export async function refreshAntigravityProfileQuota(profile: AntigravityProfile
   return withAntigravityCredentialLock(() =>
     withManagedAntigravityQuotaRefresh(async () => {
       const launcher = `${BIN}\\agy-worker-${profile}.exe`;
-      const { stdout } = await execCliTree(launcher, ["--print", "/usage"], {
-        windowsHide: true, timeout: 30_000, maxBuffer: 1024 * 1024,
-      });
-      quotaCache.set(profile, parseAntigravityUsage(stdout));
-      saveQuotaCache();
+      try {
+        const { stdout } = await execCliTree(launcher, ["--print", "/usage"], {
+          windowsHide: true, timeout: 30_000, maxBuffer: 1024 * 1024,
+        });
+        quotaCache.set(profile, parseAntigravityUsage(stdout));
+        recordAntigravityQuotaRefresh(profile, "success");
+        saveQuotaCache();
+      } catch (error) {
+        recordAntigravityQuotaRefresh(profile, "failure");
+        throw error;
+      }
     }),
   );
 }

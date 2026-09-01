@@ -29,6 +29,101 @@ function engineStatus(instance: InstanceInfo): string {
   return instance.snapshot.version ?? "Ready";
 }
 
+export function AntigravityAccountCards({
+  accounts,
+  selectedInstanceId,
+  busy,
+  onRefresh,
+}: {
+  accounts: AntigravityAccountStatus[];
+  selectedInstanceId: string;
+  busy: boolean;
+  onRefresh: () => void;
+}) {
+  const visibleAccounts = accounts.filter((account) => account.instanceId === selectedInstanceId);
+  if (visibleAccounts.length === 0) return null;
+  return (
+    <div data-testid="antigravity-account-cards" className="mt-2 space-y-2">
+      {visibleAccounts.map((account) => {
+        const quota = account.quota.gemini;
+        const value = (window: typeof quota.weekly) => window ? `${window.remaining}%` : "—";
+        return (
+          <div
+            key={account.instanceId}
+            data-testid={`antigravity-account-${account.profile}`}
+            className="rounded-lg border border-hairline/40 bg-inset px-2.5 py-2 text-[11px]"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="truncate font-medium text-ink">{account.label}</span>
+              <span className="text-success">Selected for bot</span>
+            </div>
+            {account.quotaStale && (
+              <div
+                data-testid={`antigravity-account-${account.profile}-refresh-stale`}
+                role="status"
+                className="mt-1 text-warning"
+              >
+                Refresh failed · showing last good
+              </div>
+            )}
+            <div className="mt-1.5 flex items-center gap-2 text-ink">
+              <span className="min-w-0 flex-1">Total: <b>{value(quota.weekly)}</b></span>
+              <span className="min-w-0 flex-1">5 hours: <b>{value(quota.fiveHour)}</b></span>
+              <button
+                type="button"
+                onClick={onRefresh}
+                disabled={busy}
+                className="rounded p-1 text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50"
+                title="Refresh both account quotas"
+                aria-label="Refresh Antigravity quotas"
+              >
+                <RefreshCw size={12} className={busy ? "animate-spin" : undefined} />
+              </button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+export function ModelPickerRailButton({
+  instance,
+  selected,
+  attention,
+  disabled,
+  onSelect,
+  iconKind = instance.driverKind,
+}: {
+  instance: InstanceInfo;
+  selected: boolean;
+  attention: boolean;
+  disabled?: boolean;
+  onSelect: () => void;
+  iconKind?: string;
+}) {
+  return (
+    <button
+      type="button"
+      data-testid={`model-picker-rail-${instance.instanceId}`}
+      onClick={onSelect}
+      disabled={disabled}
+      aria-label={iconKind === "openmaus" ? "OpenMaus API" : instance.displayName}
+      aria-pressed={selected}
+      title={`${iconKind === "openmaus" ? "OpenMaus API" : instance.displayName} · ${engineStatus(instance)}`}
+      className={cn(
+        "relative flex size-9 items-center justify-center rounded-lg",
+        selected ? "bg-control ring-1 ring-hairline/50" : "hover:bg-control/60",
+      )}
+    >
+      <ProviderMark driverKind={iconKind} size={18} />
+      {attention && (
+        <span className="absolute bottom-0.5 right-0.5 size-1.5 rounded-full bg-warning ring-2 ring-panel" />
+      )}
+    </button>
+  );
+}
+
 function ModelRow({
   option,
   current,
@@ -394,25 +489,13 @@ export function ModelPicker({
               const railButton = (instance: InstanceInfo) => {
                 const selected = instance.instanceId === railInstance?.instanceId;
                 const attention = needsCli(instance) || needsSignIn(instance);
-                return (
-                  <button
-                    type="button"
-                    key={instance.instanceId}
-                    onClick={() => selectRail(instance)}
-                    aria-label={instance.displayName}
-                    aria-pressed={selected}
-                    title={`${instance.displayName} · ${engineStatus(instance)}`}
-                    className={cn(
-                      "relative flex size-9 items-center justify-center rounded-lg",
-                      selected ? "bg-control ring-1 ring-hairline/50" : "hover:bg-control/60",
-                    )}
-                  >
-                    <ProviderMark driverKind={instance.driverKind} size={18} />
-                    {attention && (
-                      <span className="absolute bottom-0.5 right-0.5 size-1.5 rounded-full bg-warning ring-2 ring-panel" />
-                    )}
-                  </button>
-                );
+                return <ModelPickerRailButton
+                  key={instance.instanceId}
+                  instance={instance}
+                  selected={selected}
+                  attention={attention}
+                  onSelect={() => selectRail(instance)}
+                />;
               };
               return (
                 <>
@@ -449,36 +532,12 @@ export function ModelPicker({
                       ? "Run this agent with a model already on your machine."
                       : "Choose a model for this bot."}
                   </div>
-                  {(() => {
-                    const account = agyAccounts.find((candidate) => candidate.instanceId === railInstance.instanceId);
-                    if (!account) return null;
-                    const quota = account.quota.gemini;
-                    const value = (window: typeof quota.weekly) => window ? `${window.remaining}%` : "—";
-                    return (
-                      <div className="mt-2 rounded-lg border border-hairline/40 bg-inset px-2.5 py-2 text-[11px]">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="truncate text-ink-secondary">{account.email}</span>
-                          <span className={selection.instanceId === account.instanceId ? "text-success" : "text-ink-secondary"}>
-                            {selection.instanceId === account.instanceId ? "Selected for bot" : "Choose a model"}
-                          </span>
-                        </div>
-                        <div className="mt-1.5 flex items-center gap-2 text-ink">
-                          <span className="min-w-0 flex-1">Total: <b>{value(quota.weekly)}</b></span>
-                          <span className="min-w-0 flex-1">5 hours: <b>{value(quota.fiveHour)}</b></span>
-                          <button
-                            type="button"
-                            onClick={() => void refreshAgyQuotas()}
-                            disabled={agyBusy}
-                            className="rounded p-1 text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50"
-                            title="Refresh both account quotas"
-                            aria-label="Refresh Antigravity quotas"
-                          >
-                            <RefreshCw size={12} className={agyBusy ? "animate-spin" : undefined} />
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })()}
+                  <AntigravityAccountCards
+                    accounts={agyAccounts}
+                    selectedInstanceId={railInstance.instanceId}
+                    busy={agyBusy}
+                    onRefresh={() => void refreshAgyQuotas()}
+                  />
                   {agyError && railInstance.driverKind === "antigravityAgent" && (
                     <div className="mt-2 text-[10.5px] text-warning">{agyError}</div>
                   )}

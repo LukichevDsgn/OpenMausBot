@@ -214,6 +214,21 @@ const browserProfilesSchema = z.array(browserProfileSchema).max(20).superRefine(
 export const DEFAULT_ANTIGRAVITY_PROXY_URL = "http://127.0.0.1:10808";
 export const ANTIGRAVITY_NETWORK_ROUTE_ENV = "OPENMAUSBOT_ANTIGRAVITY_NETWORK_ROUTE";
 export const ANTIGRAVITY_NETWORK_ROUTE_SEPARATOR = "|";
+export const ANTIGRAVITY_WORKER_A_INSTANCE_ID = "antigravity-worker-a";
+export const ANTIGRAVITY_WORKER_B_INSTANCE_ID = "antigravity-worker-b";
+const ANTIGRAVITY_WORKER_LABELS = {
+  a: "Antigravity A · Worker A",
+  b: "Antigravity B · Worker B",
+} as const;
+
+function antigravityWorkerCli(profile: "a" | "b"): string {
+  const packaged = process.env.OMB_RESOURCES_PATH
+    ? join(process.env.OMB_RESOURCES_PATH, "antigravity", `agy-worker-${profile}.exe`)
+    : null;
+  return packaged && existsSync(packaged)
+    ? packaged
+    : join(homedir(), ".openmausbot", "bin", `agy-worker-${profile}.exe`);
+}
 export type AntigravityNetworkMode = "off" | "tun" | "proxy";
 
 /** Normalize only an explicitly-portioned loopback HTTP(S) proxy URL. */
@@ -868,7 +883,8 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     cursor: { driver: "cursorAgent" },
     claude: { driver: "claudeAgent" },
     codex: { driver: "codex" },
-    antigravity: { driver: "antigravityAgent" },
+    [ANTIGRAVITY_WORKER_A_INSTANCE_ID]: { driver: "antigravityAgent" },
+    [ANTIGRAVITY_WORKER_B_INSTANCE_ID]: { driver: "antigravityAgent" },
     opencodeGo: { driver: "opencodeGo" },
     computer: { driver: "boxAgent" },
     openaiCompat: { driver: "openai-compat" },
@@ -891,6 +907,36 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
   } as const;
   const configured = cfg.instances && Object.keys(cfg.instances).length ? cfg.instances : null;
   const map: InstanceConfigMap = configured ? { ...configured } : { ...DEFAULT_FLEET };
+  const antigravityFleetIsConfigured = !configured
+    || Object.hasOwn(configured, "antigravity")
+    || Object.hasOwn(configured, ANTIGRAVITY_WORKER_A_INSTANCE_ID)
+    || Object.hasOwn(configured, ANTIGRAVITY_WORKER_B_INSTANCE_ID);
+  if (antigravityFleetIsConfigured) {
+    const legacy = map.antigravity;
+    delete map.antigravity;
+    const workerEntry = (profile: "a" | "b", source: InstanceConfigMap[string] | undefined) => {
+      const rawConfig = source?.config && typeof source.config === "object" && !Array.isArray(source.config)
+        ? source.config as Record<string, unknown>
+        : {};
+      return {
+        ...(source ?? { driver: "antigravityAgent" }),
+        driver: "antigravityAgent",
+        displayName: ANTIGRAVITY_WORKER_LABELS[profile],
+        config: {
+          ...rawConfig,
+          cli: antigravityWorkerCli(profile),
+        },
+      };
+    };
+    map[ANTIGRAVITY_WORKER_A_INSTANCE_ID] = workerEntry(
+      "a",
+      map[ANTIGRAVITY_WORKER_A_INSTANCE_ID] ?? legacy,
+    );
+    map[ANTIGRAVITY_WORKER_B_INSTANCE_ID] = workerEntry(
+      "b",
+      map[ANTIGRAVITY_WORKER_B_INSTANCE_ID] ?? legacy,
+    );
+  }
   // Product fleets pick up newly shipped engines. A one-off test/shadow map
   // (no claude/grok/codex) is left exactly as written.
   if (

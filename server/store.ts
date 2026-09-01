@@ -8,7 +8,7 @@ import { join } from "node:path";
 
 import { writeFileAtomic } from "./atomic.ts";
 import { peerAllowKey, type PeerAction } from "./peer-approval-key.ts";
-import { DATA_DIR, loadBrowserProfileIdAliases } from "./config.ts";
+import { ANTIGRAVITY_WORKER_A_INSTANCE_ID, DATA_DIR, loadBrowserProfileIdAliases } from "./config.ts";
 import * as mdb from "./message-db.ts";
 import { workspaceDir } from "./workspace.ts";
 import { newId, type CloudBackend, type ModelSelection, type ThreadId } from "./contracts.ts";
@@ -610,6 +610,15 @@ interface ThreadState {
   activeLeafId: string | null;
 }
 
+function migrateLegacyAntigravityCursors(cursors: Record<string, unknown>): boolean {
+  if (!Object.hasOwn(cursors, "antigravity")) return false;
+  if (!Object.hasOwn(cursors, ANTIGRAVITY_WORKER_A_INSTANCE_ID)) {
+    cursors[ANTIGRAVITY_WORKER_A_INSTANCE_ID] = cursors.antigravity;
+  }
+  delete cursors.antigravity;
+  return true;
+}
+
 export class Store {
   bots: BotRecord[] = [];
   groups: GroupRecord[] = [];
@@ -637,6 +646,18 @@ export class Store {
     const chiefSectionsSeen = new Set<string>();
     let groupsMigrated = false;
     for (const b of this.bots) {
+      if (b.modelSelection.instanceId === "antigravity") {
+        b.modelSelection = { ...b.modelSelection, instanceId: ANTIGRAVITY_WORKER_A_INSTANCE_ID };
+        botsMigrated = true;
+      }
+      if (migrateLegacyAntigravityCursors(b.resumeCursors)) botsMigrated = true;
+      for (const task of b.tasks ?? []) {
+        if (task.lastInstanceId === "antigravity") {
+          task.lastInstanceId = ANTIGRAVITY_WORKER_A_INSTANCE_ID;
+          botsMigrated = true;
+        }
+        if (migrateLegacyAntigravityCursors(task.resumeCursors)) botsMigrated = true;
+      }
       // transient state never survives a restart — and if a previous
       // process died mid-turn, bots.json still says busy/working; persist
       // the reset so the next load does not read it again

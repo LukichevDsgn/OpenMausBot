@@ -419,6 +419,7 @@ export interface AntigravityAccountStatus {
     gemini: { weekly: AntigravityQuotaWindow | null; fiveHour: AntigravityQuotaWindow | null };
     other: { weekly: AntigravityQuotaWindow | null; fiveHour: AntigravityQuotaWindow | null };
   };
+  quotaStale?: boolean;
   error?: string;
 }
 

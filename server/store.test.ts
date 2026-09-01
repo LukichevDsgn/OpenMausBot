@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { DATA_DIR } from "./config.ts";
+import { ANTIGRAVITY_WORKER_A_INSTANCE_ID, DATA_DIR } from "./config.ts";
 import type { ModelSelection } from "./contracts.ts";
 import * as mdb from "./message-db.ts";
 import { peerAllowKey } from "./peer-approval-key.ts";
@@ -513,6 +513,21 @@ describe("Store", () => {
 
     const reloaded = new Store(selection);
     expect(reloaded.bot(bot.id)?.resumeCursors).toEqual({ claude: "sess-abc", codex: "thread-xyz" });
+  });
+
+  it("migrates a legacy aggregate Antigravity binding to worker A with its cursors", () => {
+    const store = new Store(selection);
+    const bot = store.createBot({
+      modelSelection: { instanceId: "antigravity", model: "gemini" },
+    }, { seedMessages: false });
+    store.setResumeCursor(bot.id, "antigravity", "legacy-session");
+    store.markTaskDispatched(bot.id, bot.threadId, "antigravity");
+
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)?.modelSelection).toEqual({ instanceId: ANTIGRAVITY_WORKER_A_INSTANCE_ID, model: "gemini" });
+    expect(reloaded.bot(bot.id)?.resumeCursors).toEqual({ [ANTIGRAVITY_WORKER_A_INSTANCE_ID]: "legacy-session" });
+    expect(reloaded.taskByThread(bot.id, bot.threadId)?.resumeCursors).toEqual({ [ANTIGRAVITY_WORKER_A_INSTANCE_ID]: "legacy-session" });
+    expect(reloaded.taskByThread(bot.id, bot.threadId)?.lastInstanceId).toBe(ANTIGRAVITY_WORKER_A_INSTANCE_ID);
   });
 
   it("seedIfEmpty creates exactly one starter bot, once", () => {
