@@ -82,7 +82,7 @@ interface LocalVmStatus {
   viewer_url: string;
 }
 
-function routineScheduleLabel(routine: Routine) {
+export function routineScheduleLabel(routine: Routine) {
   if (routine.schedule.type === "manual") return "Manual only";
   if (routine.schedule.type === "once") {
     return new Date(routine.schedule.at).toLocaleString([], {

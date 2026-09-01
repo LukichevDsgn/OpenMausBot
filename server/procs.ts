@@ -1,4 +1,4 @@
-// Cross-platform process spawning for the agent CLIs. Three Windows
+// Cross-platform process spawning for the agent CLIs. Four Windows
 // differences are exposed to drivers through this module:
 //   1. CreateProcess can't exec npm .cmd/.bat shims or node-shebang scripts
 //      directly. env-path resolves those to their real .exe / `node script`
@@ -7,6 +7,9 @@
 //      whole tree, CLI + its spawned MCP proxies alike.
 //   3. Console apps spawned from the GUI shell flash a console window
 //      unless windowsHide is set.
+//   4. CreateProcess has a 32,767-character command-line limit. Keep prompt
+//      bodies on stdin or in private files and fail clearly if a future
+//      driver accidentally puts one back in argv.
 import {
   spawn,
   execFile,
@@ -22,10 +25,41 @@ import { resolveCliSpawn, type ResolvedSpawn } from "./env-path.ts";
 export interface ExecCliTreeOptions extends Omit<SpawnOptions, "stdio"> {
   timeout?: number;
   maxBuffer?: number;
+  /** Optional strict output boundary for commands that can finish before
+   * their CLI closes inherited descendant pipes. The predicate must only
+   * accept a complete, valid response. */
+  completionPredicate?: (stdout: string, stderr: string) => boolean;
 }
 
 export function resolveCli(cli: string, args: string[] = []): ResolvedSpawn {
   return resolveCliSpawn(cli, args);
+}
+
+/** Leave headroom below CreateProcess' 32,767 UTF-16 code-unit limit for
+ * libuv's quoting and environment-specific executable expansion. */
+export const WINDOWS_SAFE_COMMAND_LINE_CHARS = 30_000;
+
+/** Conservative size of the command line libuv will give CreateProcess.
+ * JSON string quoting escapes every slash/quote case Windows quoting needs,
+ * so this can over-count but cannot hide a dangerous launch. */
+export function estimatedWindowsCommandLineChars(resolved: ResolvedSpawn): number {
+  return [resolved.command, ...resolved.args].reduce(
+    (total, value) => total + JSON.stringify(value).length + 1,
+    0,
+  );
+}
+
+export function assertSafeCliArgv(
+  resolved: ResolvedSpawn,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  if (platform !== "win32") return;
+  if (estimatedWindowsCommandLineChars(resolved) <= WINDOWS_SAFE_COMMAND_LINE_CHARS) return;
+  const error = new Error(
+    "agent CLI launch arguments exceed Windows' safe command-line limit; pass large prompts through stdin or a file",
+  ) as NodeJS.ErrnoException;
+  error.code = "ENAMETOOLONG";
+  throw error;
 }
 
 export function spawnCli(
@@ -34,8 +68,7 @@ export function spawnCli(
   opts: SpawnOptions,
 ): ChildProcessByStdio<Writable, Readable, Readable> {
   const resolved = resolveCli(cli, args);
-  // SAFETY: stdio is fixed to three pipes by this function, matching the
-  // ChildProcessByStdio generic used by every caller below.
+  assertSafeCliArgv(resolved);
   const child = spawn(resolved.command, resolved.args, {
     ...opts,
     // posix: own process group so kill(-pid) reaps child MCP servers;
@@ -65,6 +98,12 @@ export function execCli(
   cb: (err: Error | null, stdout: string, stderr?: string) => void,
 ): void {
   const resolved = resolveCli(cli, args);
+  try {
+    assertSafeCliArgv(resolved);
+  } catch (error) {
+    queueMicrotask(() => cb(error instanceof Error ? error : new Error(String(error)), "", ""));
+    return;
+  }
   execFile(resolved.command, resolved.args, { ...opts, windowsHide: true, encoding: "utf8" }, (err, stdout, stderr) =>
     cb(err, stdout, stderr),
   );
@@ -81,7 +120,12 @@ export function execCliTree(
   args: string[],
   opts: ExecCliTreeOptions = {},
 ): Promise<{ stdout: string; stderr: string }> {
-  const { timeout = 0, maxBuffer = 1024 * 1024, ...spawnOptions } = opts;
+  const {
+    timeout = 0,
+    maxBuffer = 1024 * 1024,
+    completionPredicate,
+    ...spawnOptions
+  } = opts;
   const child = spawnCli(cli, args, {
     ...spawnOptions,
     stdio: ["ignore", "pipe", "pipe"],
@@ -106,11 +150,27 @@ export function execCliTree(
       }
     };
 
-    const stopWith = async (error: Error) => {
+    const stopWith = async (error?: Error) => {
       if (settled || stopping) return;
       stopping = true;
       await killCliTreeAndWait(child);
       finish(error);
+    };
+
+    const finishAfterCompleteOutput = () => {
+      void stopWith();
+    };
+
+    const checkCompletionBoundary = () => {
+      if (!completionPredicate || settled || stopping) return;
+      let complete = false;
+      try {
+        complete = completionPredicate(stdout, stderr);
+      } catch {
+        // A strict parser commonly throws while the response is partial or
+        // invalid. Keep waiting so timeout/error handling remains in charge.
+      }
+      if (complete) finishAfterCompleteOutput();
     };
 
     const append = (target: "stdout" | "stderr", chunk: Buffer | string) => {
@@ -122,17 +182,20 @@ export function execCliTree(
       }
       if (target === "stdout") stdout = next;
       else stderr = next;
+      checkCompletionBoundary();
     };
 
     child.stdout.on("data", (chunk) => append("stdout", chunk));
     child.stderr.on("data", (chunk) => append("stderr", chunk));
-    child.once("error", (error) => finish(error));
+    child.once("error", (error) => {
+      void stopWith(error);
+    });
     child.once("close", (code, signal) => {
       if (stopping || settled) return;
       if (code === 0) finish();
       else {
         const detail = stderr.trim() || stdout.trim();
-        finish(new Error(
+        void stopWith(new Error(
           `${cli} exited ${code ?? signal ?? "before producing a result"}${detail ? `: ${detail}` : ""}`,
         ));
       }
@@ -160,6 +223,11 @@ export function describeSpawnFailure(err: NodeJS.ErrnoException, cli: string): S
     return { message: `\`${cli}\` isn't installed, or isn't on this app's PATH`, setup: true };
   if (err.code === "EACCES" || err.code === "EPERM")
     return { message: `\`${cli}\` isn't executable — check its file permissions`, setup: true };
+  if (err.code === "ENAMETOOLONG")
+    return {
+      message: `\`${cli}\` received too much launch data for Windows; update this provider or pass its prompt through stdin/a file`,
+      setup: false,
+    };
   return { message: `spawn failed: ${err.message}`, setup: false };
 }
 

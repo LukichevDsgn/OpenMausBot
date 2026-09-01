@@ -22,6 +22,14 @@ export interface ExportRequest {
   format: "package";
 }
 
+export function resolveExportScopeBot<T extends { id: string }>(
+  option: ExportScopeOption,
+  bots: readonly T[],
+): T | undefined {
+  if (!option.key.startsWith("bot:")) return undefined;
+  return bots.find((bot) => bot.id === option.botIds[0]);
+}
+
 interface ExportedPackage {
   name: string;
   members: number;

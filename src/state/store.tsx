@@ -443,7 +443,8 @@ export interface AntigravityAccountStatus {
   profile: "a" | "b";
   instanceId: string;
   label: string;
-  email: string;
+  /** Optional sanitized account label from the runtime quota response. */
+  email?: string;
   active: boolean;
   available: boolean;
   quota: {
@@ -451,6 +452,7 @@ export interface AntigravityAccountStatus {
     other: { weekly: AntigravityQuotaWindow | null; fiveHour: AntigravityQuotaWindow | null };
   };
   error?: string;
+  quotaStale?: boolean;
 }
 
 export type AppSettingsSection =

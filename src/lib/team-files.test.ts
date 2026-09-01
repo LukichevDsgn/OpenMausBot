@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildExportRequest, buildExportScopeOptions, exportFilename } from "./team-files";
+import { buildExportRequest, buildExportScopeOptions, exportFilename, resolveExportScopeBot } from "./team-files";
 
 describe("team export helpers", () => {
   const bots = [
@@ -46,5 +46,13 @@ describe("team export helpers", () => {
     });
     expect(exportFilename("Résumé / Team 2026")).toBe("resume-team-2026.md");
     expect(exportFilename("  ")).toBe("openmaus-package.md");
+  });
+
+  it("resolves avatar data from the full visible bot collection, not only selected previews", () => {
+    const options = buildExportScopeOptions({ projectFilter: "all", bots, groups });
+    const botOption = options.find((option) => option.key === "bot:bea");
+    expect(botOption).toBeDefined();
+    expect(resolveExportScopeBot(botOption!, bots)).toMatchObject({ id: "bea", name: "Bea" });
+    expect(resolveExportScopeBot(botOption!, bots.filter((bot) => bot.id !== "bea"))).toBeUndefined();
   });
 });

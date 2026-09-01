@@ -5,6 +5,7 @@ import {
   buildExportRequest,
   buildExportScopeOptions,
   downloadExportPackage,
+  resolveExportScopeBot,
   type ExportScopeOption,
 } from "@/lib/team-files";
 import type { Routine } from "@/lib/routines";
@@ -185,8 +186,9 @@ function ExportScopeDropdown({ options, bots, value, onChange, disabled }: { opt
     {sectionOptions.map((option, index) => {
       const itemIndex = offset + index;
       const checked = option.key === selected?.key;
+      const avatarProps = option.key.startsWith("bot:") ? exportScopeAvatarProps(option, bots) : undefined;
       return <button key={option.key} type="button" role="option" aria-selected={checked} onMouseEnter={() => setActiveIndex(itemIndex)} onClick={() => choose(option)} className={cn("flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left focus:outline-none focus-visible:bg-raised/70", itemIndex === activeIndex && "bg-raised/70")}>
-        <span className={cn("flex size-7 shrink-0 items-center justify-center rounded-lg bg-raised text-ink-secondary", option.key === "all" && "text-danger")}>{option.key === "all" ? <Users size={14} /> : option.key.startsWith("bot:") ? (bots.find((bot) => bot.id === option.botIds[0]) ? <BotAvatar bot={bots.find((bot) => bot.id === option.botIds[0])!} state="idle" size={28} animated={false} /> : <Sparkles size={14} />) : <MessageSquare size={14} />}</span>
+        <span className={cn("flex size-7 shrink-0 items-center justify-center rounded-lg bg-raised text-ink-secondary", option.key === "all" && "text-danger")}>{option.key === "all" ? <Users size={14} /> : avatarProps ? <BotAvatar {...avatarProps} /> : option.key.startsWith("bot:") ? <Sparkles size={14} /> : <MessageSquare size={14} />}</span>
         <span className="min-w-0 flex-1"><span className="block truncate text-[13px] font-medium text-ink">{option.label}</span><span className="block truncate text-[11px] text-ink-secondary">{option.detail}</span></span>
         {checked && <Check size={15} className="shrink-0 text-accent" />}
       </button>;
@@ -200,6 +202,11 @@ function ExportScopeDropdown({ options, bots, value, onChange, disabled }: { opt
       {renderSection("Projects", projectOptions, 0)}{renderSection("Teams & channels", teamOptions, projectOptions.length)}{renderSection("Individual bots", botOptions, projectOptions.length + teamOptions.length)}{renderSection("Other", broadOptions, projectOptions.length + teamOptions.length + botOptions.length)}
     </div>}
   </div>;
+}
+
+export function exportScopeAvatarProps<T extends { id: string }>(option: ExportScopeOption, bots: readonly T[]) {
+  const bot = resolveExportScopeBot(option, bots);
+  return bot ? { bot, state: "idle" as const, size: 28, animated: false as const } : undefined;
 }
 
 async function openExternal(url: string): Promise<void> {
@@ -1235,7 +1242,7 @@ export function TeamLibraryPanel({
                     <label className="mt-5 block text-[12px] font-medium text-ink-secondary" htmlFor="export-scope">Scope</label>
                     <ExportScopeDropdown
                       options={exportScopes}
-                      bots={selectedBots.length ? selectedBots : state.bots.filter((bot) => !bot.hidden)}
+                      bots={state.bots.filter((bot) => !bot.hidden)}
                       value={selectedScopeOption?.key}
                       onChange={(next) => {
                         setScopeKey(next.key);
