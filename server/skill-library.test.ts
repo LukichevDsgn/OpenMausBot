@@ -9,6 +9,7 @@ import {
   effectiveSkillIds,
   effectiveSkillToolIds,
   filterSkillGrantState,
+  loadBundledSkills,
   parseSkillManifest,
   removeGlobalImportedSkill,
   selectExactSkill,
@@ -36,6 +37,13 @@ const phone: BundledSkill = {
 };
 
 describe("bundled skill library", () => {
+  it("loads every shipped skill manifest with the packaged runtime contract", () => {
+    expect(loadBundledSkills(join(process.cwd(), "skills")).map((skill) => skill.manifest.id)).toEqual([
+      "create-verification-skill",
+      "phone-harness",
+    ]);
+  });
+
   it("derives every true provider capability deterministically and ignores metadata", () => {
     expect(enabledProviderCapabilityIds({
       phoneMcp: true,
