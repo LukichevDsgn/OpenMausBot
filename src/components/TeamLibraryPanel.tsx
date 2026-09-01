@@ -27,6 +27,15 @@ import { createPortal } from "react-dom";
 const MAX_TEAM_FILE_BYTES = 1_000_000;
 const COMMUNITY_TEAMS_REPOSITORY = "https://github.com/milind-soni/openmausbot-teams";
 
+function isGrokBotUrl(value: string): boolean {
+  try {
+    const url = new URL(value.trim());
+    return url.protocol === "https:" && url.hostname === "x.ai";
+  } catch {
+    return false;
+  }
+}
+
 interface TeamCatalogEntry {
   slug: string;
   name: string;
@@ -62,7 +71,7 @@ export interface TeamImportResult {
   archived: ArchivedTeamBot[];
 }
 
-type ImportSource = "library" | "file" | "github";
+type ImportSource = "library" | "file" | "github" | "grok";
 type TeamTab = "explore" | "import" | "scout";
 type ImportMode = "replace" | "add";
 
@@ -258,11 +267,12 @@ export function TeamLibraryPanel({
     setGithubLoading(true);
     setError("");
     try {
-      const manifest = await api("/api/team-library/github", {
+      const grok = isGrokBotUrl(requestedUrl);
+      const manifest = await api(grok ? "/api/team-library/grok" : "/api/team-library/github", {
         method: "POST",
         body: JSON.stringify({ url: requestedUrl.trim() }),
       });
-      previewManifest(teamImportPreview(manifest), "github");
+      previewManifest(teamImportPreview(manifest), grok ? "grok" : "github");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -715,15 +725,16 @@ export function TeamLibraryPanel({
 
                     <div className="flex min-h-56 flex-col justify-center rounded-2xl bg-raised/25 px-6">
                       <Github size={25} className="text-ink-secondary" />
-                      <h3 className="mt-3 text-[14px] font-medium text-ink">Load from GitHub</h3>
-                      <p className="mt-1 text-[12.5px] leading-relaxed text-ink-secondary">Paste a public repo or a direct team JSON link.</p>
+                      <h3 className="mt-3 text-[14px] font-medium text-ink">Load from GitHub or Grok</h3>
+                      <p className="mt-1 text-[12.5px] leading-relaxed text-ink-secondary">Paste a public repo, team JSON link, or exact public Grok Bot URL.</p>
+                      <p className="mt-2 text-[11.5px] leading-relaxed text-ink-secondary">Experimental Grok import uses an undocumented endpoint. No Grok login or credentials are sent.</p>
                       <div className="mt-4 flex gap-2">
                         <input
                           value={githubUrl}
                           onChange={(event) => setGithubUrl(event.target.value)}
                           onKeyDown={(event) => event.key === "Enter" && void loadGithubTeam()}
-                          placeholder="github.com/owner/repo"
-                          aria-label="GitHub team URL"
+                          placeholder="github.com/owner/repo or https://x.ai/bot/…"
+                          aria-label="GitHub team or public Grok Bot URL"
                           className="min-w-0 flex-1 rounded-xl bg-raised/80 px-3 py-2.5 text-[13px] text-ink placeholder:text-ink-secondary focus:outline-none"
                         />
                         <button
