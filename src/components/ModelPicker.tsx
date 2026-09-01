@@ -453,7 +453,7 @@ export function ModelPicker({
                         <div className="flex items-center justify-between gap-2">
                           <span className="truncate text-ink-secondary">{account.email}</span>
                           <span className={selection.instanceId === account.instanceId ? "text-success" : "text-ink-secondary"}>
-                            {selection.instanceId === account.instanceId ? "Selected for bot" : "Выбери модель"}
+                            {selection.instanceId === account.instanceId ? "Selected for bot" : "Choose a model"}
                           </span>
                         </div>
                         <div className="mt-1.5 flex items-center gap-2 text-ink">
@@ -464,8 +464,8 @@ export function ModelPicker({
                             onClick={() => void refreshAgyQuotas()}
                             disabled={agyBusy}
                             className="rounded p-1 text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50"
-                            title="Обновить квоты обоих аккаунтов"
-                            aria-label="Обновить квоты Antigravity"
+                            title="Refresh both account quotas"
+                            aria-label="Refresh Antigravity quotas"
                           >
                             <RefreshCw size={12} className={agyBusy ? "animate-spin" : undefined} />
                           </button>
