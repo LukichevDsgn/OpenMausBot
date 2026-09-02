@@ -28,6 +28,7 @@ import { migrateWorkspaceCredentials, workspaceCredentialEnv } from "./workspace
 import { activateExistingWindow } from "./single-instance.mjs";
 import { pollServerIdentity } from "./server-boot-probe.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
+import { grokBotDefaultAppsSettingsUrl } from "./windows-default-apps.mjs";
 import { windowChromeOptions } from "./window-chrome.mjs";
 import { defaultSaveName, withSavableFile } from "./save-file.mjs";
 import {
@@ -1685,6 +1686,13 @@ ipcMain.handle("desktop:open-external", async (_event, rawUrl) => {
     throw new Error("Only web links can be opened");
   }
   await shell.openExternal(url.toString());
+  return true;
+});
+
+ipcMain.handle("desktop:open-grok-default-apps", async () => {
+  const settingsUrl = grokBotDefaultAppsSettingsUrl();
+  if (!settingsUrl) return false;
+  await shell.openExternal(settingsUrl);
   return true;
 });
 

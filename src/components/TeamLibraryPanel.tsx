@@ -728,6 +728,15 @@ export function TeamLibraryPanel({
                       <h3 className="mt-3 text-[14px] font-medium text-ink">Load from GitHub or Grok</h3>
                       <p className="mt-1 text-[12.5px] leading-relaxed text-ink-secondary">Paste a public repo, team JSON link, or exact public Grok Bot URL.</p>
                       <p className="mt-2 text-[11.5px] leading-relaxed text-ink-secondary">Experimental Grok import uses an undocumented endpoint. No Grok login or credentials are sent.</p>
+                      {window.ogb?.platform === "win32" && window.ogb.openGrokDefaultApps ? (
+                        <button
+                          type="button"
+                          onClick={() => void window.ogb?.openGrokDefaultApps?.()}
+                          className="mt-2 self-start text-[11.5px] font-medium text-accent hover:underline"
+                        >
+                          Choose app for Grok Bot links in Windows
+                        </button>
+                      ) : null}
                       <div className="mt-4 flex gap-2">
                         <input
                           value={githubUrl}
