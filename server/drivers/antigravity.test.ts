@@ -308,7 +308,7 @@ describe("Antigravity snapshot", () => {
       all_proxy: "http://inherited-all",
       NO_PROXY: "inherited-no-proxy",
       no_proxy: "inherited-no-proxy",
-      GODEBUG: "custom=1,http2client=0,other=2",
+      GODEBUG: "custom=1,http2client=1,other=2",
     };
     const cases = [
       { route: "off", expectedRoute: "off", expected: inherited },

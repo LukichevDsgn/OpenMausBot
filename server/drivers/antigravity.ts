@@ -98,7 +98,7 @@ export const STATIC_ANTIGRAVITY_MODELS: ModelCatalog = {
 /** Remove the HTTP/2 workaround token before applying a new network route. */
 function removeAntigravityGodebugToken(value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
-  const remaining = value.split(",").filter((token) => token.trim() !== "http2client=0");
+  const remaining = value.split(",").filter((token) => !token.trim().startsWith("http2client="));
   return remaining.length > 0 ? remaining.join(",") : undefined;
 }
 
