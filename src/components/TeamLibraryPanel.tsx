@@ -1,7 +1,7 @@
 import { track } from "@/lib/analytics";
 import { cn } from "@/lib/cn";
 import { teamImportPreview, type PendingTeamImport } from "@/lib/team-import";
-import { buildExportRequest, buildExportScopeOptions, downloadExportPackage, resolveExportScopeBot, type ExportedPackage, type ExportScopeOption } from "@/lib/team-files";
+import { buildExportScopeOptions, resolveExportScopeBot, type ExportScopeOption } from "@/lib/team-files";
 import type { Routine } from "@/lib/routines";
 import { api, useStore, type Bot, type Group } from "@/state/store";
 import type { BotShare, BotShareVisibility, CompanionAccountState } from "@/types/ogb";
@@ -21,6 +21,7 @@ import {
   Loader2,
   MessageSquare,
   Plug,
+  Search,
   Share2,
   Sparkles,
   Trash2,
@@ -255,7 +256,6 @@ export function TeamLibraryPanel({
   const [scoutedFolder, setScoutedFolder] = useState("");
   const [exportScopeKey, setExportScopeKey] = useState<ExportScopeOption["key"] | "">("");
   const [exportName, setExportName] = useState("My OpenMaus Team");
-  const [exporting, setExporting] = useState(false);
   // null = not asked yet or still loading; [] = asked, nothing (or offline)
   const [directory, setDirectory] = useState<DirectoryCandidate[] | null>(null);
   const [pickedDirectory, setPickedDirectory] = useState<Set<string>>(new Set());
@@ -494,23 +494,6 @@ export function TeamLibraryPanel({
     }
   };
 
-  /** Request the selected team package and trigger its local download. */
-  const exportTeam = async () => {
-    if (!selectedExportOption || exporting) return;
-    setExporting(true);
-    setError("");
-    try {
-      const packageFile = await api("/api/teams/export", {
-        method: "POST",
-        body: JSON.stringify(buildExportRequest(exportName, selectedExportOption.scope, [])),
-      });
-      downloadExportPackage(packageFile as ExportedPackage);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      setExporting(false);
-    }
-  };
 
   const scoutTarget = scoutFolder.trim();
 
@@ -612,7 +595,11 @@ export function TeamLibraryPanel({
     try {
       const exported = (await api("/api/teams/export", {
         method: "POST",
-        body: JSON.stringify({ format: "package" }),
+        body: JSON.stringify({
+          format: "package",
+          name: exportName.trim() || undefined,
+          scope: selectedExportOption?.scope,
+        }),
       })) as PublishDraft;
       teamImportPreview(exported.markdown);
       setPublishDraft(exported);
@@ -957,11 +944,40 @@ export function TeamLibraryPanel({
                   </div>
                   <div className="rounded-2xl bg-raised/25 px-5 py-5">
                     <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-                      <div>
+                      <div className="min-w-0 flex-1">
                         <div className="text-[14px] font-medium text-ink">Current team</div>
                         <p className="mt-1 text-[12.5px] text-ink-secondary">
                           {currentBotCount} active {currentBotCount === 1 ? "bot" : "bots"} · validated package format
                         </p>
+                        <div className="mt-3 max-w-sm space-y-2">
+                          <input
+                            type="text"
+                            value={exportName}
+                            onChange={(e) => setExportName(e.target.value)}
+                            placeholder="Package name"
+                            aria-label="Package name"
+                            className="w-full rounded-xl bg-raised/70 px-3 py-1.5 text-[12.5px] text-ink placeholder:text-ink-secondary focus:outline-none"
+                          />
+                          {exportOptions.length > 0 && (
+                            <ExportScopeSelect
+                              options={exportOptions}
+                              bots={state.bots.filter((bot) => !bot.hidden)}
+                              value={selectedExportOption?.key ?? ""}
+                              onChange={setExportScopeKey}
+                              disabled={shareBusy !== ""}
+                            />
+                          )}
+                        </div>
+                        {selectedExportBots.length > 0 && (
+                          <div className="mt-2.5 flex flex-wrap gap-1.5">
+                            {selectedExportBots.map((b) => (
+                              <div key={b.id} className="flex items-center gap-1.5 rounded-full bg-inset py-0.5 pl-1 pr-2">
+                                <BotAvatar bot={b} state="idle" size={20} animated={false} />
+                                <span className="max-w-32 truncate text-[11px] text-ink">{b.name}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                       <div className="flex flex-wrap gap-2">
                         <button
