@@ -209,6 +209,7 @@ import {
 import {
   applyStagedSkillWrite,
   installGlobalSkillBatch,
+  installSkill,
   installSkillsAtomically,
   getStagedSkillWrite,
   listSkills,
@@ -1120,60 +1121,6 @@ function checkedMemberIds(value: unknown): { ok: true; memberIds: string[] } | {
     };
   }
   return { ok: true, memberIds };
-}
-
-type ExportSelection = { botIds: string[]; groupIds: string[] };
-
-/** Validate and normalize a requested team export scope against visible bots and non-DM rooms. */
-function checkedExportSelection(
-  value: unknown,
-  bots: readonly { id: string; hidden?: boolean }[],
-  groups: readonly GroupRecord[],
-): { ok: true; selection: ExportSelection } | { ok: false; error: string } {
-  if (value === "all") {
-    const botIds = bots.filter((bot) => !bot.hidden).map((bot) => bot.id);
-    if (!botIds.length) return { ok: false, error: "scope selects no visible bots" };
-    return {
-      ok: true,
-      selection: {
-        botIds,
-        groupIds: groups
-          .filter((group) => !group.dm && group.memberIds.some((id) => botIds.includes(id)))
-          .map((group) => group.id),
-      },
-    };
-  }
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return { ok: false, error: 'scope must be "all" or an object with botIds' };
-  }
-  const scope = value as { botIds?: unknown; groupIds?: unknown };
-  if (!Array.isArray(scope.botIds) || !scope.botIds.length || scope.botIds.some((id) => typeof id !== "string" || !id.trim())) {
-    return { ok: false, error: "scope.botIds must be a non-empty list of bot IDs" };
-  }
-  const botIds = [...scope.botIds] as string[];
-  if (new Set(botIds).size !== botIds.length) return { ok: false, error: "scope.botIds must not contain duplicates" };
-  for (const id of botIds) {
-    const bot = bots.find((candidate) => candidate.id === id);
-    if (!bot) return { ok: false, error: `scope.botIds contains unknown bot ID "${id}"` };
-    if (bot.hidden) return { ok: false, error: `scope.botIds contains hidden bot ID "${id}"` };
-  }
-  let groupIds: string[] = [];
-  if (scope.groupIds !== undefined) {
-    if (!Array.isArray(scope.groupIds) || scope.groupIds.some((id) => typeof id !== "string" || !id.trim())) {
-      return { ok: false, error: "scope.groupIds must be a list of room IDs" };
-    }
-    groupIds = [...scope.groupIds] as string[];
-    if (new Set(groupIds).size !== groupIds.length) return { ok: false, error: "scope.groupIds must not contain duplicates" };
-  }
-  for (const id of groupIds) {
-    const group = groups.find((candidate) => candidate.id === id);
-    if (!group) return { ok: false, error: `scope.groupIds contains unknown room ID "${id}"` };
-    if (group.dm) return { ok: false, error: `scope.groupIds cannot include direct-message room "${id}"` };
-    if (!group.memberIds.some((memberId) => botIds.includes(memberId))) {
-      return { ok: false, error: `scope.groupIds room "${id}" has no selected visible bots` };
-    }
-  }
-  return { ok: true, selection: { botIds, groupIds } };
 }
 
 let bootSelection = { instanceId: "", model: "" };
@@ -4263,7 +4210,7 @@ const agentRoutine = (
         : {
             type: "weekly" as const,
             time: routine.schedule.time,
-            weekdays: routine.schedule.weekdays.map((day) => ROUTINE_WEEKDAY_NAMES[day]),
+            weekdays: routine.schedule.weekdays.map((day: number) => ROUTINE_WEEKDAY_NAMES[day]),
           },
     nextRunAt: routine.nextRunAt === null ? null : new Date(routine.nextRunAt).toISOString(),
     latestRun: latestRun
@@ -8040,13 +7987,14 @@ const server = createServer(async (req, res) => {
         }
 
         for (const routine of pkg?.routines ?? []) {
+          if (routine.schedule.type === "manual") continue;
           const created = routines!.create({
             name: routine.name,
             prompt: routine.prompt,
             botId: memberIds.get(routine.agent)!,
             runOn: routine.runOn,
             enabled: false,
-            schedule: routine.schedule,
+            schedule: routine.schedule as any,
             durationMinutes: routine.durationMinutes,
             ...(routine.timeoutMinutes === undefined ? {} : { timeoutMinutes: routine.timeoutMinutes }),
           });
