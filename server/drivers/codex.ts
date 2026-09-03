@@ -226,6 +226,17 @@ export function runCodexPermissionReview(
         } catch {
           continue;
         }
+        if (!message || typeof message !== "object" || Array.isArray(message)) {
+          continue;
+        }
+        if (message.id !== undefined && typeof message.method === "string") {
+          try {
+            send({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Method not allowed during permission review" } });
+          } catch {
+            // child stdin closed
+          }
+          continue;
+        }
         if (message.id !== undefined && (message.result !== undefined || message.error !== undefined)) {
           const waiting = pending.get(message.id);
           if (!waiting) continue;

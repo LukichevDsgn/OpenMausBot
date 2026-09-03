@@ -51,6 +51,8 @@ process.stdin.on("data", (chunk) => {
     else if (message.method === "turn/start") {
       dump();
       if (mode === "hang") continue;
+      if (mode === "null-line") process.stdout.write("null\\n");
+      if (mode === "server-request") out({ jsonrpc: "2.0", id: "srv-1", method: "item/tool/requestUserInput", params: {} });
       out({ jsonrpc: "2.0", id: message.id, result: { ok: true } });
       const text = mode === "oversize"
         ? "x".repeat(1_000_001)
@@ -223,6 +225,18 @@ describe("CodexDriver turns (fake app-server)", () => {
     await expect(
       runCodexPermissionReview(reviewCli, {}, "oversized review", undefined, 1_000),
     ).rejects.toThrow("Codex review output exceeded 1 MB");
+  });
+
+  it("safely ignores null or scalar JSON-RPC output lines during review", async () => {
+    const reviewCli = writeReviewFake(scratch, "null-line");
+    const raw = await runCodexPermissionReview(reviewCli, {}, "allow test command");
+    expect(parseReviewVerdict(raw)).toEqual({ allow: true, reason: "safe" });
+  });
+
+  it("declines server-initiated JSON-RPC requests without hanging", async () => {
+    const reviewCli = writeReviewFake(scratch, "server-request");
+    const raw = await runCodexPermissionReview(reviewCli, {}, "allow test command");
+    expect(parseReviewVerdict(raw)).toEqual({ allow: true, reason: "safe" });
   });
 
   it("runs the handshake and normalizes a full turn", async () => {
