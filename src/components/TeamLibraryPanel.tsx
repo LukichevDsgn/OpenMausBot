@@ -1,6 +1,7 @@
 import { track } from "@/lib/analytics";
 import { cn } from "@/lib/cn";
 import { teamImportPreview, type PendingTeamImport } from "@/lib/team-import";
+import { buildExportRequest, buildExportScopeOptions, downloadExportPackage, resolveExportScopeBot, type ExportedPackage, type ExportScopeOption } from "@/lib/team-files";
 import type { Routine } from "@/lib/routines";
 import { api, useStore, type Bot, type Group } from "@/state/store";
 import type { BotShare, BotShareVisibility, CompanionAccountState } from "@/types/ogb";
@@ -9,6 +10,7 @@ import {
   BookOpen,
   CalendarClock,
   Check,
+  ChevronDown,
   Compass,
   Copy,
   Crown,
@@ -19,14 +21,15 @@ import {
   Loader2,
   MessageSquare,
   Plug,
-  Search,
   Share2,
+  Sparkles,
   Trash2,
   UploadCloud,
   Users,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { BotAvatar } from "./Avatar";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 const MAX_TEAM_FILE_BYTES = 1_000_000;
@@ -139,6 +142,83 @@ function TeamGlyph({ index }: { index: number }) {
   );
 }
 
+/** Build static avatar props for a single-bot export-scope option. */
+export function exportScopeAvatarProps<T extends { id: string }>(option: ExportScopeOption, bots: readonly T[]) {
+  const bot = resolveExportScopeBot(option, bots);
+  return bot ? { bot, state: "idle" as const, size: 28, animated: false as const } : undefined;
+}
+
+/** Render the export-scope picker and its option list. */
+function ExportScopeSelect({
+  options,
+  bots,
+  value,
+  onChange,
+  disabled,
+}: {
+  options: ExportScopeOption[];
+  bots: Bot[];
+  value: ExportScopeOption["key"] | "";
+  onChange: (key: ExportScopeOption["key"]) => void;
+  disabled?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const selected = options.find((option) => option.key === value) ?? options[0];
+  /** Choose the icon or avatar that represents an export-scope option. */
+  const iconFor = (option: ExportScopeOption, size: number) => {
+    if (option.key.startsWith("bot:")) {
+      const avatarProps = exportScopeAvatarProps(option, bots);
+      return avatarProps ? <BotAvatar {...avatarProps} size={size} /> : <Sparkles size={size} className="text-ink-secondary" />;
+    }
+    if (option.category === "project") return <FolderOpen size={size} className="text-ink-secondary" />;
+    if (option.category === "team") return <MessageSquare size={size} className="text-ink-secondary" />;
+    return <Users size={size} className="text-ink-secondary" />;
+  };
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        disabled={disabled || options.length === 0}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+        className="flex w-full items-center gap-3 rounded-xl bg-raised/70 px-3 py-2.5 text-left hover:bg-raised disabled:opacity-50"
+      >
+        {selected ? iconFor(selected, 28) : <Sparkles size={28} className="text-ink-secondary" />}
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-[13.5px] font-medium text-ink">{selected?.label ?? "No bots available"}</span>
+          <span className="block truncate text-[11.5px] text-ink-secondary">{selected?.detail ?? "Create a bot before exporting"}</span>
+        </span>
+        <ChevronDown size={15} className={cn("text-ink-secondary transition-transform", open && "rotate-180")} />
+      </button>
+      {open && options.length > 0 && (
+        <div role="listbox" aria-label="Export scope" className="absolute inset-x-0 top-full z-10 mt-1 max-h-64 overflow-y-auto rounded-xl border border-hairline/50 bg-panel p-1 shadow-xl">
+          {options.map((option) => (
+            <button
+              key={option.key}
+              type="button"
+              role="option"
+              aria-selected={option.key === selected?.key}
+              onClick={() => {
+                onChange(option.key);
+                setOpen(false);
+              }}
+              className="flex w-full items-center gap-3 rounded-lg px-2.5 py-2 text-left hover:bg-raised"
+            >
+              {iconFor(option, option.key.startsWith("bot:") ? 28 : 20)}
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-[13px] text-ink">{option.label}</span>
+                <span className="block truncate text-[11px] text-ink-secondary">{option.detail}</span>
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Render the team library modal for exporting, browsing, importing, and scouting teams. */
 export function TeamLibraryPanel({
   onClose,
   onImported,
@@ -173,6 +253,9 @@ export function TeamLibraryPanel({
   // the folder the current `scouted` result was actually read from — the
   // import must pin the room to THIS, not to whatever the input says now
   const [scoutedFolder, setScoutedFolder] = useState("");
+  const [exportScopeKey, setExportScopeKey] = useState<ExportScopeOption["key"] | "">("");
+  const [exportName, setExportName] = useState("My OpenMaus Team");
+  const [exporting, setExporting] = useState(false);
   // null = not asked yet or still loading; [] = asked, nothing (or offline)
   const [directory, setDirectory] = useState<DirectoryCandidate[] | null>(null);
   const [pickedDirectory, setPickedDirectory] = useState<Set<string>>(new Set());
@@ -191,6 +274,16 @@ export function TeamLibraryPanel({
   const scoutRequest = useRef(0);
 
   const currentBotCount = state.bots.filter((bot) => !bot.hidden).length;
+  const exportOptions = useMemo(
+    () => buildExportScopeOptions({ projectFilter: "all", bots: state.bots, groups: state.groups }),
+    [state.bots, state.groups],
+  );
+  const selectedExportOption = exportOptions.find((option) => option.key === exportScopeKey) ?? exportOptions[0];
+  const selectedExportBotIds = selectedExportOption?.botIds ?? [];
+  const selectedExportBots = state.bots.filter((bot) => selectedExportBotIds.includes(bot.id) && !bot.hidden);
+  useEffect(() => {
+    if (selectedExportOption && selectedExportOption.key !== exportScopeKey) setExportScopeKey(selectedExportOption.key);
+  }, [exportScopeKey, selectedExportOption]);
 
   const loadCatalog = useCallback(async () => {
     setCatalogLoading(true);
@@ -398,6 +491,24 @@ export function TeamLibraryPanel({
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setImporting(false);
+    }
+  };
+
+  /** Request the selected team package and trigger its local download. */
+  const exportTeam = async () => {
+    if (!selectedExportOption || exporting) return;
+    setExporting(true);
+    setError("");
+    try {
+      const packageFile = await api("/api/teams/export", {
+        method: "POST",
+        body: JSON.stringify(buildExportRequest(exportName, selectedExportOption.scope, [])),
+      });
+      downloadExportPackage(packageFile as ExportedPackage);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setExporting(false);
     }
   };
 
@@ -682,9 +793,16 @@ export function TeamLibraryPanel({
               <div className="mt-2 grid grid-cols-1 gap-x-10 md:grid-cols-2">
                 {pending.members.map((member, index) => (
                   <div key={`${member.name}-${index}`} className="flex min-h-[72px] items-center gap-3 border-b border-hairline/35 px-1 py-3">
-                    <div className={cn("flex size-9 shrink-0 items-center justify-center rounded-lg text-[13px] font-semibold", TEAM_GLYPHS[index % TEAM_GLYPHS.length])}>
-                      {member.name.slice(0, 1).toUpperCase()}
-                    </div>
+                    <BotAvatar
+                      bot={{
+                        name: member.name,
+                        color: member.appearance?.color ?? "green",
+                        mascotBody: member.appearance?.mascotBody,
+                      }}
+                      state={member.appearance?.mascotExpression ?? "idle"}
+                      size={36}
+                      animated={false}
+                    />
                     <div className="min-w-0">
                       <div className="truncate text-[14px] font-medium text-ink">{member.name}</div>
                       <div className="mt-0.5 truncate text-[12.5px] text-ink-secondary">{member.title || "General assistant"}</div>
@@ -743,6 +861,20 @@ export function TeamLibraryPanel({
           <>
             <div className="flex flex-col gap-3 px-6 pb-4 pt-5 sm:flex-row sm:items-center sm:justify-between sm:px-8">
             <div className="flex w-fit rounded-xl bg-raised/70 p-1" role="tablist" aria-label="Team source">
+                <button
+                  role="tab"
+                  aria-selected={tab === "export"}
+                  onClick={() => {
+                    setTab("export");
+                    setError("");
+                  }}
+                  className={cn(
+                    "rounded-lg px-4 py-2 text-[13.5px] transition-colors",
+                    tab === "export" ? "bg-card text-ink shadow-sm" : "text-ink-secondary hover:text-ink",
+                  )}
+                >
+                  Export &amp; share
+                </button>
                 <button
                   role="tab"
                   aria-selected={tab === "export"}

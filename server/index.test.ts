@@ -2245,28 +2245,32 @@ describe("harness HTTP API", () => {
     }
   });
 
-  it("exports only the explicitly scoped visible bots", async () => {
-    const first = (await api("POST", "/api/bots", { name: "Scoped Lead" })).body.bot;
-    const second = (await api("POST", "/api/bots", { name: "Scoped Helper" })).body.bot;
+  it("exports only the requested visible bot scope", async () => {
+    const first = (await api("POST", "/api/bots", { name: "Scoped Mira" })).body.bot;
+    const second = (await api("POST", "/api/bots", { name: "Scoped Scout" })).body.bot;
+    const hidden = (await api("POST", "/api/bots", { name: "Scoped Hidden" })).body.bot;
+    await api("PATCH", `/api/bots/${hidden.id}`, { hidden: true });
     try {
-      const exported = await api("POST", "/api/teams/export", {
-        format: "package",
-        name: "Scoped Package",
-        scope: { botIds: [first.id], groupIds: [] },
+      const scope = { botIds: [first.id], groupIds: [] };
+      const team = await api("POST", "/api/teams/export", { name: "Scoped Team", scope });
+      expect(team.status).toBe(200);
+      expect(team.body.team.members.map((member: { name: string }) => member.name)).toEqual(["Scoped Mira"]);
+
+      const packageExport = await api("POST", "/api/teams/export", { name: "Scoped Team", format: "package", scope });
+      expect(packageExport.status).toBe(200);
+      expect(packageExport.body.members).toBe(1);
+      expect(packageExport.body.markdown).toContain("Scoped Mira");
+      expect(packageExport.body.markdown).not.toMatch(/Scoped Scout|Scoped Hidden/);
+
+      const hiddenScope = await api("POST", "/api/teams/export", {
+        scope: { botIds: [hidden.id], groupIds: [] },
       });
-      expect(exported.status).toBe(200);
-      expect(exported.body.members).toBe(1);
-      expect(exported.body.markdown).toContain("Scoped Lead");
-      expect(exported.body.markdown).not.toContain("Scoped Helper");
-      const invalid = await api("POST", "/api/teams/export", {
-        format: "package",
-        scope: { botIds: [first.id, first.id], groupIds: [] },
-      });
-      expect(invalid.status).toBe(400);
-      expect(invalid.body.error).toContain("must not contain duplicates");
+      expect(hiddenScope.status).toBe(400);
+      expect(hiddenScope.body.error).toContain("hidden bot");
     } finally {
       await api("DELETE", `/api/bots/${first.id}`);
       await api("DELETE", `/api/bots/${second.id}`);
+      await api("DELETE", `/api/bots/${hidden.id}`);
     }
   });
 
