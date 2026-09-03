@@ -375,7 +375,8 @@ export function TeamLibraryPanel({
     try {
       setShares(await bridge.botShares.list());
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      console.warn("Failed to load online bot shares:", cause);
+      setShares([]);
     } finally {
       setSharesLoading(false);
     }

@@ -8,6 +8,15 @@ import { isIP } from "node:net";
 import { extname, join } from "node:path";
 
 import { z } from "zod";
+
+process.on("uncaughtException", (err) => {
+  if ((err as any)?.code === "EPIPE" || (err as any)?.code === "ECONNRESET") {
+    console.error("[server] non-fatal stream error ignored:", (err as Error).message);
+    return;
+  }
+  console.error("[server] fatal uncaught exception:", err);
+  process.exit(1);
+});
 import { botAvatarUrlFromStoredPath } from "../shared/bot-avatar.ts";
 import {
   CREDENTIAL_TARGETS,

@@ -323,6 +323,8 @@ async function fetchHermesAcpModels(
     };
     timer = setTimeout(() => done([]), 5_000);
     child.once("error", () => done([]));
+    child.stdin?.on("error", () => done([]));
+    child.stdout?.on("error", () => done([]));
     child.once("close", () => {
       if (hardKillTimer) clearTimeout(hardKillTimer);
       done([]);
