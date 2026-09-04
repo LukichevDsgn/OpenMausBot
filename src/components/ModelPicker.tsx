@@ -51,8 +51,7 @@ export function AntigravityAccountCards({
 }) {
   const account = accounts.find((candidate) => candidate.instanceId === selectedInstanceId);
   if (!account) return null;
-  const geminiQuota = account.quota?.gemini;
-  const otherQuota = account.quota?.other;
+  const quota = account.quota?.gemini;
   const value = (window: { remaining: number; resetsAt: string | null } | null | undefined) =>
     window && typeof window.remaining === "number" ? `${window.remaining}%` : "—";
   return (
@@ -63,38 +62,28 @@ export function AntigravityAccountCards({
       <div className="flex items-center justify-between gap-2">
         <span className="truncate font-medium text-ink">{accountDisplayLabel(account)}</span>
         <span className={cn("text-[10px]", selectedBotInstanceId === account.instanceId ? "text-success font-medium" : "text-ink-secondary")}>
-          {selectedBotInstanceId === account.instanceId ? "Выбран для бота" : "Выбери модель"}
+          {selectedBotInstanceId === account.instanceId ? "Selected for bot" : "Select model"}
         </span>
       </div>
       {account.quotaStale && (
         <div className="mt-1 text-warning">Refresh failed · showing last good</div>
       )}
-      <div className="mt-2 space-y-1 text-ink">
-        <div className="flex items-center justify-between gap-2 text-[10.5px]">
-          <span className="w-16 shrink-0 text-ink-secondary">Gemini:</span>
-          <span className="min-w-0 flex-1">Неделя: <b>{value(geminiQuota?.weekly)}</b></span>
-          <span className="min-w-0 flex-1">5 часов: <b>{value(geminiQuota?.fiveHour)}</b></span>
-        </div>
-        {otherQuota && (otherQuota.weekly || otherQuota.fiveHour) && (
-          <div className="flex items-center justify-between gap-2 text-[10.5px]">
-            <span className="w-16 shrink-0 text-ink-secondary">Claude &amp; GPT:</span>
-            <span className="min-w-0 flex-1">Неделя: <b>{value(otherQuota?.weekly)}</b></span>
-            <span className="min-w-0 flex-1">5 часов: <b>{value(otherQuota?.fiveHour)}</b></span>
-          </div>
-        )}
+      <div className="mt-2 flex items-center gap-4 text-[11px] text-ink">
+        <span>Weekly: <b>{value(quota?.weekly)}</b></span>
+        <span>5-hour: <b>{value(quota?.fiveHour)}</b></span>
       </div>
       <div className="mt-2 flex items-center justify-between border-t border-hairline/20 pt-1.5 text-[10px] text-ink-secondary">
-        <span>Профиль: {account.profile.toUpperCase()}</span>
+        <span>Profile {account.profile.toUpperCase()}</span>
         <button
           type="button"
           onClick={onRefresh}
           disabled={busy}
           className="flex items-center gap-1 rounded px-1.5 py-0.5 text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50"
-          title="Обновить квоту выбранного аккаунта"
-          aria-label="Обновить квоты Antigravity"
+          title="Refresh account quota"
+          aria-label="Refresh account quota"
         >
           <RefreshCw size={11} className={busy ? "animate-spin" : undefined} />
-          <span>Обновить квоты</span>
+          <span>Refresh quota</span>
         </button>
       </div>
     </div>
