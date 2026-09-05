@@ -253,6 +253,7 @@ export interface Bot {
   avatarUrl?: string | null;
   /** Mascot, or the crop applied to avatarUrl. */
   avatarCrop?: BotAvatarCrop;
+  avatarDefinition?: import("../../shared/bot-avatar").BotProceduralAvatar | null;
   unread: boolean;
   busy?: boolean;
   /** what the bot is doing, as the harness sees it; busy is derived from it */
@@ -350,7 +351,12 @@ export interface ConfigStatus {
   /** UI language override; "" (or absent) follows the system language. */
   language?: string;
   /** Opt-in flags. Absent means off. */
-  features?: { skillRecorder: boolean; showToolCalls?: boolean; browser?: boolean };
+  features?: {
+    skillRecorder: boolean;
+    showToolCalls?: boolean;
+    browser?: boolean;
+    antigravityProxy?: { mode: "off" | "tun" | "proxy"; url: string };
+  };
   /** Named browser sessions any bot can be pointed at. */
   browserProfiles?: BrowserProfile[];
 }
@@ -444,11 +450,44 @@ export interface InstanceInfo {
   cliCandidates?: string[];
 }
 
+export interface AntigravityQuotaWindow { remaining: number; resetsAt: string | null }
+export interface AntigravityAccountStatus {
+  profile: "a" | "b";
+  instanceId: string;
+  label: string;
+  /** Optional sanitized account label from the runtime quota response. */
+  email?: string;
+  quota?: {
+    gemini?: { weekly?: AntigravityQuotaWindow; fiveHour?: AntigravityQuotaWindow };
+    claudeGpt?: { weekly?: AntigravityQuotaWindow; fiveHour?: AntigravityQuotaWindow };
+  };
+  quotaStale?: boolean;
+}
+
+export interface SkillCatalogEntry {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  defaultEnabled: boolean;
+  triggerTerms: string[];
+  requiredCapabilities: string[];
+  tools: string[];
+  dependencies: string[];
+  origin: "built-in" | "recorded" | "imported";
+  status: "available";
+  source?: string;
+  importedAt?: string;
+  warnings: string[];
+  skippedFiles: string[];
+}
+
 export type AppSettingsSection =
   | "general"
   | "experimental"
   | "connections"
   | "engines"
+  | "skills"
   | "companion"
   | "remote"
   | "computer"
@@ -457,6 +496,7 @@ export type AppSettingsSection =
 export interface AppState {
   bots: Bot[];
   groups: Group[];
+  skills: SkillCatalogEntry[];
   instances: InstanceInfo[];
   config: ConfigStatus | null;
   /** selected chat — a bot id OR a group id */
@@ -565,6 +605,7 @@ export type Action =
   | { type: "showRoutines" }
   | { type: "showTeamMap" }
   | { type: "showSkillRecorder" }
+  | { type: "skillsCatalog"; skills: SkillCatalogEntry[] }
   | { type: "routinesHydrated"; routines: Routine[]; runs: RoutineRun[] }
   | { type: "routinePatched"; routine: Routine }
   | { type: "routineDeleted"; routineId: string }
@@ -839,6 +880,8 @@ export function reducer(state: AppState, action: Action): AppState {
         appSettingsOpen: false,
         pluginsOpen: false,
       };
+    case "skillsCatalog":
+      return { ...state, skills: action.skills };
     case "routinesHydrated":
       return { ...state, routines: action.routines, routineRuns: trimRoutineRuns(action.runs) };
     case "routinePatched": {
@@ -1457,6 +1500,7 @@ const MAX_KEPT_SCREEN_FRAMES = 8;
 export const initialState: AppState = {
   bots: [],
   groups: [],
+  skills: [],
   instances: [],
   config: null,
   selectedId: "",
@@ -2266,7 +2310,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // ── initial load + SSE fold ──────────────────────────────────────────
   useEffect(() => {
     let alive = true;
-    type PeripheralKey = "instances" | "config" | "routines" | "webhooks";
+    type PeripheralKey = "instances" | "config" | "routines" | "webhooks" | "skills";
     type PeripheralPart = {
       key: PeripheralKey;
       request: () => Promise<() => void>;
@@ -2292,6 +2336,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         request: async () => {
           const { instances } = await api("/api/instances");
           return () => rawDispatch({ type: "instances", instances });
+        },
+      },
+      {
+        key: "skills",
+        request: async () => {
+          const { skills } = await api("/api/skills/catalog");
+          return () => rawDispatch({ type: "skillsCatalog", skills: skills ?? [] });
         },
       },
       {

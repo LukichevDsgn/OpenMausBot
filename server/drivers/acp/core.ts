@@ -467,6 +467,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           env: launch.env ?? env,
           stdio: ["pipe", "pipe", "pipe"],
         });
+        child.stdin.on("error", () => {});
 
         const state = { settled: false, promptSent: false, text: "" };
         const asks = new Map<string, (behavior: string, source?: "user" | "timeout" | "system", message?: string) => void>();

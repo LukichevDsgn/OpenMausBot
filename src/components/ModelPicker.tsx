@@ -1,32 +1,131 @@
 // Compact model picker: providers live on a Cloud/Local rail. Ready engines
 // show a short suggested list with search and an explicit all-models view;
 // engines that need setup show one focused action instead of a disabled wall.
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { Check, ChevronDown, ChevronLeft, ChevronRight, Loader2, RefreshCw, Search } from "lucide-react";
-import { useStore, type Bot, type InstanceInfo, type ModelSelection } from "@/state/store";
-import { filterCustomModels, partitionCustomModels, suggestedModels } from "@/lib/custom-models";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Check, ChevronDown, ChevronLeft, ChevronRight, RefreshCw, Search } from "lucide-react";
+import { api, useStore, type AntigravityAccountStatus, type Bot, type InstanceInfo, type ModelSelection } from "@/state/store";
+import { filterCustomModels, isOpenMausEndpointModel, partitionCustomModels, suggestedModels } from "@/lib/custom-models";
 import { isCustomOnly, splitEngineRail } from "@/lib/engine-rail";
 import { ProviderMark } from "./ProviderIcons";
-import { EngineSetup, EngineUpdateNotice, needsCli, needsSignIn } from "./EngineSetup";
+import { EngineSetup, EngineUpdateNotice, engineUnavailable, needsCli, needsSignIn } from "./EngineSetup";
 import { EngineGroupLabel } from "./EngineGroupLabel";
 import { cn } from "@/lib/cn";
 import { COMPACT_SQUARE } from "@/lib/compact-chip";
 
 type ModelOption = InstanceInfo["models"]["options"][number];
 const COMPACT_MODEL_COUNT = 5;
+const OPENMAUS_RAIL_ID = "__openmaus_endpoints__";
 
 function modelLabel(instance: InstanceInfo | undefined, model: string): string {
   return instance?.models.options.find((option) => option.id === model)?.label ?? model;
 }
 
-function modelProvider(instance: InstanceInfo | undefined, model: string): string | undefined {
-  return instance?.models.options.find((option) => option.id === model)?.provider;
-}
-
 function engineStatus(instance: InstanceInfo): string {
   if (needsCli(instance)) return "Not installed";
+  if (engineUnavailable(instance)) return "Unavailable";
   if (needsSignIn(instance)) return "Sign-in required";
   return instance.snapshot.version ?? "Ready";
+}
+
+const RUNTIME_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[A-Za-z]{2,}$/;
+
+export function accountDisplayLabel(account: AntigravityAccountStatus): string {
+  const candidate = account.email?.trim();
+  return candidate && RUNTIME_EMAIL_RE.test(candidate)
+    ? candidate
+    : `Worker ${account.profile.toUpperCase()} account`;
+}
+
+export function AntigravityAccountCards({
+  accounts,
+  selectedInstanceId,
+  selectedBotInstanceId,
+  busy,
+  onRefresh,
+}: {
+  accounts: AntigravityAccountStatus[];
+  selectedInstanceId: string;
+  selectedBotInstanceId: string;
+  busy: boolean;
+  onRefresh: () => void;
+}) {
+  const account = accounts.find((candidate) => candidate.instanceId === selectedInstanceId);
+  if (!account) return null;
+  const quota = account.quota?.gemini;
+  const value = (window: { remaining: number; resetsAt: string | null } | null | undefined) =>
+    window && typeof window.remaining === "number" ? `${window.remaining}%` : "—";
+  return (
+    <div
+      data-testid={`antigravity-quota-card-${account.instanceId}`}
+      className="mt-2 rounded-lg border border-hairline/40 bg-inset px-2.5 py-2 text-[11px]"
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="truncate font-medium text-ink">{accountDisplayLabel(account)}</span>
+        <span className={cn("text-[10px]", selectedBotInstanceId === account.instanceId ? "text-success font-medium" : "text-ink-secondary")}>
+          {selectedBotInstanceId === account.instanceId ? "Selected for bot" : "Select model"}
+        </span>
+      </div>
+      {account.quotaStale && (
+        <div className="mt-1 text-warning">Refresh failed · showing last good</div>
+      )}
+      <div className="mt-2 flex items-center gap-4 text-[11px] text-ink">
+        <span>Weekly: <b>{value(quota?.weekly)}</b></span>
+        <span>5-hour: <b>{value(quota?.fiveHour)}</b></span>
+      </div>
+      <div className="mt-2 flex items-center justify-between border-t border-hairline/20 pt-1.5 text-[10px] text-ink-secondary">
+        <span>Profile {account.profile.toUpperCase()}</span>
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={busy}
+          className="flex items-center gap-1 rounded px-1.5 py-0.5 text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50"
+          title="Refresh account quota"
+          aria-label="Refresh account quota"
+        >
+          <RefreshCw size={11} className={busy ? "animate-spin" : undefined} />
+          <span>Refresh quota</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export function ModelPickerRailButton({
+  instance,
+  iconKind = instance.driverKind,
+  selected,
+  attention,
+  disabled,
+  onSelect,
+}: {
+  instance: InstanceInfo;
+  iconKind?: InstanceInfo["driverKind"] | "openmaus";
+  selected: boolean;
+  attention: boolean;
+  disabled: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      key={`${iconKind}:${instance.instanceId}`}
+      onClick={onSelect}
+      disabled={disabled}
+      aria-label={iconKind === "openmaus" ? "OpenMaus API" : instance.displayName}
+      aria-pressed={selected}
+      title={`${iconKind === "openmaus" ? "OpenMaus API" : instance.displayName} · ${engineStatus(instance)}`}
+      data-testid={`model-picker-rail-${instance.instanceId}`}
+      className={cn(
+        "relative flex size-9 items-center justify-center rounded-lg",
+        selected ? "bg-control ring-1 ring-hairline/50" : "hover:bg-control/60",
+      )}
+    >
+      <ProviderMark driverKind={iconKind} size={18} />
+      {attention && (
+        <span className="absolute bottom-0.5 right-0.5 size-1.5 rounded-full bg-warning ring-2 ring-panel" />
+      )}
+    </button>
+  );
 }
 
 function ModelRow({
@@ -51,14 +150,6 @@ function ModelRow({
     >
       <span className="flex min-w-0 items-center gap-2">
         <span className="truncate">{option.label}</span>
-        {option.provider && (
-          <span
-            className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary"
-            title={`Provider: ${option.provider}`}
-          >
-            {option.provider}
-          </span>
-        )}
         {option.id === defaultId && (
           <span className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary">Default</span>
         )}
@@ -103,6 +194,7 @@ function ModelSearch({
   );
 }
 
+/** Render model selection, Antigravity account status, and network controls. */
 export function ModelPicker({
   bot,
   className,
@@ -116,58 +208,51 @@ export function ModelPicker({
   contained?: boolean;
   label?: ReactNode;
 }) {
-  const { state, dispatch, refreshInstances, refreshModels: refreshInstanceModels } = useStore();
+  const { state, dispatch, refreshInstances } = useStore();
   const [open, setOpen] = useState(false);
   const [railId, setRailId] = useState<string | null>(null);
   const [pane, setPane] = useState<"main" | "custom">("main");
   const [query, setQuery] = useState("");
   const [showAll, setShowAll] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
+  const [agyAccounts, setAgyAccounts] = useState<AntigravityAccountStatus[]>([]);
+  const [agyBusy, setAgyBusy] = useState(false);
+  const [agyError, setAgyError] = useState<string | null>(null);
+  const [agyNotice, setAgyNotice] = useState<string | null>(null);
+  const [agyProxyDraft, setAgyProxyDraft] = useState("http://127.0.0.1:10808");
+  const [agyProxySaving, setAgyProxySaving] = useState(false);
+  const [agyProxyError, setAgyProxyError] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
-  const refreshingRef = useRef(false);
 
   const selection = bot.modelSelection;
   const active = state.instances.find((instance) => instance.instanceId === selection.instanceId);
   const railInstance =
-    state.instances.find((instance) => instance.instanceId === (railId ?? selection.instanceId)) ?? state.instances[0];
-
-  const refreshLocalInstances = useCallback(() => {
-    if (refreshingRef.current) return;
-    refreshingRef.current = true;
-    setRefreshing(true);
-    void refreshInstances()
-      .catch(() => {
-        // Keep the last known catalog when the app is temporarily offline.
-      })
-      .finally(() => {
-        refreshingRef.current = false;
-        setRefreshing(false);
-      });
-  }, [refreshInstances]);
-
-  const refreshModels = useCallback(() => {
-    if (refreshingRef.current) return;
-    refreshingRef.current = true;
-    setRefreshing(true);
-    const instanceId = railId ?? selection.instanceId;
-    void refreshInstances()
-      .then(() => refreshInstanceModels(instanceId))
-      .catch(() => {
-        // Keep the last known catalog when the app is temporarily offline.
-      })
-      .finally(() => {
-        refreshingRef.current = false;
-        setRefreshing(false);
-      });
-  }, [railId, refreshInstanceModels, refreshInstances, selection.instanceId]);
+    state.instances.find((instance) => instance.instanceId === (railId === OPENMAUS_RAIL_ID ? "opencodeGo" : railId ?? selection.instanceId)) ?? state.instances[0];
+  const showingOpenMaus = railId === OPENMAUS_RAIL_ID;
+  const antigravityProxy = state.config?.features?.antigravityProxy ?? {
+    mode: "off" as const,
+    url: "http://127.0.0.1:10808",
+  };
 
   useEffect(() => {
-    if (open) refreshLocalInstances();
-  }, [open, refreshLocalInstances]);
+    if (open) setAgyProxyDraft(antigravityProxy.url);
+  }, [open, antigravityProxy.url]);
 
   useEffect(() => {
     if (bot.busy) setOpen(false);
   }, [bot.busy]);
+
+  useEffect(() => {
+    if (!open) return;
+    void refreshInstances();
+    setAgyError(null);
+    setAgyNotice(null);
+    // Opening a model menu must stay read-only. The Antigravity CLI's `/usage`
+    // command may start an interactive OAuth flow, so quota collection is never
+    // triggered implicitly from the picker.
+    void api("/api/antigravity/accounts")
+      .then((value) => setAgyAccounts(value.accounts ?? []))
+      .catch((error) => setAgyError(error instanceof Error ? error.message : String(error)));
+  }, [open, refreshInstances]);
 
   useEffect(() => {
     if (!open) return;
@@ -210,8 +295,32 @@ export function ModelPicker({
     resetList();
   };
 
-  const pick = (instance: InstanceInfo, model: string) => {
+  const selectOpenMaus = () => {
+    setRailId(OPENMAUS_RAIL_ID);
+    setPane("custom");
+    resetList();
+  };
+
+  const pick = async (instance: InstanceInfo, model: string) => {
     if (bot.busy) return;
+    const account = agyAccounts.find((candidate) => candidate.instanceId === instance.instanceId);
+    if (account) {
+      setAgyBusy(true);
+      setAgyError(null);
+      try {
+        const result = await api("/api/antigravity/activate", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ profile: account.profile }),
+        });
+        setAgyAccounts(result.accounts ?? []);
+      } catch (error) {
+        setAgyError(error instanceof Error ? error.message : String(error));
+        setAgyBusy(false);
+        return;
+      }
+      setAgyBusy(false);
+    }
     const sameInstance = instance.instanceId === selection.instanceId;
     const nextSelection: ModelSelection = {
       instanceId: instance.instanceId,
@@ -226,22 +335,83 @@ export function ModelPicker({
     setOpen(false);
   };
 
+  const refreshAgyQuotas = async () => {
+    setAgyBusy(true);
+    setAgyError(null);
+    setAgyNotice(null);
+    try {
+      const selectedAccount = agyAccounts.find(
+        (candidate) => candidate.instanceId === railInstance.instanceId,
+      );
+      if (!selectedAccount) throw new Error("No Antigravity account is selected.");
+      const result = await api(`/api/antigravity/accounts?refresh=1&profile=${selectedAccount.profile}`);
+      setAgyAccounts(result.accounts ?? []);
+      if (result.refreshDeferred) {
+        setAgyNotice("Worker is active. Quota will refresh automatically when its task finishes.");
+      }
+    } catch (error) {
+      setAgyError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAgyBusy(false);
+    }
+  };
+
+  const saveAgyProxy = async (patch: { mode?: "off" | "tun" | "proxy"; url?: string }) => {
+    if (agyProxySaving) return;
+    setAgyProxySaving(true);
+    setAgyProxyError(null);
+    try {
+      const config = await fetch("/api/config", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ features: { antigravityProxy: patch } }),
+      }).then(async (response) => {
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.error ?? "Could not save the Antigravity network mode.");
+        return body;
+      });
+      dispatch({ type: "configStatus", config });
+    } catch (error) {
+      setAgyProxyError(error instanceof Error ? error.message : "Could not save the Antigravity network mode.");
+    } finally {
+      setAgyProxySaving(false);
+    }
+  };
+
+  const selectAgyProxyMode = (mode: "off" | "tun" | "proxy") => {
+    if (mode === antigravityProxy.mode) return;
+    void saveAgyProxy(mode === "proxy"
+      ? { mode, url: agyProxyDraft.trim() || antigravityProxy.url }
+      : { mode });
+  };
+
+  const saveAgyProxyUrl = () => {
+    if (antigravityProxy.mode !== "proxy" || agyProxyDraft.trim() === antigravityProxy.url) return;
+    void saveAgyProxy({ mode: "proxy", url: agyProxyDraft });
+  };
+
   const official = railInstance?.models.options.filter((option) => !option.custom) ?? [];
   const custom = railInstance?.models.options.filter((option) => option.custom) ?? [];
+  const endpointSource = state.instances.find((instance) => instance.instanceId === "opencodeGo");
+  const endpointModels = endpointSource?.models.options.filter((option) => isOpenMausEndpointModel(option.id)) ?? [];
+  const visibleCustom = showingOpenMaus
+    ? custom.filter((option) => isOpenMausEndpointModel(option.id))
+    : custom.filter((option) => !isOpenMausEndpointModel(option.id));
+  const hasOpenMausModels = endpointModels.length > 0;
   const currentModel = selection.instanceId === railInstance?.instanceId ? selection.model : undefined;
   const filteredOfficial = filterCustomModels(official, query);
   const compactOfficial = railInstance
     ? suggestedModels(official, railInstance.models.default, currentModel, COMPACT_MODEL_COUNT)
     : [];
   const shownOfficial = query ? filteredOfficial : showAll ? official : compactOfficial;
-  const filteredCustom = filterCustomModels(custom, query);
+  const filteredCustom = filterCustomModels(visibleCustom, query);
   const { pinned, rest } = partitionCustomModels(filteredCustom);
   const blocked = railInstance
     ? pane === "custom"
-      ? needsCli(railInstance)
-      : needsCli(railInstance) || needsSignIn(railInstance)
+      ? engineUnavailable(railInstance)
+      : engineUnavailable(railInstance) || needsSignIn(railInstance)
     : false;
-  const canOpenCustom = Boolean(railInstance && !needsCli(railInstance));
+  const canOpenCustom = Boolean(railInstance && !engineUnavailable(railInstance));
   const canReturnToOfficial = official.length > 0 && !isCustomOnly(railInstance);
 
   const renderRow = (option: ModelOption) => (
@@ -250,57 +420,53 @@ export function ModelPicker({
       option={option}
       current={selection.instanceId === railInstance?.instanceId && selection.model === option.id}
       defaultId={railInstance?.models.default ?? ""}
-      onPick={() => railInstance && pick(railInstance, option.id)}
+      onPick={() => railInstance && void pick(railInstance, option.id)}
     />
   );
 
   const trigger = (
     <button
-      type="button"
-      disabled={Boolean(bot.busy)}
-      onClick={() => {
-        if (bot.busy) return;
-        setRailId(selection.instanceId);
-        setOpen((wasOpen) => {
-          const next = !wasOpen;
-          if (next) openFor(state.instances.find((instance) => instance.instanceId === selection.instanceId));
-          return next;
-        });
-      }}
-      aria-expanded={open && !bot.busy}
-      aria-haspopup="dialog"
-      className={cn(
-        "flex items-center gap-1.5 rounded-full border border-hairline/40 bg-control/60 py-1 pl-2 pr-2.5 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-control/60",
-        // in a narrow chat header fold to a rounded square with just the
-        // provider mark; the model name rides the tooltip (a bot with no
-        // resolved engine keeps its label — the mark is what would hide it)
-        !contained && active && COMPACT_SQUARE,
-      )}
-      title={
-        bot.busy
-          ? "Stop this bot's turn before changing its model"
-          : active
-          ? `${active.displayName} · ${modelLabel(active, selection.model)}${
-              modelProvider(active, selection.model) ? ` · ${modelProvider(active, selection.model)}` : ""
-            }`
-          : selection.model
-      }
-    >
-      {active && <ProviderMark driverKind={active.driverKind} size={14} />}
-      <span className={cn("max-w-[160px] truncate", !contained && active && "@max-4xl/chathead:hidden")}>
-        {modelLabel(active, selection.model)}
-        {active && modelProvider(active, selection.model) && (
-          <span className="text-ink-secondary"> · {modelProvider(active, selection.model)}</span>
-        )}
-      </span>
-      <ChevronDown
-        size={14}
+        type="button"
+        onClick={() => {
+          setRailId(selection.instanceId === "opencodeGo" && isOpenMausEndpointModel(selection.model)
+            ? OPENMAUS_RAIL_ID
+            : selection.instanceId);
+          setOpen((wasOpen) => {
+            const next = !wasOpen;
+            if (next) openFor(state.instances.find((instance) => instance.instanceId === selection.instanceId));
+            return next;
+          });
+        }}
+        aria-expanded={open && !bot.busy}
+        aria-haspopup="dialog"
+        disabled={Boolean(bot.busy)}
         className={cn(
-          "text-ink-secondary transition-transform",
-          open && "rotate-180",
-          !contained && active && "@max-4xl/chathead:hidden",
+          "flex items-center gap-1.5 rounded-full border border-hairline/40 bg-control/60 py-1 pl-2 pr-2.5 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-control/60",
+          // in a narrow chat header fold to a rounded square with just the
+          // provider mark; the model name rides the tooltip (a bot with no
+          // resolved engine keeps its label — the mark is what would hide it)
+          !contained && active && COMPACT_SQUARE,
         )}
-      />
+        title={
+          bot.busy
+            ? "Stop this bot's turn before changing its model"
+            : active
+            ? `${active.displayName} · ${modelLabel(active, selection.model)}`
+            : selection.model
+        }
+      >
+        {active && <ProviderMark driverKind={selection.instanceId === "opencodeGo" && isOpenMausEndpointModel(selection.model) ? "openmaus" : active.driverKind} size={14} />}
+        <span className={cn("max-w-[160px] truncate", !contained && active && "@max-4xl/chathead:hidden")}>
+        {modelLabel(active, selection.model)}
+        </span>
+        <ChevronDown
+          size={14}
+          className={cn(
+            "text-ink-secondary transition-transform",
+            open && "rotate-180",
+            !contained && active && "@max-4xl/chathead:hidden",
+          )}
+        />
     </button>
   );
 
@@ -330,27 +496,20 @@ export function ModelPicker({
           <div className="flex w-14 shrink-0 flex-col gap-1 overflow-y-auto border-r border-hairline/40 bg-panel p-2">
             {(() => {
               const { subscription, custom: local } = splitEngineRail(state.instances);
-              const railButton = (instance: InstanceInfo) => {
-                const selected = instance.instanceId === railInstance?.instanceId;
-                const attention = needsCli(instance) || needsSignIn(instance) || Boolean(instance.snapshot.update);
+              const railButton = (instance: InstanceInfo, iconKind = instance.driverKind) => {
+                const selected = iconKind === "openmaus"
+                  ? showingOpenMaus
+                  : !showingOpenMaus && instance.instanceId === railInstance?.instanceId;
+                const attention = engineUnavailable(instance) || needsSignIn(instance);
                 return (
-                  <button
-                    type="button"
-                    key={instance.instanceId}
-                    onClick={() => selectRail(instance)}
-                    aria-label={instance.displayName}
-                    aria-pressed={selected}
-                    title={`${instance.displayName} · ${engineStatus(instance)}`}
-                    className={cn(
-                      "relative flex size-9 items-center justify-center rounded-lg",
-                      selected ? "bg-control ring-1 ring-hairline/50" : "hover:bg-control/60",
-                    )}
-                  >
-                    <ProviderMark driverKind={instance.driverKind} size={18} />
-                    {attention && (
-                      <span className="absolute bottom-0.5 right-0.5 size-1.5 rounded-full bg-warning ring-2 ring-panel" />
-                    )}
-                  </button>
+                  <ModelPickerRailButton
+                    instance={instance}
+                    iconKind={iconKind}
+                    selected={selected}
+                    attention={attention}
+                    disabled={agyBusy}
+                    onSelect={() => iconKind === "openmaus" ? selectOpenMaus() : selectRail(instance)}
+                  />
                 );
               };
               return (
@@ -358,11 +517,12 @@ export function ModelPicker({
                   {subscription.length > 0 && (
                     <EngineGroupLabel className="px-0 pb-0.5 pt-0.5 text-center text-[9px]">Cloud</EngineGroupLabel>
                   )}
-                  {subscription.map(railButton)}
+                  {subscription.map((instance) => railButton(instance))}
+                  {hasOpenMausModels && endpointSource && railButton(endpointSource, "openmaus")}
                   {local.length > 0 && (
                     <EngineGroupLabel className="px-0 pb-0.5 pt-2 text-center text-[9px]">Local</EngineGroupLabel>
                   )}
-                  {local.map(railButton)}
+                  {local.map((instance) => railButton(instance))}
                 </>
               );
             })()}
@@ -373,48 +533,91 @@ export function ModelPicker({
               <>
                 <div className="shrink-0 px-4 pb-2 pt-3.5">
                   <div className="flex items-center justify-between gap-3">
-                    <div className="truncate text-[14px] font-semibold text-ink">{railInstance.displayName}</div>
-                    <div className="flex shrink-0 items-center gap-1">
-                      <button
-                        type="button"
-                        data-model-refresh
-                        disabled={refreshing}
-                        onClick={refreshModels}
-                        aria-label={
-                          refreshing
-                            ? `Refreshing ${railInstance.displayName} models`
-                            : `Refresh ${railInstance.displayName} models`
-                        }
-                        title="Refresh models"
-                        className="flex size-6 items-center justify-center rounded-md text-ink-secondary hover:bg-control hover:text-ink disabled:cursor-wait disabled:opacity-70"
-                      >
-                        {refreshing ? (
-                          <Loader2 size={12} className="animate-spin" aria-hidden="true" />
-                        ) : (
-                          <RefreshCw size={12} aria-hidden="true" />
-                        )}
-                      </button>
-                      <span
-                        className={cn(
-                          "shrink-0 rounded-full px-2 py-0.5 text-[10.5px] font-medium",
-                          blocked ? "bg-warning/10 text-warning" : "bg-success/10 text-success",
-                        )}
-                      >
-                        {pane === "custom" && !blocked ? "Local models" : engineStatus(railInstance)}
-                      </span>
-                    </div>
+                    <div className="truncate text-[14px] font-semibold text-ink">{showingOpenMaus ? "OpenMaus API" : railInstance.displayName}</div>
+                    <span
+                      className={cn(
+                        "shrink-0 rounded-full px-2 py-0.5 text-[10.5px] font-medium",
+                        blocked ? "bg-warning/10 text-warning" : "bg-success/10 text-success",
+                      )}
+                    >
+                      {showingOpenMaus && !blocked ? "API models" : pane === "custom" && !blocked ? "Local models" : engineStatus(railInstance)}
+                    </span>
                   </div>
                   <div className="mt-0.5 text-[11.5px] text-ink-secondary">
-                    {pane === "custom"
-                      ? "Run this agent with a model already on your machine."
-                      : "Choose a model for this bot."}
+                    {showingOpenMaus
+                      ? "Models discovered from your configured API keys."
+                      : pane === "custom"
+                        ? "Run this agent with a model already on your machine."
+                        : "Choose a model for this bot."}
                   </div>
+                  <AntigravityAccountCards
+                    accounts={agyAccounts}
+                    selectedInstanceId={railInstance.instanceId}
+                    selectedBotInstanceId={selection.instanceId}
+                    busy={agyBusy}
+                    onRefresh={() => void refreshAgyQuotas()}
+                  />
+                  {agyError && railInstance.driverKind === "antigravityAgent" && (
+                    <div className="mt-2 text-[10.5px] text-warning">{agyError}</div>
+                  )}
+                  {agyNotice && railInstance.driverKind === "antigravityAgent" && (
+                    <div className="mt-2 text-[10.5px] text-ink-secondary">{agyNotice}</div>
+                  )}
+                  {railInstance.driverKind === "antigravityAgent" && (
+                    <div className="mt-3 rounded-lg border border-hairline/40 bg-inset px-2.5 py-2.5">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="text-[12px] font-medium text-ink">VPN mode</div>
+                        <div role="radiogroup" aria-label="VPN mode" className="flex rounded-md bg-card p-0.5">
+                          {[
+                            { label: "Off", mode: "off" as const },
+                            { label: "TUN", mode: "tun" as const },
+                            { label: "Proxy", mode: "proxy" as const },
+                          ].map((mode) => (
+                            <button
+                              key={mode.label}
+                              type="button"
+                              role="radio"
+                              aria-checked={antigravityProxy.mode === mode.mode}
+                              disabled={agyProxySaving}
+                              onClick={() => selectAgyProxyMode(mode.mode)}
+                              className={cn(
+                                "rounded px-2 py-1 text-[10.5px] font-medium transition-colors",
+                                antigravityProxy.mode === mode.mode
+                                  ? "bg-control text-ink"
+                                  : "text-ink-secondary hover:text-ink",
+                                agyProxySaving && "cursor-wait opacity-50",
+                              )}
+                            >
+                              {mode.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      {antigravityProxy.mode === "proxy" && (
+                        <label className="mt-2 block text-[10.5px] text-ink-secondary">
+                          Proxy URL
+                          <input
+                            type="url"
+                            value={agyProxyDraft}
+                            onChange={(event) => setAgyProxyDraft(event.target.value)}
+                            onBlur={saveAgyProxyUrl}
+                            disabled={agyProxySaving}
+                            placeholder="http://127.0.0.1:10808"
+                            aria-label="Proxy URL"
+                            className="mt-1 w-full rounded-md border border-hairline/40 bg-card px-2 py-1.5 text-[11.5px] text-ink placeholder:text-ink-secondary focus:border-accent/60 focus:outline-none disabled:opacity-50"
+                          />
+                        </label>
+                      )}
+                      {agyProxyError && <div className="mt-1.5 text-[10.5px] text-warning">{agyProxyError}</div>}
+                    </div>
+                  )}
                 </div>
 
                 {pane === "custom" && canReturnToOfficial && (
                   <button
                     type="button"
                     onClick={() => {
+                      setRailId(railInstance.instanceId);
                       setPane("main");
                       resetList();
                     }}
@@ -436,7 +639,7 @@ export function ModelPicker({
                 ) : (
                   <>
                     {((pane === "main" && official.length > COMPACT_MODEL_COUNT) ||
-                      (pane === "custom" && custom.length > COMPACT_MODEL_COUNT)) && (
+                      (pane === "custom" && visibleCustom.length > COMPACT_MODEL_COUNT)) && (
                       <ModelSearch
                         value={query}
                         local={pane === "custom"}
@@ -495,15 +698,15 @@ export function ModelPicker({
                             <div className="mx-2 my-2 border-t border-hairline/40" role="separator" />
                           )}
                           {rest.map(renderRow)}
-                          {custom.length === 0 && (
+                          {visibleCustom.length === 0 && (
                             <div className="mx-1 rounded-xl border border-dashed border-hairline/50 px-3 py-5 text-center">
-                              <div className="text-[12.5px] font-medium text-ink">No local models found</div>
+                              <div className="text-[12.5px] font-medium text-ink">{showingOpenMaus ? "No API models found" : "No local models found"}</div>
                               <div className="mt-1 text-[11.5px] leading-relaxed text-ink-secondary">
-                                Start oMLX, Ollama, Unsloth, LM Studio, or EXO, then reopen this picker.
+                                {showingOpenMaus ? "Add and test an endpoint in Settings → Connections." : "Start oMLX, Ollama, Unsloth, LM Studio, or EXO, then reopen this picker."}
                               </div>
                             </div>
                           )}
-                          {custom.length > 0 && filteredCustom.length === 0 && (
+                          {visibleCustom.length > 0 && filteredCustom.length === 0 && (
                             <div className="px-2 py-5 text-center text-[12.5px] text-ink-secondary">
                               Nothing matches “{query.trim()}”
                             </div>
@@ -518,7 +721,7 @@ export function ModelPicker({
                   <button
                     type="button"
                     aria-label={
-                      custom.length > 0 ? `Use a local model (${custom.length} available)` : "Use a local model"
+                      visibleCustom.length > 0 ? `${showingOpenMaus ? "OpenMaus API models" : "Use a local model"} (${visibleCustom.length} available)` : "Use a local model"
                     }
                     disabled={!canOpenCustom}
                     onClick={() => {
@@ -527,11 +730,11 @@ export function ModelPicker({
                     }}
                     className="flex w-full shrink-0 items-center justify-between gap-2 border-t border-hairline/40 px-4 py-3 text-left text-[12.5px] font-medium text-ink hover:bg-control/60 disabled:cursor-not-allowed disabled:text-ink-secondary/40 disabled:hover:bg-transparent"
                   >
-                    <span>Use a local model</span>
+                    <span>{showingOpenMaus ? "OpenMaus API models" : "Use a local model"}</span>
                     <span className="flex items-center gap-2">
-                      {custom.length > 0 && (
+                      {visibleCustom.length > 0 && (
                         <span className="rounded-full bg-inset px-2 py-0.5 text-[10.5px] text-ink-secondary">
-                          {custom.length} available
+                          {visibleCustom.length} available
                         </span>
                       )}
                       <ChevronRight size={14} className="text-ink-secondary" />

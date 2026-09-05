@@ -6,6 +6,14 @@ import { existsSync, readFileSync, rmSync, unlinkSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { extname, join } from "node:path";
 
+process.on("uncaughtException", (error: any) => {
+  if (error && (error.code === "EPIPE" || error.code === "ECONNRESET")) {
+    return;
+  }
+  console.error("Uncaught exception in server process:", error);
+  process.exit(1);
+});
+
 import { z } from "zod";
 import { botAvatarUrlFromStoredPath } from "../shared/bot-avatar.ts";
 import {
@@ -27,6 +35,16 @@ import {
 } from "../shared/credential-request.ts";
 
 import { approvalModeForOrigin, autoVerdict, rememberableApprovalKey } from "./auto-approve.ts";
+import {
+  activateAntigravityProfile,
+  antigravityAccountStatuses,
+  antigravityManagedQuotaRefreshRunning,
+  antigravityManagedWorkerRunning,
+  antigravityProcessRunning,
+  profileForInstance,
+  refreshAntigravityProfileQuota,
+  type AntigravityProfile,
+} from "./antigravity-accounts.ts";
 import { requestReview, resolveAutoReviewMode, shouldReview } from "./auto-review.ts";
 import { updateClaudeCli } from "./claude-update.ts";
 import {
@@ -96,6 +114,8 @@ import {
   type Runtime,
 } from "./container-computer.ts";
 import {
+  antigravityNetworkRoute,
+  antigravityProxySettings,
   ensureDirs,
   instanceConfigs,
   loadConfig,
@@ -6958,6 +6978,22 @@ bus.subscribe((event: RuntimeEvent) => {
   if (event.type === "turn.completed") {
     drainConnectorResumes();
     drainSecretResumes();
+
+    // Quota cards are cache-backed so merely opening the picker never starts
+    // OAuth. Refresh the exact isolated A/B profile after its turn settles.
+    const settledBot = store.botByThread(event.threadId);
+    const settledProfile = settledBot ? profileForInstance(settledBot.modelSelection.instanceId) : null;
+    if (settledProfile) {
+      const timer = setTimeout(() => {
+        void refreshAntigravityProfileQuota(
+          settledProfile,
+          antigravityNetworkRoute(loadConfig()),
+        ).catch(() => {
+          // Telemetry is best-effort and must never change the turn outcome.
+        });
+      }, 1_500);
+      timer.unref?.();
+    }
   }
 });
 
@@ -7146,6 +7182,7 @@ function configStatus() {
       skillRecorder: skillRecorderEnabled(cfg),
       showToolCalls: showToolCallsEnabled(cfg),
       browser: builtInBrowserEnabled(cfg),
+      antigravityProxy: antigravityProxySettings(cfg),
     },
     // partitionId is non-secret routing metadata. The renderer needs it to
     // show the same durable session as an agent, but config PATCH validation
@@ -12040,6 +12077,59 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         if (changingLocalVmMode) localVmModeChangeBusy = false;
         providerConfigBusy = false;
       }
+    }
+
+    if (method === "GET" && path === "/api/antigravity/accounts") {
+      const refresh = url.searchParams.get("refresh") === "1";
+      const requestedProfile = url.searchParams.get("profile");
+      if (requestedProfile !== null && requestedProfile !== "a" && requestedProfile !== "b") {
+        return json(res, 400, { error: "profile must be a or b" });
+      }
+      // A managed Worker A/B turn owns the launcher's machine-wide credential
+      // mutex. Do not call it a standalone terminal and do not start a quota
+      // probe that may wait behind a long task. Return the last good cache;
+      // turn.completed refreshes that exact profile automatically.
+      if (refresh && antigravityManagedWorkerRunning()) {
+        return json(res, 200, {
+          accounts: await antigravityAccountStatuses(false),
+          refreshDeferred: true,
+        });
+      }
+      if (refresh && await antigravityProcessRunning() && !antigravityManagedQuotaRefreshRunning()) {
+        return json(res, 409, { error: "Close standalone Antigravity terminals before refreshing account quotas." });
+      }
+      if (refresh && requestedProfile) {
+        try {
+          await refreshAntigravityProfileQuota(
+            requestedProfile,
+            antigravityNetworkRoute(loadConfig()),
+          );
+        } catch {
+          // The status response keeps the last-good value and marks this exact
+          // profile stale, so the picker remains truthful without a generic 500.
+        }
+        return json(res, 200, { accounts: await antigravityAccountStatuses(false) });
+      }
+      return json(res, 200, {
+        accounts: await antigravityAccountStatuses(
+          refresh,
+          antigravityNetworkRoute(loadConfig()),
+        ),
+      });
+    }
+
+    if (method === "POST" && path === "/api/antigravity/activate") {
+      if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+        return json(res, 415, { error: "content-type must be application/json" });
+      }
+      const body = await readBody(req);
+      const profile = body?.profile as AntigravityProfile;
+      if (profile !== "a" && profile !== "b") return json(res, 400, { error: "profile must be a or b" });
+      if (providerConfigBusy || await antigravityProcessRunning()) {
+        return json(res, 409, { error: "Antigravity is busy. Wait for the current task or close its terminal." });
+      }
+      await activateAntigravityProfile(profile);
+      return json(res, 200, { accounts: await antigravityAccountStatuses(false) });
     }
 
     // ── voice ─────────────────────────────────────────────────────────

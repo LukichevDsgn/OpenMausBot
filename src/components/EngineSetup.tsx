@@ -34,6 +34,12 @@ export function needsCli(instance: InstanceInfo | undefined): boolean {
   return instance?.snapshot.state !== "available";
 }
 
+/** The engine cannot be used right now, regardless of whether installation
+ * is the remedy. */
+export function engineUnavailable(instance: InstanceInfo | undefined): boolean {
+  return instance?.snapshot.state === "unavailable";
+}
+
 export function CommandRow({
   command,
   actionLabel,

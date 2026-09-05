@@ -300,6 +300,8 @@ async function fetchHermesAcpModels(
       if (hardKillTimer) clearTimeout(hardKillTimer);
       done([]);
     });
+    child.stdin?.on("error", () => {});
+    child.stdout?.on("error", () => {});
 
     let buf = "";
     let id = 0;

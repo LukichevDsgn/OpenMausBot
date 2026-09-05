@@ -12,6 +12,7 @@ import {
   Copy,
   Crown,
   FolderMinus,
+  BookOpen,
   FolderPlus,
   Library,
   Loader2,
@@ -1655,6 +1656,12 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
                 icon: <Network size={18} />,
                 active: state.activeView === "team-map",
                 onSelect: () => dispatch({ type: "showTeamMap" }),
+              },
+              {
+                key: "skills-library",
+                label: "Skills library",
+                icon: <BookOpen size={18} />,
+                onSelect: () => dispatch({ type: "toggleAppSettings", section: "skills" }),
               },
               ...(!remoteClient && skillRecorderEnabled(state.config)
                 ? [

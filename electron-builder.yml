@@ -76,6 +76,8 @@ extraResources:
     to: skills
   - from: dist-native/android-platform-tools
     to: android-platform-tools
+  - from: dist-native/antigravity
+    to: antigravity
 
 mac:
   # Two single-arch artifacts rather than one universal binary: the app is
