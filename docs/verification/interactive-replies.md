@@ -88,7 +88,7 @@ repeat at 390 px. Mixed form controls must stack; only peer Cards get columns.
 The source and reset actions are in the reply's options menu.
 
 ```sh
-pnpm exec vitest run shared/interactive-reply.test.ts src/lib/interactive-state.test.ts src/lib/drafts.test.ts server/system-prompt.test.ts
+pnpm exec vitest run shared/interactive-reply.test.ts src/lib/interactive-state.test.ts src/lib/drafts.test.ts server/system-prompt.test.ts src/components/ChatMarkdown.test.ts
 pnpm typecheck
 ```
 
@@ -104,7 +104,7 @@ it does not claim document-preview behavior or Windows custom-path behavior.
 
 The focused checks completed on the feature branch:
 
-- `pnpm exec vitest run shared/interactive-reply.test.ts src/lib/interactive-state.test.ts src/lib/drafts.test.ts server/system-prompt.test.ts`: 5 files, 52 passed.
+- `pnpm exec vitest run shared/interactive-reply.test.ts src/lib/interactive-state.test.ts src/lib/drafts.test.ts server/system-prompt.test.ts src/components/ChatMarkdown.test.ts`: 5 files, 52 passed.
 - `pnpm typecheck`: passed.
 - `pnpm build`: passed.
 - Browser acceptance: choices, text entry, draft preservation without a POST,
