@@ -121,6 +121,7 @@ the draft in the composer. The checked-in screenshots are:
 - [`interactive-choices.png`](images/interactive-choices.png)
 - [`interactive-actions.png`](images/interactive-actions.png)
 - [`interactive-focus.png`](images/interactive-focus.png)
+- [`interactive-heatmap-8.png`](images/interactive-heatmap-8.png)
 - [`interactive-light.png`](images/interactive-light.png)
 - [`interactive-mobile.png`](images/interactive-mobile.png)
 
