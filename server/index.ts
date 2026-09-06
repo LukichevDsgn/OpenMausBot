@@ -68,6 +68,7 @@ import {
   generateAvatarImage,
   snapshotAvatarGenerationState,
 } from "./avatar-image.ts";
+import { readDocumentPreview } from "./document-preview.ts";
 import { fitsOnOneLine, parseBotProfilePatch } from "./bot-profile.ts";
 import { groupTurnCwd } from "./room-cwd.ts";
 import { RoomTurnDeadline, RoomTurnStallRegistry, roomTurnTimeoutMessage } from "./room-turn-timeout.ts";
@@ -8905,6 +8906,15 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
 
       const file = await openMessageFile(href, roots);
+      if (method === "POST" && body?.preview === true) {
+        try {
+          res.setHeader("cache-control", "private, no-store");
+          res.setHeader("x-content-type-options", "nosniff");
+          return json(res, 200, await readDocumentPreview(file));
+        } finally {
+          await file.handle.close();
+        }
+      }
       if (streamsMessageImage && !file.mime.startsWith("image/")) {
         await file.handle.close();
         return json(res, 415, { error: "only images can be previewed here" });

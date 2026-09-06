@@ -7876,6 +7876,24 @@ describe("message pages", () => {
     })).status).toBe(404);
   });
 
+  it("previews a document with the same stored-message and root boundaries as downloading", async () => {
+    const route = "/api/threads/test-linked-file-room-thread/messages";
+    const linkedFile = join(home, ".openmausbot", "workspaces", "test-bot-a", "phone report.md");
+    const result = await api("POST", `${route}/linked-file-message/file`, { path: linkedFile, preview: true });
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({ kind: "markdown", name: "phone report.md", text: "# Phone-ready report\n", truncated: false });
+    expect((await api("POST", `${route}/prose-file-message/file`, { path: linkedFile, preview: true })).status).toBe(403);
+    expect((await api("POST", `${route}/user-outside-file-message/file`, { path: linkedFile, preview: true })).status).toBe(403);
+    expect((await api("POST", `${route}/linked-file-message/file`, { path: join(home, "secret.txt"), preview: true })).status).toBe(403);
+    expect((await api("POST", `${route}/missing/file`, { path: linkedFile, preview: true })).status).toBe(404);
+    const pdf = await api("POST", `${route}/user-attached-file-message/file`, {
+      path: join(home, ".openmausbot", "attachments", "shared-notes.pdf"), preview: true,
+    });
+    expect(pdf.status).toBe(200);
+    expect(pdf.body.kind).toBe("download");
+    expect(pdf.body).not.toHaveProperty("text");
+  });
+
   it("downloads an image rendered by the exact stored bot message", async () => {
     const threadId = "test-linked-file-room-thread";
     const linkedImage = join(home, ".openmausbot", "workspaces", "test-bot-a", "preview.png");

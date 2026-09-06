@@ -173,6 +173,9 @@ export function memorySystemPrompt(botId: string): string {
   const memoryFile = join(workspaceDir(botId), "MEMORY.md");
   const topicDir = join(workspaceDir(botId), "memory");
   const guidance =
+    ` To share a created document in chat, save it inside this task's working folder or your own workspace ${JSON.stringify(workspaceDir(botId))}, then include a Markdown file link.` +
+    " Files in system temporary folders, other tasks' worktrees, or outside those roots cannot be opened by the chat client. Copy a finished report into an allowed folder before sharing it; never widen filesystem access to fix a link." +
+    " Use an absolute native path with forward slashes in an angle-bracket Markdown destination when it contains spaces, for example [Report](<C:/Project/Final report.md>); do not prepend a slash to a Windows drive path." +
     ` Your private long-term memory file is ${JSON.stringify(memoryFile)}.` +
     " It stays separate from a custom project working folder." +
     ` Its first ${MEMORY_MAX_LINES} lines are shown to you at the start of every session, so keep it` +
