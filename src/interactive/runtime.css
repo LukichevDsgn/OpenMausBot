@@ -4,7 +4,7 @@
   --surface: #f4f3f1;
   --border: #dddcd9;
   --accent: #7463d3;
-  --canvas: #fff;
+  --canvas: transparent;
   color-scheme: light dark;
   font-family:
     system-ui,

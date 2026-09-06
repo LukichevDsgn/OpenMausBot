@@ -246,7 +246,7 @@ function InteractiveView({
               referrerPolicy="no-referrer"
               srcDoc={srcDoc}
               onLoad={init}
-              style={{ height, visibility: ready ? "visible" : "hidden" }}
+              style={{ height }}
             />
           )}
           {drafted && (
