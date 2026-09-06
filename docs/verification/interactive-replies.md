@@ -95,3 +95,34 @@ pnpm typecheck
 Browser/package evidence additionally checks that the sandbox cannot access the
 parent DOM, storage, Electron bridge or network. A green unit test or build is not
 visual acceptance; record current screenshots and exercise the packaged app.
+
+## Verification record
+
+The verification fixture uses the scripted Claude-compatible driver and a
+disposable data directory. It exercises this interactive-reply surface only;
+it does not claim document-preview behavior or Windows custom-path behavior.
+
+The focused checks completed on the feature branch:
+
+- `pnpm exec vitest run shared/interactive-reply.test.ts src/lib/interactive-state.test.ts src/lib/drafts.test.ts server/system-prompt.test.ts`: 5 files, 52 passed.
+- `pnpm typecheck`: passed.
+- `pnpm build`: passed.
+- Browser acceptance: choices, text entry, draft preservation without a POST,
+  heatmap filtering, derived totals, selectable steps, reload hydration, skin
+  changes, sequential mixed controls, mobile layout, and iframe isolation for
+  parent DOM, storage, bridge, and network.
+
+The before/after evidence uses the same fixture state. The upstream comparison
+at `http://127.0.0.1:5399` leaves the fenced source visible in the transcript;
+the feature build at `http://127.0.0.1:5599` renders the controls and preserves
+the draft in the composer. The checked-in screenshots are:
+
+- [`interactive-upstream-source.png`](images/interactive-upstream-source.png)
+- [`interactive-choices.png`](images/interactive-choices.png)
+- [`interactive-actions.png`](images/interactive-actions.png)
+- [`interactive-focus.png`](images/interactive-focus.png)
+- [`interactive-light.png`](images/interactive-light.png)
+- [`interactive-mobile.png`](images/interactive-mobile.png)
+
+The fixture is a deterministic renderer and safety check; it does not replace
+paid-provider coverage or the separate packaged-desktop integration gate.
