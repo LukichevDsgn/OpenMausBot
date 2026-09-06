@@ -44,6 +44,7 @@ function currentTheme() {
         canvas: "card",
       }).map(([key, value]) => [key, style.getPropertyValue(`--color-${value}`).trim()]),
     ),
+    scheme: style.getPropertyValue("--code-color-scheme").trim(),
     font: getComputedStyle(document.body).fontFamily,
   };
 }

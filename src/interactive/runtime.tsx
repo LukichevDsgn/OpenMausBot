@@ -531,6 +531,7 @@ function applyTheme(theme: Record<string, unknown> | undefined) {
   }
   if (typeof theme?.font === "string" && theme.font.length < 300)
     document.documentElement.style.fontFamily = theme.font;
+  if (theme?.scheme === "light" || theme?.scheme === "dark") document.documentElement.style.colorScheme = theme.scheme;
 }
 addEventListener("message", (event) => {
   if (event.source !== parent || event.data?.channel !== "omb-interactive-v1") return;

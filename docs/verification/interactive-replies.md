@@ -111,6 +111,9 @@ The focused checks completed on the feature branch:
   heatmap filtering, derived totals, selectable steps, reload hydration, skin
   changes, sequential mixed controls, mobile layout, and iframe isolation for
   parent DOM, storage, bridge, and network.
+- Theme QA after the production bundle rebuild: the iframe reports `dark` for
+  midnight, `light` for atelier, and `dark` after returning to midnight; the
+  heatmap at slider 8 has four active cells.
 
 The before/after evidence uses the same fixture state. The upstream comparison
 at `http://127.0.0.1:5399` leaves the fenced source visible in the transcript;

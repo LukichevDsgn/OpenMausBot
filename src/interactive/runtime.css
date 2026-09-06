@@ -6,6 +6,8 @@
   --accent: #7463d3;
   --canvas: transparent;
   color-scheme: light dark;
+  scrollbar-width: thin;
+  scrollbar-color: var(--muted) var(--canvas);
   font-family:
     system-ui,
     -apple-system,
