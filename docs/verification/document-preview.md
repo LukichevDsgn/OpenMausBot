@@ -1,5 +1,13 @@
 # Document preview
 
+## UI evidence
+
+Screenshots from an isolated fake-provider conversation:
+
+| Before | Desktop preview | Narrow preview |
+| --- | --- | --- |
+| ![Original file links](images/document-preview-before.png) | ![Document beside the chat](images/document-preview-desktop.png) | ![Narrow dialog](images/document-preview-mobile.png) |
+
 File links in desktop/web conversations open a read-only document panel.
 The conversation remains visible when enough space is available. Below 900 px
 of available conversation space, the reader becomes a dismissible dialog.
