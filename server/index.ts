@@ -27,7 +27,7 @@ import {
   type CredentialTargetId,
 } from "../shared/credential-request.ts";
 
-import { approvalHeldReason, approvalModeForOrigin, autoVerdict, rememberableApprovalKey } from "./auto-approve.ts";
+import { HELD_NOTE, approvalHeldNote, approvalHeldReason, approvalModeForOrigin, autoVerdict, rememberableApprovalKey } from "./auto-approve.ts";
 import { requestReview, resolveAutoReviewMode, shouldReview } from "./auto-review.ts";
 import { updateClaudeCli } from "./claude-update.ts";
 import {
@@ -466,10 +466,8 @@ const browserCleanup: BrowserCleanupCoordinator = new BrowserCleanupCoordinator(
       : request.partitionId
         ? [browserSessionId("", request.partitionId)]
         : [];
-    // Best effort, never a reason to keep a deleted bot or profile around:
-    // the engine's saved state is a per-session file set, and an engine that
-    // cannot run here (or was never installed) has nothing to clear. A real
-    // failure is logged with the session name so it can be cleared by hand.
+    // Failed erasure leaves the committed intent pending for retry; it must
+    // never acknowledge that saved state was removed when it was not.
     const work = status.kind === "ready" && sessions.length
       ? Promise.all(sessions.map(async (session) => {
           const ok = await clearBrowserSessionState(status.binaryPath, session, { encryptionKey: browserEngineEncryptionKey() });
@@ -477,8 +475,13 @@ const browserCleanup: BrowserCleanupCoordinator = new BrowserCleanupCoordinator(
           return ok;
         }))
       : Promise.resolve([true]);
-    void work.finally(() => {
-      browserCleanup.receive({ type: "openmausbot:browser-lifecycle-result", requestId: request.requestId, ok: true });
+    void work.then((results) => results.every(Boolean), (error) => {
+      console.warn("browser cleanup: could not clear saved session state", error);
+      return false;
+    }).then((ok) => {
+      browserCleanup.receive({ type: "openmausbot:browser-lifecycle-result", requestId: request.requestId, ok });
+    }).catch((error) => {
+      console.warn("browser cleanup: could not acknowledge cleanup", error);
     });
     return true;
   },
@@ -515,6 +518,7 @@ type InternalCapability = {
   skillAuthoring: boolean;
   createdBots: number;
   orphanExpiresAt: number;
+  localVmTarget?: LocalVmTarget;
 };
 // A capability lives for the exact provider-turn generation, including while
 // that turn is parked on a human approval. The long ceiling is only an orphan
@@ -591,12 +595,8 @@ function revokeInternalCapabilityForProviderEvent(event: RuntimeEvent): void {
  * length; only capabilities for currently active turns are retained. */
 function authorizedInternalCapability(header: string | string[] | undefined): InternalCapability | null {
   const got = Buffer.from(Array.isArray(header) ? "" : (header ?? ""));
-  const now = Date.now();
   for (const [token, capability] of internalCapabilities) {
-    if (
-      capability.orphanExpiresAt <= now ||
-      activeInternalGenerationByThread.get(capability.threadId) !== capability.generation
-    ) {
+    if (!internalCapabilityIsActive(capability)) {
       internalCapabilities.delete(token);
       continue;
     }
@@ -607,6 +607,11 @@ function authorizedInternalCapability(header: string | string[] | undefined): In
 }
 
 function internalCapabilityIsActive(capability: InternalCapability): boolean {
+  if (capability.localVmTarget) {
+    const owner = localVmLeaseFor(capability.localVmTarget).current(localVmOwnerBusy);
+    if (localVmThreadTargets.get(capability.threadId) !== capability.localVmTarget ||
+        owner?.threadId !== capability.threadId || owner.botId !== capability.botId) return false;
+  }
   return (
     capability.orphanExpiresAt > Date.now() &&
     activeInternalGenerationByThread.get(capability.threadId) === capability.generation
@@ -871,7 +876,7 @@ const routineRequestEnvelopeSchema = z.discriminatedUnion("action", [
 ]);
 
 /** The loopback endpoint a bot's computer proxy polls before acting. */
-function controlIntegration(botId: string, threadId: string, generation: string) {
+function controlIntegration(botId: string, threadId: string, generation: string, localVmTarget?: LocalVmTarget) {
   return {
     url: `http://127.0.0.1:${PORT}/api/internal/computer-control?botId=${encodeURIComponent(botId)}`,
     token: mintInternalCapability({
@@ -880,6 +885,7 @@ function controlIntegration(botId: string, threadId: string, generation: string)
       generation,
       depth: 0,
       kind: "computer",
+      ...(localVmTarget ? { localVmTarget } : {}),
       skillAuthoring: false,
       createdBots: 0,
     }),
@@ -2277,6 +2283,9 @@ const watchdog = new TurnWatchdog({
   stallMs: TURN_STALL_MS,
   checkMs: 60_000,
   onStall: (turn) => {
+    // Room targets carry an invocation identity; only those claims belong
+    // to the room grace cleanup added here.
+    const stalledVmTarget = groupSpeakers.has(turn.threadId) ? localVmThreadTargets.get(turn.threadId) : undefined;
     revokeInternalCapabilitiesForThread(turn.threadId);
     repeats.settle(turn.threadId);
     const bot = store.bot(turn.botId);
@@ -2304,6 +2313,9 @@ const watchdog = new TurnWatchdog({
         const retry = setTimeout(releaseOwnership, 1_000);
         retry.unref?.();
         return;
+      }
+      if (stalledVmTarget && localVmThreadTargets.get(turn.threadId) === stalledVmTarget) {
+        releaseLocalVmThread(turn.threadId);
       }
       const group = store.groupByThread(turn.threadId);
       const speaker = groupSpeakers.get(turn.threadId);
@@ -2892,18 +2904,23 @@ bus.subscribe((event: RuntimeEvent) => {
       // the guards in auto-approve.ts; explicitly acknowledged Full does not.
       const asker = bot ?? (speaker ? store.bot(speaker.botId) : undefined);
       const unattended = permission && asker && event.requestId ? isUnattended(asker.id) : false;
+      const effectiveApprovalMode = asker ? approvalModeForTurn(asker, isInternalTurn(event.threadId)) : "ask";
       const verdict = permission && asker && event.requestId
         ? autoVerdict({
             // the same origin the dispatch used, so a peer-started turn's
             // residual asks are judged as Approve for me here too
-            approvalMode: approvalModeForTurn(asker, isInternalTurn(event.threadId)),
+            approvalMode: effectiveApprovalMode,
             autoApprove: false,
             alwaysAllow: asker.alwaysAllow,
           }, event.tool, event.summary, {
             unattended,
             scope: event.approvalScope,
             requiresExplicitApproval: event.requiresExplicitApproval,
-            nativeApproval: requiresNativeApproval(event.provider, approvalModeForTurn(asker)),
+            // Antigravity's residual asks must use a peer-started turn's
+            // effective safe Auto mode, not its durable Full grant.
+            // Preserve the existing policy of every other provider.
+            nativeApproval: requiresNativeApproval(event.provider, event.provider === "antigravityAgent"
+              ? effectiveApprovalMode : approvalModeForTurn(asker)),
           })
         : null;
       if (verdict?.approve && asker && event.requestId) {
@@ -2958,9 +2975,12 @@ bus.subscribe((event: RuntimeEvent) => {
                   scope: event.approvalScope,
                   requiresExplicitApproval: event.requiresExplicitApproval,
                 }),
-                held: verdict.source === "full-access"
-                  ? "Full access couldn't deliver this approval."
-                  : "Approve for me couldn't answer this one.",
+                held: HELD_NOTE[verdict.source === "full-access"
+                  ? "approval.held.undeliveredFull"
+                  : "approval.held.undelivered"],
+                heldCode: verdict.source === "full-access"
+                  ? "approval.held.undeliveredFull"
+                  : "approval.held.undelivered",
                 approvalScope: event.approvalScope,
               },
             });
@@ -2980,6 +3000,18 @@ bus.subscribe((event: RuntimeEvent) => {
         })();
         break;
       }
+      // A card can outlive the bot record that raised it. Without one there is
+      // no mode to explain, but the sandbox note still applies.
+      const heldContext = {
+        source: verdict?.source,
+        permission,
+        requiresExplicitApproval: event.requiresExplicitApproval,
+        mode: asker ? approvalModeForOrigin(approvalModeFor(asker), { peerInitiated: isInternalTurn(event.threadId) }) : ("ask" as const),
+        unattended: Boolean(unattended),
+        fullAccessAvailable: asker && !isInternalTurn(event.threadId)
+          ? supportsApprovalMode(registry.cliTarget(asker.modelSelection.instanceId)?.driverKind, "full")
+          : false,
+      };
       const message = pushMessage({
         role: "bot",
         kind: "options",
@@ -3003,18 +3035,10 @@ bus.subscribe((event: RuntimeEvent) => {
                 requiresExplicitApproval: event.requiresExplicitApproval,
               })
             : undefined,
-          // A card can outlive the bot record that raised it. Without one
-          // there is no mode to explain, but the sandbox note still applies.
-          held: approvalHeldReason({
-            source: verdict?.source,
-            permission,
-            requiresExplicitApproval: event.requiresExplicitApproval,
-            mode: asker ? approvalModeForOrigin(approvalModeFor(asker), { peerInitiated: isInternalTurn(event.threadId) }) : "ask",
-            unattended: Boolean(unattended),
-            fullAccessAvailable: asker && !isInternalTurn(event.threadId)
-              ? supportsApprovalMode(registry.cliTarget(asker.modelSelection.instanceId)?.driverKind, "full")
-              : false,
-          }),
+          // The text stays for cards saved before heldCode existed, and for
+          // clients that do not know the key yet.
+          held: approvalHeldReason(heldContext),
+          heldCode: approvalHeldNote(heldContext),
           approvalScope: event.approvalScope,
         },
       });
@@ -5187,6 +5211,14 @@ async function runGroupMemberTurn(
     return true;
   }
   const internalGeneration = beginInternalCapabilityGeneration(threadId);
+  let roomVmTarget: ReturnType<typeof localVmTargetForBot> | null = null;
+  let retainRoomVmLease = false;
+  let roomSpeaker: { botId: string; name: string; color: string } | undefined;
+  let providerDispatched = false;
+  const releaseRoomVmLease = () => {
+    if (roomVmTarget && localVmThreadTargets.get(threadId) === roomVmTarget) releaseLocalVmThread(threadId);
+    roomVmTarget = null;
+  };
   try {
   const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
   const skillAuthoring =
@@ -5384,7 +5416,48 @@ async function runGroupMemberTurn(
   }
 
   store.patchGroup(readyGroup.id, { busyBotId: bot.id }); // the store's change stream carries the frame
-  groupSpeakers.set(threadId, { botId: bot.id, name: bot.name, color: bot.color });
+  roomSpeaker = { botId: bot.id, name: bot.name, color: bot.color };
+  groupSpeakers.set(threadId, roomSpeaker);
+
+  // Room and Goal turns use the speaker's desktop, never the coordinator's.
+  // Claim the same lease as direct turns before asynchronous VM setup.
+  if (readyBot.computer === "vm") {
+    if (instance.adapter.capabilities.computerMcp !== true || instance.driverKind === "boxAgent") {
+      throw new Error("this model engine cannot use the Local VM");
+    }
+    // A distinct identity fences cleanup even in shared mode on the same room thread.
+    const target = { ...localVmTargetForBot(readyBot.id) };
+    if (localVmImageBusy || localVmModeChangeBusy || localVmLifecycleBusy.has(target.key)) {
+      throw new Error("this Local VM is being started, stopped, or replaced");
+    }
+    if (!localVmLeaseFor(target).claim(threadId, readyBot.id, localVmOwnerBusy)) {
+      throw new Error("this Local VM is already being used by another turn");
+    }
+    roomVmTarget = target;
+    localVmThreadTargets.set(threadId, target);
+    localVmActiveThreads.set(target.key, threadId);
+    localVmIdleFor(target).touch();
+    const setupIsCurrent = () => !isCancelled?.() &&
+      groupSpeakers.get(threadId) === roomSpeaker &&
+      activeInternalGenerationByThread.get(threadId) === internalGeneration &&
+      store.group(readyGroup.id)?.memberIds.includes(readyBot.id) === true &&
+      store.bot(readyBot.id)?.busy === true &&
+      store.group(readyGroup.id)?.busyBotId === readyBot.id;
+    const vm = await readyLocalVmForTurn(readyBot.id, target, setupIsCurrent);
+    if (!setupIsCurrent()) {
+      return false;
+    }
+    if (!vm.ready || !vm.runtime) throw new Error(vm.problem ?? "the Local VM is not ready");
+    const owner = localVmLeaseFor(target).current(localVmOwnerBusy);
+    if (owner?.threadId !== threadId || owner.botId !== readyBot.id) {
+      throw new Error("the Local VM lease expired while preparing the turn");
+    }
+    integrations.localComputer = containerComputerMcp(
+      vm.runtime,
+      controlIntegration(readyBot.id, threadId, internalGeneration, target),
+      target,
+    );
+  }
 
   const roster = readyGroup.memberIds
     .map((id) => store.bot(id))
@@ -5438,6 +5511,7 @@ async function runGroupMemberTurn(
     if (drift.drift !== Boolean(bot.soulDrift)) store.patchBot(bot.id, { soulDrift: drift.drift });
   }
   const roomSystem = buildSystemPrompt(system, store.bot(bot.id)?.soul ?? bot.soul ?? "", [
+    { id: "computer", label: "Computer", text: computerPrompt(roomVmTarget ? localVmMode(cfg) === "per-bot" ? "vm-private" : "vm-shared" : null) },
     { id: "browser", label: "Browser", text: integrations.browser ? BUILT_IN_BROWSER_SYSTEM_PROMPT : "" },
     { id: "recall", label: "Recall", text: integrations.agents ? SESSION_SEARCH_SYSTEM_PROMPT : "" },
     { id: "section-context", label: "Section context", text: sectionContextSystemPrompt(bot.section) },
@@ -5536,6 +5610,7 @@ async function runGroupMemberTurn(
     });
     watchdog.watch(threadId, bot.id);
     onProviderHandshakeStarted?.();
+    providerDispatched = true;
     guardTurnDispatch(instance.adapter.sendTurn({
         threadId,
         text,
@@ -5587,6 +5662,8 @@ async function runGroupMemberTurn(
   // work so a retained proxy from this member cannot act during the next
   // member's generation.
   revokeInternalCapabilityGeneration(threadId, internalGeneration);
+  retainRoomVmLease = outcome === "timed_out" || outcome === "stalled";
+  if (!retainRoomVmLease) releaseRoomVmLease();
   if (orchestration) {
     orchestration.result.replyText = replyText.trim();
     orchestration.result.outcome = outcome;
@@ -5626,6 +5703,7 @@ async function runGroupMemberTurn(
         retry.unref?.();
         return;
       }
+      releaseRoomVmLease();
       const currentGroup = store.group(group.id);
       const speaker = groupSpeakers.get(threadId);
       if (currentGroup?.busyBotId === bot.id && speaker?.botId === bot.id) {
@@ -5733,10 +5811,33 @@ async function runGroupMemberTurn(
     }
   }
   return true;
+  } catch (error) {
+    if (providerDispatched || !roomSpeaker) throw error;
+    const message = error instanceof Error ? error.message : "Local VM setup failed";
+    store.appendMessage(threadId, {
+      role: "bot", kind: "activity",
+      from: { botId: bot.id, name: bot.name, color: bot.color },
+      tool: { name: `error: ${message}`, ok: false },
+    });
+    onDispatchError?.(message);
+    if (orchestration) orchestration.result.outcome = "dispatch_failed";
+    return false;
   } finally {
     // Covers connector/setup failures, cancellation before dispatch, and all
     // other early returns that never produce a provider terminal event.
     revokeInternalCapabilityGeneration(threadId, internalGeneration);
+    if (!retainRoomVmLease) releaseRoomVmLease();
+    if (!providerDispatched && roomSpeaker && groupSpeakers.get(threadId) === roomSpeaker) {
+      groupSpeakers.delete(threadId);
+      if (store.group(group.id)?.busyBotId === bot.id) store.patchGroup(group.id, { busyBotId: null });
+      if (store.bot(bot.id)?.busy) {
+        store.setActivity(bot.id, "idle");
+        retryDelegationsWaitingOn(bot.id);
+      }
+      drainQueuedSends();
+      drainConnectorResumes();
+      drainSecretResumes();
+    }
   }
 }
 
@@ -7189,13 +7290,14 @@ async function localVmPayload(target: LocalVmTarget) {
  * instance cap; creating past it would quietly do what the lifecycle route
  * refuses.
  */
-async function readyLocalVmForTurn(botId: string, target: LocalVmTarget) {
+async function readyLocalVmForTurn(botId: string, target: LocalVmTarget, isCurrent = () => true) {
   let status = await containerComputerStatus(undefined, undefined, target);
+  if (!isCurrent()) return status;
   if (status.ready || !localVmRecreatableOnDemand(status)) return status;
 
   if (target.key !== SHARED_LOCAL_VM_TARGET.key) {
     const count = await existingPerBotLocalVmCount(status.runtime);
-    if (count >= localVmMaxInstances(cfg)) return status;
+    if (!isCurrent() || count >= localVmMaxInstances(cfg)) return status;
   }
 
   broadcast({ kind: "computer", botId, state: "provisioning" });
@@ -7217,8 +7319,9 @@ async function readyLocalVmForTurn(botId: string, target: LocalVmTarget) {
   // the turn is the whole point: a person who has been away eight hours should
   // not have to send their message twice.
   const deadline = Date.now() + LOCAL_VM_DESKTOP_WAIT_MS;
-  while (!status.ready && status.container === "running" && Date.now() < deadline) {
+  while (isCurrent() && !status.ready && status.container === "running" && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 2_000));
+    if (!isCurrent()) break;
     status = await containerComputerStatus(undefined, undefined, target);
   }
   return status;
@@ -10104,7 +10207,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           registry.cliTarget(checked.selection.instanceId)?.driverKind !== registry.cliTarget(existing.modelSelection.instanceId)?.driverKind)
       ) {
         return json(res, 400, {
-          error: "Changing providers with elevated permissions requires choosing Ask or Auto first",
+          error: "Changing providers with elevated permissions requires choosing Ask first",
         });
       }
       // patchBot persists first and emits the canonical bot change, which the
@@ -10338,7 +10441,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           (existingBot && normalizedSelection && registry.cliTarget(normalizedSelection.instanceId)?.driverKind !== registry.cliTarget(existingBot.modelSelection.instanceId)?.driverKind))
       ) {
         return json(res, 400, {
-          error: "This provider does not support the selected approval level, or changing providers requires choosing Ask or Auto first",
+          error: "This provider does not support the selected approval level, or changing providers requires choosing Ask first",
         });
       }
       const requiresPrivateApprovalTransition =
@@ -11691,6 +11794,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!browserEngineInstall) {
         const status = browserEngineStatus();
         if (status.kind === "unavailable" && !status.installable) return json(res, 409, { error: status.reason });
+        browserEngineInstallError = null;
         browserEngineInstall = (async () => {
           const binary = resolveAgentBrowserBinary() ?? await installAgentBrowserBinary({ log: (line) => console.log(line) });
           await ensureChrome(binary, { log: (line) => console.log(line) });
@@ -11701,6 +11805,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           browserEngineInstall = null;
           broadcast({ kind: "config", ...configStatus() });
         });
+        broadcast({ kind: "config", ...configStatus() });
       }
       return json(res, 202, { installing: true });
     }
@@ -12266,14 +12371,12 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       const browserCleanupRequests: BrowserCleanupRequest[] = [];
       try {
-        if (utilityParentPort) {
-          for (const profileId of removedBrowserProfileIds) {
-            const target = browserProfilePartitionTarget(cfg, profileId);
-            if (!target) throw new Error(`browser profile cleanup target “${profileId}” is unavailable`);
-            browserCleanupRequests.push(
-              browserCleanup.prepare("profile", target.profileId, target.partitionId),
-            );
-          }
+        for (const profileId of removedBrowserProfileIds) {
+          const target = browserProfilePartitionTarget(cfg, profileId);
+          if (!target) throw new Error(`browser profile cleanup target “${profileId}” is unavailable`);
+          browserCleanupRequests.push(
+            browserCleanup.prepare("profile", target.profileId, target.partitionId),
+          );
         }
       } catch (error) {
         for (const request of browserCleanupRequests) browserCleanup.abort(request);
