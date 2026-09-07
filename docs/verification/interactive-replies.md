@@ -93,7 +93,8 @@ node --experimental-strip-types scripts/interactive-reply-fixture.ts
 
 The launcher prints the exact URL/PID/data directory and persisted messages. Set
 `OMB_PORT` to that port before starting `pnpm dev`, then open **Interactive Studio**.
-Add `--include-errors` to include an unsupported-component fallback. Ctrl-C closes
+Add `--include-errors` to include unsupported-component, invalid numeric range,
+and mismatched chart/heatmap dimension fallbacks. Ctrl-C closes
 only the fixture it launched. All example data is illustrative.
 
 Verify choices, text entry, draft preservation and the absence of POST requests
@@ -160,3 +161,24 @@ comparison totals, steps, themes, mobile layout and sandbox boundaries also pass
 The choices, actions, focus, light and mobile screenshots now show this work-plan
 fixture. The upstream-source and heatmap images retain their original evidence.
 These scripted checks do not prove that every provider will follow the guidance.
+
+### Render failure regression
+
+`scripts/smoke-interactive-runtime.mjs` builds the actual production runtime and
+runs it in fresh sandboxed browser frames. It requires the optional Playwright QA
+tool; set `OMB_PLAYWRIGHT_MODULE` to an existing installation if it is not locally
+resolvable, and optionally `OMB_BROWSER_CHANNEL=msedge` to use installed Edge.
+No provider or user profile is used.
+
+```sh
+node --experimental-strip-types scripts/smoke-interactive-runtime.mjs
+```
+
+The eight cases cover three reactive examples, invalid numeric ranges, mismatched
+chart/heatmap dimensions, and an injected render exception. Each failure must
+report an error without a preceding ready event; a repeated init must replay that
+error. The regression fails on `--runtime-ref 2df3d3be` with a false-ready outcome
+and passes after the render boundary/readiness fix. In the isolated conversation
+fixture, the five malformed blocks retain their source while the three healthy
+blocks remain usable. Readiness is sent only after a successful React commit;
+all parser, property and render failures update the cached handshake outcome.

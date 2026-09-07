@@ -19,7 +19,13 @@ try {
   const created = (await call("new-bot", "--name", "Interactive Studio")) as { bot: { id: string } };
   const examples = [INTERACTIVE_CHOICE_EXAMPLE, INTERACTIVE_HEATMAP_EXAMPLE, INTERACTIVE_COMPARE_EXAMPLE];
   if (process.argv.includes("--include-errors"))
-    examples.push('root = UnknownComponent("Unsupported content");');
+    examples.push(
+      'root = UnknownComponent("Unsupported content");',
+      'root = NumberInput("Invalid range", 8, 1, 1, 2);',
+      'root = Chart("Mismatched chart", ["A", "B"], [{name:"Series",values:[1]}], "bar");',
+      'root = Heatmap("Mismatched rows", ["A", "B"], ["X"], [[1]], 0);',
+      'root = Heatmap("Mismatched columns", ["A"], ["X", "Y"], [[1]], 0);',
+    );
   const reply =
     "Explore a work plan, inspect the activity or compare the sample plans. Changes remain local until you send a draft.\n\n" +
     examples.map((source) => `\`\`\`openmaus-ui\n${source}\n\`\`\``).join("\n\n");

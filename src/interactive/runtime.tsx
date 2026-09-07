@@ -29,7 +29,7 @@ function InvalidProps({ name }: { name: string }) {
   // OpenUI initializes reactive defaults in an effect. An unresolved first
   // render is transient; report only if validation still fails afterwards.
   useEffect(() => {
-    const timer = setTimeout(() => post("error", `Invalid ${name} properties`), 0);
+    const timer = setTimeout(() => reportError(`Invalid ${name} properties`), 0);
     return () => clearTimeout(timer);
   }, [name]);
   return null;
@@ -192,7 +192,7 @@ const numericProps = z.object({ label: str, min: num, max: num, step: num.positi
 function Numeric({ props, range }: { props: z.infer<typeof numericProps>; range: boolean }) {
   const state = useStateField(props.label, props.value);
   const id = useId();
-  if (props.max <= props.min) throw new Error("Invalid input range");
+  if (props.max <= props.min) return <InvalidProps name="input range" />;
   const value =
     typeof state.value === "number" && Number.isFinite(state.value)
       ? Math.max(props.min, Math.min(props.max, state.value))
@@ -293,7 +293,7 @@ const Chart = component(
     const state = useStateField<string[]>(`chart:${props.title}`, []);
     const hidden = Array.isArray(state.value) ? state.value : [];
     if (props.series.some((s) => s.values.length !== props.labels.length))
-      throw new Error("Chart dimensions do not match");
+      return <InvalidProps name="Chart dimensions" />;
     const series = props.series.map((s, i) => ({ ...s, i })).filter((s) => !hidden.includes(s.name));
     const values = series.flatMap((s) => s.values);
     const min = Math.min(0, ...values);
@@ -411,7 +411,7 @@ const Heatmap = component(
       props.values.some((row) => row.length !== props.columns.length) ||
       props.values.flat().length > 1500
     )
-      throw new Error("Heatmap dimensions do not match");
+      return <InvalidProps name="Heatmap dimensions" />;
     const max = Math.max(1, ...props.values.flat());
     return (
       <section className="stack">
@@ -523,6 +523,40 @@ const library = createLibrary({
 const root = createRoot(document.getElementById("root")!);
 let started = false;
 let outcome: { type: "ready" | "error"; value?: string } | undefined;
+function reportError(error: unknown) {
+  outcome = {
+    type: "error",
+    value: error instanceof Error ? error.message : typeof error === "string" ? error : "Could not render this reply",
+  };
+  post(outcome.type, outcome.value);
+}
+
+class RuntimeBoundary extends React.Component<{ children: React.ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  componentDidCatch(error: Error) {
+    reportError(error);
+  }
+  render() {
+    return this.state.failed ? null : this.props.children;
+  }
+}
+
+function ReadyAfterCommit() {
+  useEffect(() => {
+    // Child validation effects run first. Let their deferred InvalidProps
+    // outcomes settle before acknowledging a successfully committed subtree.
+    const timer = setTimeout(() => {
+      if (outcome?.type === "error") return;
+      outcome = { type: "ready" };
+      post(outcome.type);
+    }, 0);
+    return () => clearTimeout(timer);
+  }, []);
+  return null;
+}
 function applyTheme(theme: Record<string, unknown> | undefined) {
   for (const key of ["ink", "muted", "surface", "border", "accent", "canvas"] as const) {
     const value = theme?.[key];
@@ -564,23 +598,23 @@ addEventListener("message", (event) => {
     )
       throw new Error("Could not read this interactive reply");
     root.render(
-      <Renderer
-        response={source}
-        library={library}
-        initialState={initialState}
-        publishObservability={false}
-        toolProvider={null}
-        onStateUpdate={(state) => post("state", state)}
-        onError={(errors) => {
-          if (errors.length) post("error", errors[0]!.message);
-        }}
-      />,
+      <RuntimeBoundary>
+        <Renderer
+          response={source}
+          library={library}
+          initialState={initialState}
+          publishObservability={false}
+          toolProvider={null}
+          onStateUpdate={(state) => post("state", state)}
+          onError={(errors) => {
+            if (errors.length) reportError(errors[0]!.message);
+          }}
+        />
+        <ReadyAfterCommit />
+      </RuntimeBoundary>,
     );
-    outcome = { type: "ready" };
-    post(outcome.type);
   } catch (error) {
-    outcome = { type: "error", value: error instanceof Error ? error.message : "Could not render this reply" };
-    post(outcome.type, outcome.value);
+    reportError(error);
   }
 });
 new ResizeObserver(() =>
