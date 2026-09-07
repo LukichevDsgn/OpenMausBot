@@ -27,7 +27,7 @@ import {
   type CredentialTargetId,
 } from "../shared/credential-request.ts";
 
-import { approvalHeldReason, approvalModeForOrigin, autoVerdict, rememberableApprovalKey } from "./auto-approve.ts";
+import { HELD_NOTE, approvalHeldNote, approvalHeldReason, approvalModeForOrigin, autoVerdict, rememberableApprovalKey } from "./auto-approve.ts";
 import { requestReview, resolveAutoReviewMode, shouldReview } from "./auto-review.ts";
 import { updateClaudeCli } from "./claude-update.ts";
 import {
@@ -2903,18 +2903,23 @@ bus.subscribe((event: RuntimeEvent) => {
       // the guards in auto-approve.ts; explicitly acknowledged Full does not.
       const asker = bot ?? (speaker ? store.bot(speaker.botId) : undefined);
       const unattended = permission && asker && event.requestId ? isUnattended(asker.id) : false;
+      const effectiveApprovalMode = asker ? approvalModeForTurn(asker, isInternalTurn(event.threadId)) : "ask";
       const verdict = permission && asker && event.requestId
         ? autoVerdict({
             // the same origin the dispatch used, so a peer-started turn's
             // residual asks are judged as Approve for me here too
-            approvalMode: approvalModeForTurn(asker, isInternalTurn(event.threadId)),
+            approvalMode: effectiveApprovalMode,
             autoApprove: false,
             alwaysAllow: asker.alwaysAllow,
           }, event.tool, event.summary, {
             unattended,
             scope: event.approvalScope,
             requiresExplicitApproval: event.requiresExplicitApproval,
-            nativeApproval: requiresNativeApproval(event.provider, approvalModeForTurn(asker)),
+            // Antigravity's residual asks must use a peer-started turn's
+            // effective safe Auto mode, not its durable Full grant.
+            // Preserve the existing policy of every other provider.
+            nativeApproval: requiresNativeApproval(event.provider, event.provider === "antigravityAgent"
+              ? effectiveApprovalMode : approvalModeForTurn(asker)),
           })
         : null;
       if (verdict?.approve && asker && event.requestId) {
@@ -2969,9 +2974,12 @@ bus.subscribe((event: RuntimeEvent) => {
                   scope: event.approvalScope,
                   requiresExplicitApproval: event.requiresExplicitApproval,
                 }),
-                held: verdict.source === "full-access"
-                  ? "Full access couldn't deliver this approval."
-                  : "Approve for me couldn't answer this one.",
+                held: HELD_NOTE[verdict.source === "full-access"
+                  ? "approval.held.undeliveredFull"
+                  : "approval.held.undelivered"],
+                heldCode: verdict.source === "full-access"
+                  ? "approval.held.undeliveredFull"
+                  : "approval.held.undelivered",
                 approvalScope: event.approvalScope,
               },
             });
@@ -2991,6 +2999,18 @@ bus.subscribe((event: RuntimeEvent) => {
         })();
         break;
       }
+      // A card can outlive the bot record that raised it. Without one there is
+      // no mode to explain, but the sandbox note still applies.
+      const heldContext = {
+        source: verdict?.source,
+        permission,
+        requiresExplicitApproval: event.requiresExplicitApproval,
+        mode: asker ? approvalModeForOrigin(approvalModeFor(asker), { peerInitiated: isInternalTurn(event.threadId) }) : ("ask" as const),
+        unattended: Boolean(unattended),
+        fullAccessAvailable: asker && !isInternalTurn(event.threadId)
+          ? supportsApprovalMode(registry.cliTarget(asker.modelSelection.instanceId)?.driverKind, "full")
+          : false,
+      };
       const message = pushMessage({
         role: "bot",
         kind: "options",
@@ -3014,18 +3034,10 @@ bus.subscribe((event: RuntimeEvent) => {
                 requiresExplicitApproval: event.requiresExplicitApproval,
               })
             : undefined,
-          // A card can outlive the bot record that raised it. Without one
-          // there is no mode to explain, but the sandbox note still applies.
-          held: approvalHeldReason({
-            source: verdict?.source,
-            permission,
-            requiresExplicitApproval: event.requiresExplicitApproval,
-            mode: asker ? approvalModeForOrigin(approvalModeFor(asker), { peerInitiated: isInternalTurn(event.threadId) }) : "ask",
-            unattended: Boolean(unattended),
-            fullAccessAvailable: asker && !isInternalTurn(event.threadId)
-              ? supportsApprovalMode(registry.cliTarget(asker.modelSelection.instanceId)?.driverKind, "full")
-              : false,
-          }),
+          // The text stays for cards saved before heldCode existed, and for
+          // clients that do not know the key yet.
+          held: approvalHeldReason(heldContext),
+          heldCode: approvalHeldNote(heldContext),
           approvalScope: event.approvalScope,
         },
       });
@@ -10185,7 +10197,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           registry.cliTarget(checked.selection.instanceId)?.driverKind !== registry.cliTarget(existing.modelSelection.instanceId)?.driverKind)
       ) {
         return json(res, 400, {
-          error: "Changing providers with elevated permissions requires choosing Ask or Auto first",
+          error: "Changing providers with elevated permissions requires choosing Ask first",
         });
       }
       // patchBot persists first and emits the canonical bot change, which the
@@ -10419,7 +10431,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           (existingBot && normalizedSelection && registry.cliTarget(normalizedSelection.instanceId)?.driverKind !== registry.cliTarget(existingBot.modelSelection.instanceId)?.driverKind))
       ) {
         return json(res, 400, {
-          error: "This provider does not support the selected approval level, or changing providers requires choosing Ask or Auto first",
+          error: "This provider does not support the selected approval level, or changing providers requires choosing Ask first",
         });
       }
       const requiresPrivateApprovalTransition =
@@ -11772,6 +11784,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!browserEngineInstall) {
         const status = browserEngineStatus();
         if (status.kind === "unavailable" && !status.installable) return json(res, 409, { error: status.reason });
+        browserEngineInstallError = null;
         browserEngineInstall = (async () => {
           const binary = resolveAgentBrowserBinary() ?? await installAgentBrowserBinary({ log: (line) => console.log(line) });
           await ensureChrome(binary, { log: (line) => console.log(line) });
@@ -11782,6 +11795,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           browserEngineInstall = null;
           broadcast({ kind: "config", ...configStatus() });
         });
+        broadcast({ kind: "config", ...configStatus() });
       }
       return json(res, 202, { installing: true });
     }
