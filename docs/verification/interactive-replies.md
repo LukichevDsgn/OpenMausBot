@@ -10,6 +10,22 @@ replaced.
 
 ## Architecture decision
 
+### Existing cards and interaction routing
+
+OpenMaus already renders onboarding choices through `OptionCard` and native
+provider questions/approvals through its request flow. This contribution does not
+introduce those capabilities or replace their request IDs, resume behavior, secure
+credential entry, or confirmation boundaries.
+
+The common system prompt prefers those existing paths when the agent needs an
+answer to continue. Without a native question tool it asks in normal chat. OpenUI
+is for local exploration with derived results, such as adjusting a time budget
+and inspecting an estimate, or filtering a chart. A plain question with answer
+buttons does not need a generated block. Never duplicate a pending native question
+or represent permission/credential/profile/routine/skill confirmation through
+OpenUI. A local draft remains an unsent composer draft, not a response to a brokered
+request. The work-plan fixture demonstrates linked controls, preview and estimate.
+
 - [Thesys OpenUI](https://github.com/thesysdev/openui): use the actual MIT-licensed
   `@openuidev/react-lang` and `@openuidev/lang-core` packages, pinned to 0.2.15.
   Its reactive bindings, expression interpreter and component catalog support
@@ -115,7 +131,7 @@ The focused checks completed on the feature branch:
   midnight, `light` for atelier, and `dark` after returning to midnight; the
   heatmap at slider 8 has four active cells.
 
-The before/after evidence uses the same fixture state. The upstream comparison
+The original before/after evidence used the same fixture state. The upstream comparison
 at `http://127.0.0.1:5399` leaves the fenced source visible in the transcript;
 the feature build at `http://127.0.0.1:5599` renders the controls and preserves
 the draft in the composer. The checked-in screenshots are:
@@ -130,3 +146,17 @@ the draft in the composer. The checked-in screenshots are:
 
 The fixture is a deterministic renderer and safety check; it does not replace
 paid-provider coverage or the separate packaged-desktop integration gate.
+
+### Native interaction coexistence follow-up (2026-09-07)
+
+The prompt now routes blocking questions and confirmations to the existing native
+interaction paths. The work-plan example demonstrates a local calculation instead
+of a standalone question. The six focused suites, including the existing Claude
+native question/request tests, passed 123 tests with 2 platform skips. The production
+build passed. A fresh isolated fixture at `http://127.0.0.1:22482` (PID 282504)
+verified that 4 hours produces 12 estimated sections and updates the plan preview;
+adding the draft produces no POST. Choice/input persistence, heatmap filtering,
+comparison totals, steps, themes, mobile layout and sandbox boundaries also passed.
+The choices, actions, focus, light and mobile screenshots now show this work-plan
+fixture. The upstream-source and heatmap images retain their original evidence.
+These scripted checks do not prove that every provider will follow the guidance.

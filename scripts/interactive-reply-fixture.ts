@@ -21,7 +21,7 @@ try {
   if (process.argv.includes("--include-errors"))
     examples.push('root = UnknownComponent("Unsupported content");');
   const reply =
-    "Choose a next step, inspect the activity or compare the sample plans. Changes remain local until you send a draft.\n\n" +
+    "Explore a work plan, inspect the activity or compare the sample plans. Changes remain local until you send a draft.\n\n" +
     examples.map((source) => `\`\`\`openmaus-ui\n${source}\n\`\`\``).join("\n\n");
   const wrapper = join(dataDir, "interactive-fake.mjs");
   writeFileSync(
@@ -39,7 +39,7 @@ try {
     "--bot",
     created.bot.id,
     "--text",
-    "Help me choose the next step and explore the sample data.",
+    "Build a local work-plan explorer with a time budget and estimate, and let me explore the sample data.",
   );
   const result = await call("wait", "--bot", created.bot.id, "--timeout", "30");
   console.log(JSON.stringify({ ...fixture.info, botId: created.bot.id, result }, null, 2));
