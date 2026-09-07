@@ -18,13 +18,16 @@ const labels = z.array(str).min(1).max(100);
 const matrix = z.array(z.array(num).max(100)).max(100);
 let token = "";
 let words = { draft: "Add to reply", drafted: "Added to your reply", table: "View data" };
+/** Send a nonce-tagged runtime event to the parent; the host validates its source. */
 const post = (type: string, value?: unknown) =>
   parent.postMessage({ channel: "omb-interactive-v1", token, type, value }, "*");
+/** Format evaluated display values without interpreting markup or executable text. */
 const format = (value: unknown) =>
   typeof value === "number"
     ? new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(value)
     : String(value ?? "");
 
+/** Report persistent invalid props after reactive defaults have had time to settle. */
 function InvalidProps({ name }: { name: string }) {
   // OpenUI initializes reactive defaults in an effect. An unresolved first
   // render is transient; report only if validation still fails afterwards.
@@ -37,6 +40,7 @@ function InvalidProps({ name }: { name: string }) {
 
 // Every renderer validates evaluated props. No prop spreading, HTML, URLs,
 // arbitrary styles, event source, or tool provider crosses into these views.
+/** Wrap a catalog view with validation of every evaluated non-binding property. */
 function component<T extends z.ZodObject>(
   name: string,
   props: T,
@@ -56,6 +60,7 @@ function component<T extends z.ZodObject>(
 }
 // Reactive props are interpreter binding objects. They are resolved only by
 // useStateField; the typed schema retains the expected primitive for the parser.
+/** Annotate a cloned schema as a mutable OpenUI binding without altering its caller. */
 function field<T extends z.ZodType>(schema: T) {
   return reactive(schema.clone());
 }
@@ -101,6 +106,7 @@ const Details = component("Details", z.object({ title: str, children }), ({ prop
 
 // Zod's reactive annotation is prompt metadata, not a runtime union. Validate
 // binding descriptors separately while keeping scalar schemas in the catalog.
+/** Validate control props while letting useStateField resolve binding descriptors. */
 function control<T extends z.ZodObject>(name: string, props: T, render: React.FC<{ props: z.infer<T> }>) {
   const View = render;
   return defineComponent({
@@ -189,6 +195,8 @@ const Input = control("Input", z.object({ label: str, value: field(str) }), ({ p
   );
 });
 const numericProps = z.object({ label: str, min: num, max: num, step: num.positive(), value: field(num) });
+/** Share bounded numeric editing between sliders and number fields; invalid
+ * ranges produce a source fallback rather than throwing during rendering. */
 function Numeric({ props, range }: { props: z.infer<typeof numericProps>; range: boolean }) {
   const state = useStateField(props.label, props.value);
   const id = useId();
@@ -523,6 +531,7 @@ const library = createLibrary({
 const root = createRoot(document.getElementById("root")!);
 let started = false;
 let outcome: { type: "ready" | "error"; value?: string } | undefined;
+/** Cache the terminal failure so subsequent init handshakes replay that outcome. */
 function reportError(error: unknown) {
   outcome = {
     type: "error",
@@ -531,19 +540,24 @@ function reportError(error: unknown) {
   post(outcome.type, outcome.value);
 }
 
+/** Translate unexpected React subtree failures into the host's source fallback. */
 class RuntimeBoundary extends React.Component<{ children: React.ReactNode }, { failed: boolean }> {
   state = { failed: false };
+  /** Replace the failed subtree before any readiness effect can commit. */
   static getDerivedStateFromError() {
     return { failed: true };
   }
+  /** Publish the caught failure using the same cached outcome as validation errors. */
   componentDidCatch(error: Error) {
     reportError(error);
   }
+  /** Keep the frame empty on failure; the parent owns the readable fallback. */
   render() {
     return this.state.failed ? null : this.props.children;
   }
 }
 
+/** Acknowledge a committed subtree only after deferred child validation settles. */
 function ReadyAfterCommit() {
   useEffect(() => {
     // Child validation effects run first. Let their deferred InvalidProps
@@ -557,6 +571,7 @@ function ReadyAfterCommit() {
   }, []);
   return null;
 }
+/** Apply bounded host theme tokens; generated reply data cannot supply styles. */
 function applyTheme(theme: Record<string, unknown> | undefined) {
   for (const key of ["ink", "muted", "surface", "border", "accent", "canvas"] as const) {
     const value = theme?.[key];

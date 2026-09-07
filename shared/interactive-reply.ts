@@ -1,5 +1,6 @@
 /** The versioned fence carries OpenUI Lang, never JavaScript or HTML. */
 export const INTERACTIVE_REPLY_MAX_BYTES = 32 * 1024;
+/** Reserve comparison columns for peer Cards; mixed controls stay sequential. */
 export function usesComparisonColumns(children: readonly unknown[]): boolean {
   return (
     children.length > 1 &&
@@ -8,6 +9,8 @@ export function usesComparisonColumns(children: readonly unknown[]): boolean {
     )
   );
 }
+/** Reject unsupported capabilities and excessive source expansion before the
+ * third-party parser runs. Return a user-facing reason, or null for admission. */
 export function validateInteractiveSource(source: string): string | null {
   if (new TextEncoder().encode(source).length > INTERACTIVE_REPLY_MAX_BYTES)
     return "This interactive reply is too large.";

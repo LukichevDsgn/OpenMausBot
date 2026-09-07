@@ -25,6 +25,7 @@ import { TeamMapPage } from "@/components/TeamMapPage";
 import { skillRecorderEnabled } from "@/lib/feature-flags";
 import { setLocale } from "@/lib/i18n";
 
+/** Route the selected task and bind interactive drafts to that conversation. */
 function Shell() {
   const { state, dispatch } = useStore();
   const unreadCount =

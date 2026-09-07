@@ -19,6 +19,7 @@ import { t } from "@/lib/i18n";
 import "./interactive-reply.css";
 
 const FollowUpContext = createContext<((thread: string, text: string) => void) | null>(null);
+/** Permit blocks in this task to append plain text to its unsent composer only. */
 export function InteractiveReplyScope({ scope, children }: { scope: string; children: ReactNode }) {
   const draft = useCallback(
     (thread: string, text: string) => {
@@ -31,6 +32,7 @@ export function InteractiveReplyScope({ scope, children }: { scope: string; chil
 
 const srcDoc = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; img-src 'none'; media-src 'none'; font-src 'none'; form-action 'none'; base-uri 'none'"><style>${frameCss}</style></head><body><div id="root"></div><script>${runtime.replace(/<\/script/gi, "<\\/script")}</script></body></html>`;
 
+/** Snapshot the host's approved theme tokens for the isolated frame. */
 function currentTheme() {
   const style = getComputedStyle(document.documentElement);
   return {
@@ -49,6 +51,7 @@ function currentTheme() {
   };
 }
 
+/** Admit a fenced reply and key its view to the message/source identity. */
 export function InteractiveReply({
   source,
   streaming,
@@ -74,6 +77,8 @@ export function InteractiveReply({
   );
 }
 
+/** Own the nonce-bound sandbox handshake, local state and source fallback.
+ * Outward drafts append to the composer and never submit a turn. */
 function InteractiveView({
   source,
   streaming,

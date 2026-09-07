@@ -297,6 +297,8 @@ function Spoiler({ children }: { children?: ReactNode }) {
   );
 }
 
+/** Render safe chat Markdown, delegating admitted interactive fences to their
+ * isolated renderer while preserving the message context for local file links. */
 function ChatMarkdownComponent({ text, streaming = false, message }: { text: string; streaming?: boolean; message?: MessageAttachmentContext }) {
   return (
     <div className="chat-md min-w-0 [&>*+*]:mt-2">

@@ -149,6 +149,8 @@ function PinToggle({ group, message }: { group: Group; message: Message }) {
   );
 }
 
+/** Render the group transcript with the same interactive message layout hooks
+ * as direct chats; attribution and group delivery remain owned by this view. */
 const Transcript = memo(function Transcript({
   group,
   members,

@@ -288,6 +288,8 @@ function BubbleEditor({
   );
 }
 
+/** Render one chat message and its actions, exposing layout hooks for generated
+ * interactive content while retaining normal message permissions and actions. */
 function Bubble({
   bot,
   message,
