@@ -188,6 +188,8 @@ function CodeBlock({ code, lang, streaming }: { code: string; lang: string; stre
 // and an <a href="file://…"> would still reach setWindowOpenHandler on a
 // middle or modifier click, which calls shell.openExternal without the main
 // process' containment check.
+/** Open a message-backed file in the scoped reader when available, otherwise
+ * retain the authorized download path; legacy links carry no file capability. */
 function LocalFileLink({ filePath, children, message }: { filePath: string; children?: ReactNode; message?: MessageAttachmentContext }) {
   const save = useLocalFileSave(filePath, undefined, message);
   const open = useDocumentPreview();

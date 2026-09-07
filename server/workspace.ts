@@ -168,6 +168,8 @@ export const SESSION_SEARCH_SYSTEM_PROMPT =
  * it has written anything. Content from other bots or imported files must
  * never be recorded as fact — memory is a prompt-injection persistence
  * vector the moment a bot copies untrusted text into it. */
+/** Describe the bot's private memory and allowed deliverable locations without
+ * granting filesystem access beyond the task and bot workspace roots. */
 export function memorySystemPrompt(botId: string): string {
   const memory = loadMemory(botId);
   const memoryFile = join(workspaceDir(botId), "MEMORY.md");

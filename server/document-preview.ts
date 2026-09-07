@@ -14,6 +14,8 @@ export interface DocumentPreview {
 
 const TEXT_EXTENSIONS = new Set([".txt", ".log", ".csv", ".tsv", ".json", ".yaml", ".yml"]);
 
+/** Read bounded UTF-8 content from an already authorized handle; the caller
+ * retains ownership of closing it. Unsupported content remains download-only. */
 export async function readDocumentPreview(file: OpenedMessageFile): Promise<DocumentPreview> {
   const extension = extname(file.name).toLowerCase();
   const kind = extension === ".md" || extension === ".markdown" ? "markdown"

@@ -25,6 +25,8 @@ import { TeamMapPage } from "@/components/TeamMapPage";
 import { skillRecorderEnabled } from "@/lib/feature-flags";
 import { setLocale } from "@/lib/i18n";
 
+/** Route the selected conversation while keeping its document reader scoped
+ * to the active bot/group task, so navigation cannot retain another preview. */
 function Shell() {
   const { state, dispatch } = useStore();
   const unreadCount =

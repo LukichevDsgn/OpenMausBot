@@ -9,6 +9,7 @@ import "./document-workspace.css";
 type Selection = { path: string; message: MessageAttachmentContext; opener: HTMLElement | null };
 type Preview = { name: string; bytes: number; kind: "markdown" | "text" | "download"; text?: string; truncated: boolean };
 const DocumentContext = createContext<((path: string, message: MessageAttachmentContext) => void) | null>(null);
+/** Return the enclosing task's preview opener, or null for download-only hosts. */
 export const useDocumentPreview = () => useContext(DocumentContext);
 
 /** The scope check is synchronous: a task switch cannot expose an old
@@ -36,6 +37,8 @@ export function DocumentWorkspace({ scope, children }: { scope: string; children
   </DocumentContext.Provider>;
 }
 
+/** Load a message-authorized preview with cancellable requests and keyboard
+ * focus ownership; narrow layouts trap focus until the reader is dismissed. */
 function DocumentPanel({ selection, onClose, narrow }: { selection: Selection; onClose: () => void; narrow: boolean }) {
   const [preview, setPreview] = useState<Preview | null>(null);
   const [error, setError] = useState("");
