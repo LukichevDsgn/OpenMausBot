@@ -33,8 +33,8 @@ async function until<T>(read: () => T | Promise<T>, accept: (value: T) => boolea
     await new Promise(r => setTimeout(r, 40));
   }
 }
-// The fake CLI creates this file before writeFileSync finishes. Poll past an
-// incomplete JSON snapshot instead of failing during a valid in-flight write.
+/** Wait for a complete fake-CLI JSON snapshot, retrying an in-flight write.
+ * Propagate non-parse read errors so a broken fixture cannot look like readiness. */
 const dump = () => until(() => {
   if (!existsSync(dumpFile)) return null;
   try { return JSON.parse(readFileSync(dumpFile, "utf8")); }
