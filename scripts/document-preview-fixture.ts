@@ -12,6 +12,7 @@ try {
   const { url, dataDir } = fixture.info;
   const health = await (await fetch(`${url}/api/health`)).json() as { pid: number };
   if (health.pid !== fixture.info.pid) throw new Error("Fixture ownership mismatch");
+  /** Pin every mapped command to this fixture's URL, never the live app. */
   const call = (...args: string[]) => runControlOmb([...args, "--url", url]);
   const { bot } = await call("new-bot", "--name", "Document Studio") as { bot: { id: string } };
   const workspace = join(dataDir, "workspaces", bot.id);

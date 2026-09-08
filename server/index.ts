@@ -9064,6 +9064,10 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (method === "POST" && body?.preview === true) {
         try {
           res.setHeader("cache-control", "private, no-store");
+          res.setHeader("cdn-cache-control", "no-store");
+          res.setHeader("cloudflare-cdn-cache-control", "no-store");
+          res.setHeader("pragma", "no-cache");
+          res.setHeader("vary", "Authorization");
           res.setHeader("x-content-type-options", "nosniff");
           return json(res, 200, await readDocumentPreview(file));
         } finally {

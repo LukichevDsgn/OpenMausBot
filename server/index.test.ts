@@ -8035,9 +8035,18 @@ describe("message pages", () => {
   it("previews a document with the same stored-message and root boundaries as downloading", async () => {
     const route = "/api/threads/test-linked-file-room-thread/messages";
     const linkedFile = join(home, ".openmausbot", "workspaces", "test-bot-a", "phone report.md");
-    const result = await api("POST", `${route}/linked-file-message/file`, { path: linkedFile, preview: true });
-    expect(result.status).toBe(200);
-    expect(result.body).toMatchObject({ kind: "markdown", name: "phone report.md", text: "# Phone-ready report\n", truncated: false });
+    const response = await fetch(`${BASE}${route}/linked-file-message/file`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: linkedFile, preview: true }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ kind: "markdown", name: "phone report.md", text: "# Phone-ready report\n", truncated: false });
+    expect(response.headers.get("cache-control")).toBe("private, no-store");
+    expect(response.headers.get("cdn-cache-control")).toBe("no-store");
+    expect(response.headers.get("cloudflare-cdn-cache-control")).toBe("no-store");
+    expect(response.headers.get("pragma")).toBe("no-cache");
+    expect(response.headers.get("vary")).toBe("Authorization");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
     expect((await api("POST", `${route}/prose-file-message/file`, { path: linkedFile, preview: true })).status).toBe(403);
     expect((await api("POST", `${route}/user-outside-file-message/file`, { path: linkedFile, preview: true })).status).toBe(403);
     expect((await api("POST", `${route}/linked-file-message/file`, { path: join(home, "secret.txt"), preview: true })).status).toBe(403);

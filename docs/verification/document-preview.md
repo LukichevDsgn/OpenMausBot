@@ -21,6 +21,9 @@ alongside the existing `path`. Both preview and download first validate the
 exact stored message and its existing roots, then use `openMessageFile`.
 The preview reads at most 256 KiB from that authorised handle and closes it
 even on error. The original 25 MiB file limit remains in effect.
+Preview responses preserve download's private/no-store policy, CDN-specific
+no-store headers, legacy no-cache hint and authorization variation. The real
+HTTP test asserts those headers alongside the existing access refusals.
 
 Markdown and UTF-8 text (txt, log, csv, tsv, json, yaml) are readable. A
 truncation notice distinguishes copying the preview from saving the complete

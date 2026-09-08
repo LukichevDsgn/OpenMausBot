@@ -96,6 +96,7 @@ function DocumentPanel({ selection, onClose, narrow }: { selection: Selection; o
     return () => controller.abort();
   }, [selection.path, selection.message.threadId, selection.message.messageId, attempt]);
 
+  /** Copy only the bounded preview; saving remains the route to the complete file. */
   const copy = async () => {
     try { await navigator.clipboard.writeText(preview?.text ?? ""); setCopyStatus(t("document.copied")); }
     catch { setCopyStatus(t("document.copyFailed")); }
