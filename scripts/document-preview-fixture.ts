@@ -46,6 +46,7 @@ try {
   console.log(JSON.stringify({ ok: true, ...fixture.info, botId: bot.id,
     messages: await call("messages", "--bot", bot.id, "--limit", "10") }, null, 2));
   await new Promise<void>((done) => {
+    /** Release the fixture wait on shutdown; the outer finally closes its server. */
     const stop = () => done();
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);

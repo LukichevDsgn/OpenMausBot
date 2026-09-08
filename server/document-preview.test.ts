@@ -7,6 +7,7 @@ import { DOCUMENT_PREVIEW_MAX_BYTES, readDocumentPreview } from "./document-prev
 
 const root = mkdtempSync(join(tmpdir(), "omb-documents-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
+/** Read a temporary file through its authorized handle and always close it. */
 async function preview(name: string, bytes: string | Buffer) {
   writeFileSync(join(root, name), bytes);
   const file = await openMessageFile(name, [root]);
