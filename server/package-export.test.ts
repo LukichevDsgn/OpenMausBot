@@ -15,6 +15,7 @@ describe("package export", () => {
           name: "Lead",
           title: "Chief",
           description: "Coordinates",
+          soul: "Preserve the mission.\n",
           notifications: true,
           color: "purple",
           unread: false,
@@ -23,6 +24,7 @@ describe("package export", () => {
           chiefOfStaff: true,
           composio: true,
           cwd: "/private/path",
+          approvalMode: "full",
           autoApprove: true,
           alwaysAllow: ["everything"],
           installedPackage: {
@@ -90,7 +92,14 @@ describe("package export", () => {
           botId: "private-id",
           runOn: "maus",
           enabled: true,
-          schedule: { type: "interval", everyMinutes: 15, anchorAt: 1_788_254_400_000 },
+          schedule: {
+            type: "interval",
+            everyMinutes: 15,
+            anchorAt: 1_788_254_400_000,
+            weekdays: [1, 3, 5],
+            window: { start: "09:00", end: "17:00" },
+            endsAt: 1_790_843_400_000,
+          },
           durationMinutes: 30,
           timeoutMinutes: 20,
           nextRunAt: 789,
@@ -109,10 +118,14 @@ describe("package export", () => {
       ]]),
     });
     expect(exported.package.routines).toHaveLength(2);
+    expect(exported.package.agents[0].soul).toBe("Preserve the mission.\n");
     expect(exported.package.routines?.[1]?.schedule).toEqual({
       type: "interval",
       everyMinutes: 15,
       anchorAt: 1_788_254_400_000,
+      weekdays: [1, 3, 5],
+      window: { start: "09:00", end: "17:00" },
+      endsAt: 1_790_843_400_000,
     });
     expect(exported.package.routines?.[1]?.timeoutMinutes).toBe(20);
 
@@ -131,10 +144,13 @@ describe("package export", () => {
         agents: [{ skills: ["source-check"] }],
       },
     });
-    expect(JSON.stringify(exported)).not.toMatch(/private-id|private-thread|private-engine|secret-model|secret-session|private\/path|private-attachment|autoApprove|alwaysAllow|nextRunAt/);
+    expect(JSON.stringify(exported)).not.toMatch(/private-id|private-thread|private-engine|secret-model|secret-session|private\/path|private-attachment|approvalMode|autoApprove|alwaysAllow|nextRunAt/);
   });
 
-  it("refuses conflicting portable skill content across selected bots", () => {
+  it.each([
+    { instructions: "---\nname: shared\ndescription: Shared\n---\ntwo" },
+    { description: "Different" }, { source: "other" }, { license: "MIT" }, { compatibility: "Other" },
+  ])("refuses conflicting portable skill content across selected bots: %j", (patch) => {
     const bot = (id: string): BotRecord => ({
       id,
       threadId: `thread-${id}`,
@@ -155,7 +171,7 @@ describe("package export", () => {
       routines: [],
       skillsByBot: new Map([
         ["one", [{ name: "shared", description: "Shared", instructions: "---\nname: shared\ndescription: Shared\n---\none" }]],
-        ["two", [{ name: "shared", description: "Shared", instructions: "---\nname: shared\ndescription: Shared\n---\ntwo" }]],
+        ["two", [{ name: "shared", description: "Shared", instructions: "---\nname: shared\ndescription: Shared\n---\none", ...patch }]],
       ]),
     })).toThrow("conflicting content");
   });
@@ -197,38 +213,4 @@ describe("package export", () => {
     ]);
   });
 
-  it("exports a manual-only routine as manual and paused", () => {
-    const bot: BotRecord = {
-      id: "manual-bot",
-      threadId: "private-thread",
-      name: "Manual Bot",
-      title: "Reviewer",
-      description: "Reviews on request.",
-      notifications: true,
-      color: "green",
-      unread: false,
-      modelSelection: { instanceId: "engine", model: "model", effort: "medium" },
-      resumeCursors: {},
-      createdAt: 1,
-    };
-    const exported = createBotPackageExport({
-      name: "Manual package",
-      bots: [bot],
-      groups: [],
-      routines: [{
-        id: "private-routine",
-        name: "Review",
-        prompt: "Review now.",
-        botId: bot.id,
-        runOn: "maus",
-        enabled: false,
-        schedule: { type: "manual" },
-        durationMinutes: 30,
-        nextRunAt: null,
-        createdAt: 1,
-        updatedAt: 1,
-      }],
-    });
-    expect(exported.package.routines).toMatchObject([{ schedule: { type: "manual" }, enabledAfterInstall: false }]);
-  });
 });

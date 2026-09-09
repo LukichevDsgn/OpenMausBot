@@ -70,7 +70,11 @@ export function createBotPackageExport(input: {
     const assignedSkills: string[] = [];
     for (const skill of input.skillsByBot?.get(bot.id) ?? []) {
       const existing = packageSkills.get(skill.name);
-      if (existing && existing.instructions !== skill.instructions) {
+      if (existing && (
+        existing.instructions !== skill.instructions || existing.description !== skill.description ||
+        existing.source !== skill.source || existing.license !== skill.license ||
+        existing.compatibility !== skill.compatibility
+      )) {
         throw new Error(`Skill "${skill.name}" has conflicting content across selected bots`);
       }
       if (!existing) packageSkills.set(skill.name, { ...skill });
@@ -126,10 +130,15 @@ export function createBotPackageExport(input: {
               type: "interval",
               everyMinutes: routine.schedule.everyMinutes,
               anchorAt: routine.schedule.anchorAt,
+              ...(routine.schedule.weekdays === undefined
+                ? {}
+                : { weekdays: [...routine.schedule.weekdays] }),
+              ...(routine.schedule.window === undefined
+                ? {}
+                : { window: { ...routine.schedule.window } }),
+              ...(routine.schedule.endsAt === undefined ? {} : { endsAt: routine.schedule.endsAt }),
             }
-          : routine.schedule.type === "daily"
-            ? { type: "daily", time: routine.schedule.time, weekdays: [...routine.schedule.weekdays] }
-            : { type: "manual" },
+          : { type: "daily", time: routine.schedule.time, weekdays: [...routine.schedule.weekdays] },
       durationMinutes: routine.durationMinutes,
       ...(routine.timeoutMinutes === undefined ? {} : { timeoutMinutes: routine.timeoutMinutes }),
       enabledAfterInstall: false as const,
@@ -146,6 +155,7 @@ export function createBotPackageExport(input: {
       name: bot.name,
       title: bot.title,
       description: bot.description,
+      ...(bot.soul !== undefined ? { soul: bot.soul } : {}),
       appearance,
     };
     const assigned = agentPlaybooks.get(bot.id);

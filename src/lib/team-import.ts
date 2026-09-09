@@ -1,8 +1,9 @@
 import { parse as parseYaml } from "yaml";
+import { parseTeamBackup, TEAM_BACKUP_CONTENTS } from "../../shared/team-backup";
 
 export interface PendingTeamImport {
   manifest: unknown;
-  kind: "team" | "package";
+  kind: "team" | "package" | "backup";
   name: string;
   description: string;
   members: Array<{ name: string; title: string }>;
@@ -11,6 +12,10 @@ export interface PendingTeamImport {
   playbooks: number;
   routines: number;
   apps: Array<{ label: string; optional: boolean }>;
+  skills?: string[];
+  conversations?: number;
+  archivedBots?: number;
+  warnings?: string[];
 }
 
 /** Small client-side preview only; the server remains the trust boundary. */
@@ -20,8 +25,20 @@ export function teamImportPreview(manifest: unknown): PendingTeamImport {
     throw new Error("This file does not contain a team.");
   }
   const root = manifest as Record<string, unknown>;
+  if (root.format === "openmaus.backup") {
+    const backup = parseTeamBackup(manifest);
+    return {
+      manifest: backup, kind: "backup", name: backup.name, description: TEAM_BACKUP_CONTENTS,
+      members: backup.bots.map((bot) => ({ name: bot.name, title: bot.title })),
+      rooms: backup.groups.length, playbooks: backup.bots.reduce((total, bot) => total + bot.playbooks.length, 0),
+      routines: backup.routines.length, apps: [],
+      conversations: [...backup.bots, ...backup.groups].reduce((total, owner) => total + owner.tasks.length, 0),
+      archivedBots: backup.bots.filter((bot) => bot.hidden).length,
+      warnings: backup.warnings,
+    };
+  }
   if (root.format === "openmaus.package") return packagePreview(root, manifest);
-  if (root.format !== "openmaus.team") throw new Error("This is not a BotMRR playbook or legacy OpenMaus team.");
+  if (root.format !== "openmaus.team") throw new Error("This is not an OpenMaus backup, BotMRR playbook or legacy team.");
   if (root.version !== 1 && root.version !== 2) throw new Error(`Team file version ${String(root.version)} is not supported.`);
   if (!root.team || typeof root.team !== "object" || Array.isArray(root.team)) {
     throw new Error("This team file is missing its team definition.");
@@ -104,6 +121,9 @@ function packagePreview(root: Record<string, unknown>, manifest: unknown): Pendi
           : [];
       })
     : [];
+  const skills = pkg.skills && typeof pkg.skills === "object" && !Array.isArray(pkg.skills)
+    ? (pkg.skills as Record<string, unknown>).entries
+    : undefined;
   return {
     manifest,
     kind: "package",
@@ -115,5 +135,10 @@ function packagePreview(root: Record<string, unknown>, manifest: unknown): Pendi
     playbooks: Array.isArray(pkg.playbooks) ? pkg.playbooks.length : 0,
     routines: Array.isArray(pkg.routines) ? pkg.routines.length : 0,
     apps,
+    skills: Array.isArray(skills) ? skills.flatMap((skill) => {
+      if (!skill || typeof skill !== "object" || Array.isArray(skill)) return [];
+      const { name } = skill as Record<string, unknown>;
+      return typeof name === "string" && name.trim() ? [name.trim()] : [];
+    }) : [],
   };
 }

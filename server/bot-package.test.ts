@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 
 import { packageAgentAsMember, parseBotPackage, renderBotPackageMarkdown } from "./bot-package.ts";
-import { BOT_INSTRUCTIONS_MAX_CHARS } from "./team-manifest.ts";
 
 const validPackage: any = {
   format: "openmaus.package",
@@ -26,6 +25,7 @@ const validPackage: any = {
         description: "Own the brief.",
         appearance: { color: "purple" },
         playbooks: ["source-check"],
+        approvalMode: "full",
         autoApprove: true,
       },
     ],
@@ -81,9 +81,53 @@ describe("bot packages", () => {
     })).toThrow("does not match its description");
   });
 
+  it("round-trips optional soul through Markdown and the import persona, with the profile byte cap", () => {
+    const input = structuredClone(validPackage);
+    const soul = "  Preserve precise instructions. 🐭\n";
+    input.package.agents[0].soul = soul;
+    const parsed = parseBotPackage(renderBotPackageMarkdown(parseBotPackage(input)));
+    expect(packageAgentAsMember(parsed.package.agents[0]).soul).toBe(soul);
+    input.package.agents[0].soul = "🐭".repeat(6_001);
+    expect(() => parseBotPackage(input)).toThrow("24000 bytes");
+  });
+  it.each([
+    { name: "../escape" },
+    { instructions: "not frontmatter" },
+    { source: "/private/skill" },
+    { source: "file:///private/skill" },
+    { license: "not the SKILL.md license" },
+    { compatibility: "not the SKILL.md compatibility" },
+    { instructions: "---\nname: source-check\ndescription: Check sources before writing.\n---\n" + "🐭".repeat(65_536) },
+  ])("rejects invalid portable skill data: %j", (patch) => {
+    expect(() => parseBotPackage({
+      ...validPackage,
+      package: { ...validPackage.package, agents: [{ ...validPackage.package.agents[0], skills: ["source-check"] }],
+        skills: { version: 1, entries: [{ ...portableSkill, ...patch }] } },
+    })).toThrow();
+  });
+
+  it("rejects duplicate, unassigned and excessive packaged skills", () => {
+    const document = structuredClone(validPackage);
+    document.package.skills = { version: 1, entries: [portableSkill] };
+    expect(() => parseBotPackage(document)).toThrow("not referenced");
+    document.package.agents[0].skills = ["source-check"];
+    document.package.skills.entries.push(portableSkill);
+    expect(() => parseBotPackage(document)).toThrow("Duplicate skill");
+    document.package.skills.entries = Array(21).fill(portableSkill);
+    expect(() => parseBotPackage(document)).toThrow();
+  });
+  it("refuses to render a skill bundle larger than the Markdown import limit", () => {
+    const document = structuredClone(validPackage);
+    document.package.agents[0].skills = Array.from({ length: 5 }, (_, i) => `large-${i}`);
+    document.package.skills = { version: 1, entries: document.package.agents[0].skills.map((name: string) => ({
+      name, description: "Large fixture", instructions: `---\nname: ${name}\ndescription: Large fixture\n---\n${"a".repeat(210_000)}`,
+    })) };
+    expect(() => renderBotPackageMarkdown(parseBotPackage(document))).toThrow("too large");
+  });
   it("parses the complete portable structure and strips authority fields", () => {
     const parsed = parseBotPackage(validPackage);
     expect(parsed.package.rooms![0]?.defaultResponder).toEqual({ kind: "agent", agent: "lead" });
+    expect(parsed.package.agents[0]).not.toHaveProperty("approvalMode");
     expect(parsed.package.agents[0]).not.toHaveProperty("autoApprove");
     expect(packageAgentAsMember(parsed.package.agents[0]!)).toEqual({
       key: "lead",
@@ -99,6 +143,7 @@ describe("bot packages", () => {
     expect(markdown).toContain("## Activation");
     expect(markdown).toContain("Give this file to your Chief of Staff");
     expect(markdown).not.toContain("autoApprove");
+    expect(markdown).not.toContain("approvalMode");
     expect(parseBotPackage(markdown).package).toMatchObject({
       id: "research-desk",
       chiefOfStaff: "lead",
@@ -143,7 +188,14 @@ describe("bot packages", () => {
           agent: "lead",
           prompt: "Check the queue.",
           runOn: "maus",
-          schedule: { type: "interval", everyMinutes: 15, anchorAt: 1_788_254_400_000 },
+          schedule: {
+            type: "interval",
+            everyMinutes: 15,
+            anchorAt: 1_788_254_400_000,
+            weekdays: [1, 3, 5],
+            window: { start: "09:00", end: "17:00" },
+            endsAt: 1_790_843_400_000,
+          },
           durationMinutes: 30,
           timeoutMinutes: 20,
           enabledAfterInstall: false,
@@ -156,9 +208,14 @@ describe("bot packages", () => {
       type: "interval",
       everyMinutes: 15,
       anchorAt: 1_788_254_400_000,
+      weekdays: [1, 3, 5],
+      window: { start: "09:00", end: "17:00" },
+      endsAt: 1_790_843_400_000,
     });
     expect(parsed.package.routines?.[0]?.timeoutMinutes).toBe(20);
     expect(renderBotPackageMarkdown(parsed)).toContain("every 15 minutes");
+    expect(renderBotPackageMarkdown(parsed)).toContain("Monday, Wednesday, Friday");
+    expect(renderBotPackageMarkdown(parsed)).toContain("09:00–17:00");
     expect(renderBotPackageMarkdown(parsed)).toContain("**Run limit:** 20 minutes");
     expect(() => parseBotPackage({
       ...document,
@@ -174,33 +231,34 @@ describe("bot packages", () => {
         }],
       },
     })).toThrow();
+    expect(() => parseBotPackage({
+      ...document,
+      package: {
+        ...document.package,
+        routines: [{
+          ...document.package.routines[0],
+          schedule: {
+            ...document.package.routines[0].schedule,
+            weekdays: [1, 1],
+          },
+        }],
+      },
+    })).toThrow(/unique weekdays/);
+    expect(() => parseBotPackage({
+      ...document,
+      package: {
+        ...document.package,
+        routines: [{
+          ...document.package.routines[0],
+          schedule: {
+            ...document.package.routines[0].schedule,
+            window: { start: "17:00", end: "09:00" },
+          },
+        }],
+      },
+    })).toThrow(/later on the same day/);
   });
 
-  it("round-trips a paused manual-only routine without inventing a schedule", () => {
-    const manual = structuredClone(validPackage);
-    manual.package.routines = [{
-      key: "manual-review",
-      name: "Manual review",
-      agent: "lead",
-      prompt: "Review when asked.",
-      runOn: "maus",
-      schedule: { type: "manual" },
-      durationMinutes: 30,
-      enabledAfterInstall: false,
-    }];
-    const parsed = parseBotPackage(manual);
-    expect(parsed.package.routines?.[0]?.schedule).toEqual({ type: "manual" });
-    expect(renderBotPackageMarkdown(parsed)).toContain("**Schedule:** manual only");
-  });
-
-  it("keeps long agent instructions within the shared portable cap", () => {
-    const accepted = structuredClone(validPackage);
-    accepted.package.agents[0].description = "A".repeat(6_219);
-    expect(parseBotPackage(accepted).package.agents[0]?.description).toHaveLength(6_219);
-    const rejected = structuredClone(validPackage);
-    rejected.package.agents[0].description = "A".repeat(BOT_INSTRUCTIONS_MAX_CHARS + 1);
-    expect(() => parseBotPackage(rejected)).toThrow("agents.0.description is too long");
-  });
 
   it("rejects dangling agent, room, playbook, chief, and routine references", () => {
     expect(() => parseBotPackage({

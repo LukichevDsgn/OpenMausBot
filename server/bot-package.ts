@@ -2,15 +2,17 @@ import { z } from "zod";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 import { schemaIssue, type JsonValue } from "./schema.ts";
-import { parseSkillMd, SKILL_FILE_MAX_BYTES } from "./skills.ts";
+import { isSkillName, parseSkillMd, SKILL_FILE_MAX_BYTES } from "./skills.ts";
 import type { MausColor } from "./store.ts";
-import { BOT_INSTRUCTIONS_MAX_CHARS, type TeamManifestMember } from "./team-manifest.ts";
+import type { TeamManifestMember } from "./team-manifest.ts";
+import { BOT_PROFILE_LIMITS } from "../shared/bot-profile.ts";
 
 export const BOT_PACKAGE_FORMAT = "openmaus.package" as const;
 export const BOT_PACKAGE_VERSION = 1 as const;
 export const BOTMRR_MARKDOWN_VERSION = 1 as const;
 export const BOT_PACKAGE_SKILLS_VERSION = 1 as const;
-const BOT_PACKAGE_MAX_SKILLS = 20;
+export const BOT_PACKAGE_MAX_SKILLS = 20;
+const BOT_PACKAGE_MARKDOWN_MAX_BYTES = 1_000_000;
 
 const COLORS = [
   "green",
@@ -39,7 +41,7 @@ const key = requiredText(64).regex(/^[a-z0-9][a-z0-9_-]*$/, {
   message: "may only contain lowercase letters, numbers, - and _",
 });
 const MAX_DATE_MS = 8_640_000_000_000_000;
-const skillName = requiredText(64).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, {
+const skillName = requiredText(64).refine(isSkillName, {
   message: "must be a lowercase skill name",
 });
 const portableSource = optionalText(2_000).refine(
@@ -59,6 +61,54 @@ const portableSkillSchema = z.object({
   license: optionalText(200),
   compatibility: optionalText(200),
   instructions: skillInstructions,
+});
+const CLOCK_TIME = /^([01]\d|2[0-3]):[0-5]\d$/;
+const intervalWeekdays = z.array(z.number().int().min(0).max(6)).min(1).max(7).refine(
+  (weekdays) => new Set(weekdays).size === weekdays.length,
+  "must contain unique weekdays",
+);
+const intervalWindow = z.object({
+  start: z.string().regex(CLOCK_TIME, { message: "must use HH:MM" }),
+  end: z.string().regex(CLOCK_TIME, { message: "must use HH:MM" }),
+}).strict().refine(({ start, end }) => start < end, {
+  message: "must end later on the same day",
+});
+const packageRoutineScheduleSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("once"), at: z.number().int() }),
+  z.object({
+    type: z.literal("daily"),
+    time: requiredText(5).regex(CLOCK_TIME, { message: "must use HH:MM" }),
+    weekdays: z.array(z.number().int().min(0).max(6)).min(1).max(7),
+  }),
+  z.object({
+    type: z.literal("interval"),
+    everyMinutes: z.number().int().min(5).max(1_440),
+    anchorAt: z.number().int().nonnegative().max(MAX_DATE_MS),
+    weekdays: intervalWeekdays.optional(),
+    window: intervalWindow.optional(),
+    endsAt: z.number().int().nonnegative().max(MAX_DATE_MS).optional(),
+  }),
+]).superRefine((schedule, context) => {
+  if (schedule.type !== "interval") return;
+  if (schedule.window) {
+    const [startHour, startMinute] = schedule.window.start.split(":").map(Number);
+    const [endHour, endMinute] = schedule.window.end.split(":").map(Number);
+    const windowMinutes = endHour * 60 + endMinute - (startHour * 60 + startMinute);
+    if (windowMinutes < schedule.everyMinutes) {
+      context.addIssue({
+        code: "custom",
+        message: "must be at least as long as the interval cadence",
+        path: ["window"],
+      });
+    }
+  }
+  if (schedule.endsAt !== undefined && schedule.endsAt < schedule.anchorAt) {
+    context.addIssue({
+      code: "custom",
+      message: "must not be before the interval anchor",
+      path: ["endsAt"],
+    });
+  }
 });
 
 const packageSchema = z.object({
@@ -91,7 +141,10 @@ const packageSchema = z.object({
       key,
       name: requiredText(100),
       title: optionalText(200),
-      description: optionalText(BOT_INSTRUCTIONS_MAX_CHARS),
+      description: optionalText(4_000),
+      soul: z.string().refine((value) => Buffer.byteLength(value, "utf8") <= BOT_PROFILE_LIMITS.soul, {
+        error: "standing instructions must be at most 24000 bytes",
+      }).optional(),
       appearance: z.object({
         color: z.enum(COLORS, { error: "is not supported" }),
         mascotExpression: optionalText(80),
@@ -118,20 +171,7 @@ const packageSchema = z.object({
       agent: key,
       prompt: requiredText(20_000),
       runOn: z.enum(["maus", "cloud"]),
-      schedule: z.discriminatedUnion("type", [
-        z.object({ type: z.literal("manual") }),
-        z.object({ type: z.literal("once"), at: z.number().int() }),
-        z.object({
-          type: z.literal("daily"),
-          time: requiredText(5).regex(/^([01]\d|2[0-3]):[0-5]\d$/, { message: "must use HH:MM" }),
-          weekdays: z.array(z.number().int().min(0).max(6)).min(1).max(7),
-        }),
-        z.object({
-          type: z.literal("interval"),
-          everyMinutes: z.number().int().min(5).max(1_440),
-          anchorAt: z.number().int().nonnegative().max(MAX_DATE_MS),
-        }),
-      ]),
+      schedule: packageRoutineScheduleSchema,
       durationMinutes: z.number().int().min(5).max(240),
       timeoutMinutes: z.number().int().min(5).max(240).optional(),
       enabledAfterInstall: z.literal(false),
@@ -168,7 +208,7 @@ export function isBotPackage(value: unknown): boolean {
 }
 
 function markdownDocument(markdown: string): ParsedBotPackage {
-  if (Buffer.byteLength(markdown) > 1_000_000) throw new Error("The bot playbook is too large");
+  if (Buffer.byteLength(markdown) > BOT_PACKAGE_MARKDOWN_MAX_BYTES) throw new Error("The bot playbook is too large");
   const frontmatter = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
   if (!frontmatter) throw new Error("This Markdown is missing YAML frontmatter");
   let metadata: unknown;
@@ -233,6 +273,11 @@ export function parseBotPackage(value: JsonValue | ParsedBotPackage): ParsedBotP
     if ("error" in parsed) throw new Error(`Skill ${skill.name} is invalid: ${parsed.error}`);
     if (parsed.name !== skill.name) throw new Error(`Skill ${skill.name} does not match its SKILL.md name`);
     if (parsed.description !== skill.description) throw new Error(`Skill ${skill.name} does not match its description`);
+    for (const field of ["license", "compatibility"] as const) {
+      if (skill[field] !== undefined && skill[field] !== parsed[field]) {
+        throw new Error(`Skill ${skill.name} does not match its ${field}`);
+      }
+    }
     if (!referencedSkills.has(skill.name)) throw new Error(`Skill ${skill.name} is not referenced by an agent`);
   }
   for (const room of pkg.rooms ?? []) {
@@ -251,6 +296,21 @@ export function parseBotPackage(value: JsonValue | ParsedBotPackage): ParsedBotP
 }
 
 const list = (values: string[]) => values.map((value) => `- ${value}`).join("\n");
+const WEEKDAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+function intervalScheduleText(
+  schedule: Extract<NonNullable<BotPackageDefinition["routines"]>[number]["schedule"], { type: "interval" }>,
+): string {
+  const restrictions = [
+    schedule.weekdays?.length
+      ? `on ${schedule.weekdays.map((day) => WEEKDAY_NAMES[day]).join(", ")}`
+      : null,
+    schedule.window ? `during ${schedule.window.start}–${schedule.window.end}` : null,
+    schedule.endsAt !== undefined ? `until ${new Date(schedule.endsAt).toISOString()}` : null,
+  ].filter((part): part is string => part !== null);
+  const cadence = `every ${schedule.everyMinutes} minutes from ${new Date(schedule.anchorAt).toISOString()}`;
+  return restrictions.length ? `${cadence}; ${restrictions.join("; ")}` : cadence;
+}
 
 /** Render the public artifact. The frontmatter enables deterministic imports;
  * the body is deliberately complete enough for any Chief-of-Staff agent to
@@ -276,13 +336,11 @@ export function renderBotPackageMarkdown(document: ParsedBotPackage): string {
     `### ${routine.name}`,
     `**Owner:** \`${routine.agent}\`  `,
     `**Schedule:** ${
-      routine.schedule.type === "manual"
-        ? "manual only"
-        : routine.schedule.type === "daily"
-          ? `${routine.schedule.time} on weekdays ${routine.schedule.weekdays.join(", ")}`
-          : routine.schedule.type === "interval"
-            ? `every ${routine.schedule.everyMinutes} minutes from ${new Date(routine.schedule.anchorAt).toISOString()}`
-            : `once at ${routine.schedule.at}`
+      routine.schedule.type === "daily"
+        ? `${routine.schedule.time} on weekdays ${routine.schedule.weekdays.join(", ")}`
+        : routine.schedule.type === "interval"
+          ? intervalScheduleText(routine.schedule)
+          : `once at ${routine.schedule.at}`
     }  `,
     `**Run limit:** ${routine.timeoutMinutes === undefined ? "none" : `${routine.timeoutMinutes} minutes`}  `,
     "**Initial state:** paused — the user must enable it",
@@ -312,7 +370,9 @@ export function renderBotPackageMarkdown(document: ParsedBotPackage): string {
     ? pkg.requirements.apps.map((app) => `- **${app.label}${app.optional ? " (optional)" : ""}:** ${app.reason}`).join("\n")
     : "- No connected apps are required.";
 
-  return `---\n${frontmatter}\n---\n\n# ${pkg.name}\n\n${pkg.tagline}\n\n> **Give this file to your Chief of Staff.** It is the complete team blueprint. Any agent system can run it; OpenMausBot can also install it directly.\n\n## Activation\n\nYou are the Chief of Staff for this blueprint. Read the whole document before acting. Confirm the user's goal and any missing inputs, then create or delegate to the specialist roles below. Preserve their names, ownership, boundaries, shared-room rules, and playbooks. If your platform cannot literally spawn agents, perform the roles one at a time and keep their outputs clearly separated.\n\nNever request pasted passwords or secret keys. Use the platform's normal connection flow. Do not send messages, publish content, spend money, delete data, or enable a schedule without the user's explicit approval. All routines start paused.\n\n## Mission\n\n${pkg.summary}\n\n## Outcomes\n\n${list(pkg.outcomes)}\n\n## Connections\n\n${connections}\n\n## Team\n\n${agents}\n\n## Chief of Staff\n\nThe Chief of Staff role is \`${pkg.chiefOfStaff ?? pkg.agents[0].key}\`. This role owns delegation, synthesis, conflict resolution, and the final answer to the user.\n${rooms ? `\n## Shared rooms\n\n${rooms}\n` : ""}${routines ? `\n## Suggested routines\n\n${routines}\n` : ""}${playbooks ? `\n## Playbooks\n\n${playbooks}\n` : ""}${examples ? `\n## Example job\n\n${examples}\n` : ""}\n## Completion rule\n\nReturn one clear result to the user, distinguish evidence from inference, cite source links when the work uses external material, and state what still needs human approval or a connected app.\n`;
+  const markdown = `---\n${frontmatter}\n---\n\n# ${pkg.name}\n\n${pkg.tagline}\n\n> **Give this file to your Chief of Staff.** It is the complete team blueprint. Any agent system can run it; OpenMausBot can also install it directly.\n\n## Activation\n\nYou are the Chief of Staff for this blueprint. Read the whole document before acting. Confirm the user's goal and any missing inputs, then create or delegate to the specialist roles below. Preserve their names, ownership, boundaries, shared-room rules, and playbooks. If your platform cannot literally spawn agents, perform the roles one at a time and keep their outputs clearly separated.\n\nNever request pasted passwords or secret keys. Use the platform's normal connection flow. Do not send messages, publish content, spend money, delete data, or enable a schedule without the user's explicit approval. All routines start paused.\n\n## Mission\n\n${pkg.summary}\n\n## Outcomes\n\n${list(pkg.outcomes)}\n\n## Connections\n\n${connections}\n\n## Team\n\n${agents}\n\n## Chief of Staff\n\nThe Chief of Staff role is \`${pkg.chiefOfStaff ?? pkg.agents[0].key}\`. This role owns delegation, synthesis, conflict resolution, and the final answer to the user.\n${rooms ? `\n## Shared rooms\n\n${rooms}\n` : ""}${routines ? `\n## Suggested routines\n\n${routines}\n` : ""}${playbooks ? `\n## Playbooks\n\n${playbooks}\n` : ""}${examples ? `\n## Example job\n\n${examples}\n` : ""}\n## Completion rule\n\nReturn one clear result to the user, distinguish evidence from inference, cite source links when the work uses external material, and state what still needs human approval or a connected app.\n`;
+  if (Buffer.byteLength(markdown) > BOT_PACKAGE_MARKDOWN_MAX_BYTES) throw new Error("The bot playbook is too large");
+  return markdown;
 }
 
 export function packageAgentAsMember(agent: BotPackageAgent): TeamManifestMember {
@@ -321,6 +381,7 @@ export function packageAgentAsMember(agent: BotPackageAgent): TeamManifestMember
     name: agent.name,
     title: agent.title ?? "",
     description: agent.description ?? "",
+    ...(agent.soul !== undefined ? { soul: agent.soul } : {}),
     appearance: {
       color: agent.appearance.color,
       ...(agent.appearance.mascotExpression ? { mascotExpression: agent.appearance.mascotExpression } : {}),

@@ -33,7 +33,7 @@ class SlashCommandsTest {
             SlashCommands.ALL.map { it.id },
         )
         assertEquals(
-            listOf("/computer", "/tasks", "/diff", "/retry", "/steer"),
+            listOf("/computer", "/threads", "/diff", "/retry", "/steer"),
             SlashCommands.ALL.map { it.title },
         )
     }
@@ -48,7 +48,7 @@ class SlashCommandsTest {
     @Test
     fun `computer and tasks navigate, and carry no prompt to send`() {
         assertEquals(SlashEffect.OpenComputer, effect("/computer"))
-        assertEquals(SlashEffect.OpenTasks, effect("/tasks"))
+        assertEquals(SlashEffect.OpenTasks, effect("/threads"))
         assertEquals(
             listOf("/diff", "/retry", "/steer"),
             SlashCommands.ALL.filter { it.effect is SlashEffect.Send }.map { it.title },
@@ -67,7 +67,7 @@ class SlashCommandsTest {
     fun `a channel with tasks keeps tasks but never computer`() {
         val channel = Chat.RoomChat(room().copy(tasks = listOf(BotTask("task-1", "Plan", 0.0))))
         assertEquals(
-            listOf("/tasks", "/diff", "/retry", "/steer"),
+            listOf("/threads", "/diff", "/retry", "/steer"),
             SlashCommands.forChat(channel).map { it.title },
         )
     }
@@ -261,6 +261,7 @@ class ComposerAccessoriesTest {
                 busy = false,
                 pendingApproval = false,
                 hasQuickReplies = true,
+                hasAttachments = false,
             ),
         )
     }
@@ -294,6 +295,7 @@ class ComposerAccessoriesTest {
                 busy = true,
                 pendingApproval = true,
                 hasQuickReplies = true,
+                hasAttachments = false,
             ),
         )
     }
@@ -316,7 +318,8 @@ class ComposerAccessoriesTest {
         busy: Boolean = false,
         pendingApproval: Boolean = false,
         hasQuickReplies: Boolean = true,
-    ) = ComposerAccessories.accessory(hudOpen, draft, busy, pendingApproval, hasQuickReplies)
+        hasAttachments: Boolean = false,
+    ) = ComposerAccessories.accessory(hudOpen, draft, busy, pendingApproval, hasQuickReplies, hasAttachments)
 
     private fun card(pending: Boolean): Message = Message(
         id = if (pending) "pending" else "answered",

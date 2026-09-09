@@ -5,7 +5,9 @@
 // session/prompt, and streams session/update notifications for a scripted
 // turn. Failure modes mirror how real ACP agents misbehave:
 //
-//   FAKE_ACP_MODE   happy (default) | image | empty-reply | exit-early | fail-after-text | hang | no-auth | auth-required | permission
+//   FAKE_ACP_LOAD_NULL  return null for session/load so the resume cursor is
+//                       ignored and the driver falls through to session/new
+//   FAKE_ACP_MODE   happy (default) | image | empty-reply | exit-early | fail-after-text | hang | hang-initialize | no-auth | auth-required | permission | question
 //                   | interleave (message → tool → message → tool → message)
 //                   | no-session-config (reject session/set_mode + set_model
 //                     with -32601, i.e. an agent predating those methods)
@@ -23,6 +25,8 @@
 //                     file exists — a deterministic busy window for the
 //                     steer-queue e2e, with the echo pinning exactly what a
 //                     drained turn was sent)
+//                   | safe-agent-reads (simulate a native Auto reviewer around
+//                     the real injected agents MCP; not a real classifier test)
 //   FAKE_ACP_DUMP   path to write {argv, env} as JSON, so a test can assert
 //                   argv shape (agent/stdio flags) and env hygiene
 //   FAKE_ACP_MODELS      comma-separated model ids. Enables the opencode-shaped
@@ -47,6 +51,8 @@ const ONE_PIXEL_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42
 // identical to before.
 const models = (process.env.FAKE_ACP_MODELS ?? "").split(",").filter(Boolean);
 let currentModel: string | null = models[0] ?? null;
+const modes = (process.env.FAKE_ACP_MODES ?? "").split(",").filter(Boolean);
+let currentMode: string | null = modes[0] ?? null;
 // task id captured from the last delegate_bot reply, for a later
 // check_delegation call. Each turn is a fresh process, so the id is passed
 // through a file (same state-passing pattern as FAKE_ACP_GATE_FILE).
@@ -76,9 +82,9 @@ function savedDelegatedTaskId(): string {
   }
   return chiefDelegatedTaskId;
 }
-const configOptions = () =>
-  models.length
-    ? [
+const configOptions = () => {
+  const options = [
+    ...(models.length ? [
         {
           id: "model",
           name: "Model",
@@ -87,8 +93,18 @@ const configOptions = () =>
           currentValue: currentModel,
           options: models.map((value) => ({ value, name: value })),
         },
-      ]
-    : null;
+      ] : []),
+    ...(modes.length ? [{
+      id: "mode",
+      name: "Mode",
+      category: "mode",
+      type: "select",
+      currentValue: currentMode,
+      options: modes.map((value) => ({ value, name: value })),
+    }] : []),
+  ];
+  return options.length ? options : null;
+};
 // cursor-shaped surface: the session advertises `models.availableModels` with
 // parameterised ids (`default[]`) that differ from the argv `--model` slugs
 // (`auto`). Off unless FAKE_ACP_SESSION_MODELS is set, so every existing mode
@@ -112,6 +128,8 @@ const dumpEnv = Object.fromEntries(
     "SystemRoot",
     "FAKE_ACP_MODE",
     "FAKE_ACP_RPC_DUMP",
+    "FAKE_ACP_IMAGE_CAPABILITY",
+    "FAKE_ACP_DUMP_PROMPT",
     "TEST_POLICY",
     "OPENCODE_API_KEY",
     "OPENAI_API_KEY",
@@ -131,6 +149,9 @@ const dumpEnv = Object.fromEntries(
     "KIMI_MODEL_DISPLAY_NAME",
     "TEST_TURN_MODEL",
     "MY_AGENT_TOKEN",
+    "GEMINI_HOME",
+    "AGY_ACP_FORCE_FILE_STORAGE",
+    "ANTIGRAVITY_HARNESS_PATH",
   ].flatMap((key) => (process.env[key] === undefined ? [] : [[key, process.env[key]]] as const)),
 );
 const dumpState: Record<string, unknown> = { argv, env: dumpEnv };
@@ -194,7 +215,7 @@ const configCalls: Array<{ method: string; params: unknown }> = [];
 
 // pending server→client permission request id → resolver
 let pendingPermissionId: number | null = null;
-let onPermissionAnswered: (() => void) | null = null;
+let onPermissionAnswered: ((allowed: boolean) => void) | null = null;
 
 // ask-peer mode: the "agents" MCP server entry from session/new's mcpServers
 type McpEntry = { command: string; args?: string[]; env?: Array<{ name: string; value: string }> };
@@ -202,7 +223,7 @@ let agentsMcp: McpEntry | null = null;
 
 /** Minimal one-shot MCP stdio client: initialize, call each tool in
  * sequence, return the text of the last result. Dependency-free. */
-function driveMcp(entry: McpEntry, calls: Array<{ name: string; args: (prev: string) => object }>): Promise<string> {
+function driveMcp(entry: McpEntry, calls: Array<{ name: string; args: (prev: string) => object }>, strict = false): Promise<string> {
   return new Promise((resolve, reject) => {
     const env = { ...process.env };
     for (const { name, value } of entry.env ?? []) env[name] = value;
@@ -237,6 +258,12 @@ function driveMcp(entry: McpEntry, calls: Array<{ name: string; args: (prev: str
           continue;
         }
         if (msg.id === undefined) continue;
+        if (strict && (msg.error || msg.result?.isError)) {
+          clearTimeout(timer);
+          child.kill();
+          reject(new Error(`Fixture MCP request failed: ${JSON.stringify(msg.error ?? msg.result)}`));
+          return;
+        }
         if (step === -1) {
           write({ jsonrpc: "2.0", method: "notifications/initialized" });
           next();
@@ -289,7 +316,7 @@ function handle(msg: any) {
   // client's response to our permission request
   if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined) && msg.id === pendingPermissionId) {
     pendingPermissionId = null;
-    onPermissionAnswered?.();
+    onPermissionAnswered?.(msg.result?.outcome?.optionId === "allow-once");
     return;
   }
   if (!msg.method) return;
@@ -297,12 +324,31 @@ function handle(msg: any) {
 
   switch (msg.method) {
     case "initialize": {
+      if (mode === "hang-initialize") {
+        setInterval(() => {}, 1_000);
+        return;
+      }
       if (mode === "exit-early") {
         process.stderr.write("fake-acp: simulated crash before result\n");
         process.exit(3);
       }
-      const authMethods = mode === "no-auth" ? [] : [{ id: "cached_token" }];
-      result(msg.id, { protocolVersion: 1, authMethods, _meta: { modelState: { currentModelId: "fake-acp-model" } } });
+      const authMethods = mode === "no-auth" ? [] : [{ id: process.env.FAKE_ACP_AUTH_METHOD ?? "cached_token" }];
+      const agentName = process.env.FAKE_ACP_AGENT_NAME;
+      const acceptsImages = process.env.FAKE_ACP_IMAGE_CAPABILITY === "1";
+      result(msg.id, {
+        protocolVersion: 1,
+        authMethods,
+        agentInfo: agentName
+          ? { name: agentName, version: process.env.FAKE_ACP_AGENT_VERSION ?? "test" }
+          : undefined,
+        agentCapabilities: agentName || acceptsImages
+          ? {
+              ...(agentName ? { loadSession: true, sessionCapabilities: { resume: true }, auth: { logout: true } } : {}),
+              ...(acceptsImages ? { promptCapabilities: { image: true } } : {}),
+            }
+          : undefined,
+        _meta: { modelState: { currentModelId: "fake-acp-model" } },
+      });
       break;
     }
     case "authenticate":
@@ -336,6 +382,25 @@ function handle(msg: any) {
       break;
     }
     case "session/load": {
+      if (process.env.FAKE_ACP_LOAD_NULL) {
+        result(msg.id, null);
+        break;
+      }
+      if (mode === "safe-agent-reads") {
+        agentsMcp = (msg.params?.mcpServers ?? []).find((server: any) => server.name === "agents") ?? null;
+        if (process.env.FAKE_ACP_DUMP) {
+          writeFileSync(`${process.env.FAKE_ACP_DUMP}.mcp.json`, JSON.stringify(msg.params?.mcpServers ?? []));
+        }
+      }
+      const opts = configOptions();
+      const mdls = sessionModels();
+      result(msg.id, { ...(opts ? { configOptions: opts } : {}), ...(mdls ? { models: mdls } : {}) });
+      break;
+    }
+    case "session/resume": {
+      if (process.env.FAKE_ACP_DUMP) {
+        writeFileSync(`${process.env.FAKE_ACP_DUMP}.mcp.json`, JSON.stringify(msg.params?.mcpServers ?? []));
+      }
       const opts = configOptions();
       const mdls = sessionModels();
       result(msg.id, { ...(opts ? { configOptions: opts } : {}), ...(mdls ? { models: mdls } : {}) });
@@ -374,6 +439,15 @@ function handle(msg: any) {
     }
     case "session/set_config_option": {
       const { configId, value } = msg.params ?? {};
+      if (configId === "mode" && modes.includes(value)) {
+        currentMode = value;
+        configCalls.push({ method: msg.method, params: msg.params });
+        if (process.env.FAKE_ACP_DUMP) {
+          writeFileSync(`${process.env.FAKE_ACP_DUMP}.config.json`, JSON.stringify(configCalls, null, 2));
+        }
+        result(msg.id, process.env.FAKE_ACP_EMPTY_MODE_ACK ? {} : { configOptions: configOptions() });
+        break;
+      }
       if (configId !== "model" || !models.includes(value)) {
         out({
           jsonrpc: "2.0",
@@ -386,10 +460,17 @@ function handle(msg: any) {
       // in the protocol forbids it, and it is the shape core.ts's confirmation
       // guard exists for — an error is loud, this is silent.
       if (!process.env.FAKE_ACP_MODEL_STICKS) currentModel = value;
+      configCalls.push({ method: msg.method, params: msg.params });
+      if (process.env.FAKE_ACP_DUMP) {
+        writeFileSync(`${process.env.FAKE_ACP_DUMP}.config.json`, JSON.stringify(configCalls, null, 2));
+      }
       result(msg.id, { configOptions: configOptions() });
       break;
     }
     case "session/prompt": {
+      if (process.env.FAKE_ACP_DUMP && process.env.FAKE_ACP_DUMP_PROMPT === "1") {
+        writeFileSync(`${process.env.FAKE_ACP_DUMP}.prompt.json`, JSON.stringify(msg.params?.prompt ?? null, null, 2));
+      }
       if (mode === "hang") {
         // never resolve the prompt — lets tests exercise interrupt
         setInterval(() => {}, 1_000);
@@ -630,6 +711,33 @@ function handle(msg: any) {
         });
       } else if (mode === "interleave") playInterleaveTurn();
       else if (mode !== "empty-reply") playTurn();
+      if (mode === "safe-agent-reads" && agentsMcp) {
+        const entry = agentsMcp;
+        // Deliberately independent of the app's policy catalog. These are the
+        // two exact calls in the reported regression, repeated in one turn.
+        void (async () => {
+          for (const name of ["list_bots", "session_search", "list_bots"]) {
+            const nativeAuto = argv[argv.indexOf("--permission-mode") + 1] === "auto";
+            if (!nativeAuto) {
+              const allowed = await new Promise<boolean>((resolve) => {
+                pendingPermissionId = 9100;
+                onPermissionAnswered = resolve;
+                out({ jsonrpc: "2.0", id: pendingPermissionId, method: "session/request_permission", params: {
+                  toolCall: { toolCallId: `fixture-${name}`, kind: "other", title: `agents__${name}`, rawInput: {} },
+                  options: [{ optionId: "allow-once", kind: "allow_once" }, { optionId: "reject", kind: "reject_once" }],
+                } });
+              });
+              if (!allowed) { complete(); return; }
+            }
+            const text = await driveMcp(entry, [{ name, args: () => name === "session_search" ? { query: "approval fixture" } : {} }], true);
+            out({ jsonrpc: "2.0", method: "session/update", params: { update: {
+              sessionUpdate: "agent_message_chunk", content: { text: `${name}: ${text}\n` },
+            } } });
+          }
+          complete();
+        })().catch((error) => out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: String(error) } }));
+        return;
+      }
       if (mode === "permission") {
         // ask the client to approve a tool, then complete once answered
         pendingPermissionId = 9001;
@@ -639,10 +747,33 @@ function handle(msg: any) {
           id: pendingPermissionId,
           method: "session/request_permission",
           params: {
-            toolCall: { kind: "execute", rawInput: { command: "echo hi" }, title: "echo hi" },
+            toolCall: process.env.FAKE_ACP_PERMISSION_TOOL_CALL
+              ? JSON.parse(process.env.FAKE_ACP_PERMISSION_TOOL_CALL)
+              : { kind: "execute", rawInput: { command: "echo hi" }, title: "echo hi" },
             options: [
               { optionId: "allow-once", kind: "allow_once" },
               { optionId: "reject", kind: "reject_once" },
+            ],
+          },
+        });
+        return;
+      }
+      if (mode === "question") {
+        pendingPermissionId = 9002;
+        onPermissionAnswered = complete;
+        out({
+          jsonrpc: "2.0",
+          id: pendingPermissionId,
+          method: "session/request_permission",
+          params: {
+            toolCall: { toolCallId: "interaction_color", kind: "other", title: "Which color?" },
+            options: [
+              { optionId: "blue-id", kind: "allow_once", name: "Blue" },
+              {
+                optionId: "green-id",
+                kind: "allow_once",
+                name: process.env.FAKE_ACP_PAD_QUESTION_OPTION ? " Green " : "Green",
+              },
             ],
           },
         });

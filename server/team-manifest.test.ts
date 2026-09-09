@@ -1,8 +1,22 @@
 import { describe, expect, it } from "vitest";
 
-import { BOT_INSTRUCTIONS_MAX_CHARS, createTeamManifest, importedMemberProfile, parseTeamManifest } from "./team-manifest.ts";
+import { createTeamManifest, importedMemberProfile, parseTeamManifest } from "./team-manifest.ts";
 
 describe("team manifests", () => {
+  it("round-trips optional soul exactly and rejects over-budget Unicode", () => {
+    const soul = "  Be precise. 🐭\n\n";
+    const manifest = createTeamManifest({ name: "Soul team", memberIds: ["one"] }, [{
+      id: "one", name: "One", title: "", description: "", soul, color: "blue",
+    }]);
+    expect(manifest.team.members[0].soul).toBe(soul);
+    expect(importedMemberProfile(parseTeamManifest(manifest).team.members[0], new Set()).soul).toBe(soul);
+    manifest.team.members[0].soul = "🐭".repeat(6_000);
+    expect(parseTeamManifest(manifest).team.members[0].soul).toBe(manifest.team.members[0].soul);
+    manifest.team.members[0].soul += "!";
+    expect(() => parseTeamManifest(manifest)).toThrow("24000 bytes");
+    delete manifest.team.members[0].soul;
+    expect(importedMemberProfile(parseTeamManifest(manifest).team.members[0], new Set())).not.toHaveProperty("soul");
+  });
   it("exports portable member keys without room or runtime state", () => {
     const manifest = createTeamManifest(
       {
@@ -103,18 +117,6 @@ describe("team manifests", () => {
     expect(manifest.team).not.toHaveProperty("room");
   });
 
-  it("keeps long member instructions within the shared portable cap", () => {
-    const manifest = (description: string) => ({
-      format: "openmaus.team" as const,
-      version: 2 as const,
-      team: { name: "Engineering", members: [{ key: "lead", name: "Ada", description, appearance: { color: "blue" as const } }] },
-    });
-    const accepted = "A".repeat(6_219);
-    expect(parseTeamManifest(manifest(accepted)).team.members[0]?.description).toBe(accepted);
-    expect(() => parseTeamManifest(manifest("A".repeat(BOT_INSTRUCTIONS_MAX_CHARS + 1))))
-      .toThrow("members.0.description is too long");
-  });
-
   it("rejects unsupported versions and dangling member references", () => {
     expect(() => parseTeamManifest({ format: "openmaus.team", version: 99 })).toThrow("not supported");
     expect(() =>
@@ -186,6 +188,7 @@ describe("team manifests", () => {
             // one of these has to vanish in the parse, not downstream
             id: "bot-1",
             threadId: "thread-1",
+            approvalMode: "full",
             autoApprove: true,
             alwaysAllow: ["Bash"],
             chiefOfStaff: true,
